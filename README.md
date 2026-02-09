@@ -29,11 +29,9 @@ Current top-level content in this workspace:
 Local model files currently present:
 - `gemma-3-4b-it-Q4_K_M.gguf` (~2.3 GB)
 - `Meta-Llama-3-8B-Instruct-Q4_K_M.gguf` (~4.6 GB)
-- `phi-4-Q4_K_M.gguf` (~8.3 GB)
 - `Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf` (~8.4 GB)
 - `qwen-image-2512-Q4_K_M.gguf` (~12 GB)
 - `Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf` (~16 GB)
-- `Qwen3-235B-A22B-Thinking-2507-Q4_K_M-00003-of-00003.gguf` (~39 GB)
 - `Qwen3-Coder-Next-Q4_K_M.gguf` (~45 GB)
 
 ## What the Runtime Supports Today
@@ -161,17 +159,9 @@ time ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Ca
 
 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt       1055.66s user 452.01s system 511% cpu 4:54.93 total
 
-# working models
-
-gemma-3-4b-it-Q4_K_M.gguf
-Qwen3-Coder-Next-Q4_K_M.gguf
-Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf
-Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf
-Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
-
-
 # llama3pure vs llama-cli
 
+```bash
 /usr/bin/time -l llama-cli -m Qwen3-Coder-Next-Q4_K_M.gguf --n-gpu-layers 0 -p "Can you write me a programm in Rust that can convert PNG images to JPEG"
       840.84 real       723.82 user       271.35 sys
          23993057280  maximum resident set size
@@ -191,7 +181,9 @@ Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
       13004308126129  instructions retired
        3311218222110  cycles elapsed
          43459789696  peak memory footprint
+```
 
+```bash
 /usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000
       402.09 real      1471.08 user       615.37 sys
          24622071808  maximum resident set size
@@ -211,3 +203,4 @@ Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
       17121227687878  instructions retired
        5829526672922  cycles elapsed
           1485049760  peak memory footprint
+```

@@ -168,3 +168,46 @@ Qwen3-Coder-Next-Q4_K_M.gguf
 Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf
 Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf
 Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
+
+
+# llama3pure vs llama-cli
+
+/usr/bin/time -l llama-cli -m Qwen3-Coder-Next-Q4_K_M.gguf --n-gpu-layers 0 -p "Can you write me a programm in Rust that can convert PNG images to JPEG"
+      840.84 real       723.82 user       271.35 sys
+         23993057280  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+            24205272  page reclaims
+            10304639  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   2  signals received
+             3739287  voluntary context switches
+            13029133  involuntary context switches
+      13004308126129  instructions retired
+       3311218222110  cycles elapsed
+         43459789696  peak memory footprint
+
+/usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000
+      402.09 real      1471.08 user       615.37 sys
+         24622071808  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             3249301  page reclaims
+             5537088  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 111  voluntary context switches
+            41269987  involuntary context switches
+      17121227687878  instructions retired
+       5829526672922  cycles elapsed
+          1485049760  peak memory footprint

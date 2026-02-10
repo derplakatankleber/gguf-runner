@@ -272,3 +272,66 @@ sys	63m43.536s
 
 # apple m4
 427.90 real      1384.12 user       639.31 sys
+
+## updates (2026-02-10, x86 optimization guide)
+
+### x86 code paths now available
+
+- Added runtime-dispatched x86 SIMD paths.
+- `LLAMA3PURE_X86_AVX2=1` enables AVX2+FMA kernels for core `dot/axpy/scale` and BF16 prefix dot.
+- `LLAMA3PURE_X86_F16C=1` enables F16C-based F16 prefix dot.
+- `LLAMA3PURE_X86_QK_MR4=1` enables x86 `MR=4` matmul kernels for `Q4_K`, `Q5_K`, `Q6_K`.
+- Added chunked parallel row scheduling for matmul.
+- `LLAMA3PURE_PAR_MATMUL_CHUNK_ROWS` (new)
+- `LLAMA3PURE_PAR_MATMUL_MIN_ROWS` (kept)
+
+### recommended baseline command (x86)
+
+```bash
+/usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+```
+
+### intel ultra preset (starting point)
+
+```bash
+LLAMA3PURE_X86_AVX2=1 \
+LLAMA3PURE_X86_F16C=1 \
+LLAMA3PURE_X86_QK_MR4=1 \
+LLAMA3PURE_PAR_MATMUL_MIN_ROWS=512 \
+LLAMA3PURE_PAR_MATMUL_CHUNK_ROWS=96 \
+LLAMA3PURE_PAR_ATTN_MIN_HEADS=16 \
+LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 \
+/usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 8 -show-tokens
+```
+
+### amd zen 5 preset (starting point)
+
+```bash
+LLAMA3PURE_X86_AVX2=1 \
+LLAMA3PURE_X86_F16C=1 \
+LLAMA3PURE_X86_QK_MR4=1 \
+LLAMA3PURE_PAR_MATMUL_MIN_ROWS=640 \
+LLAMA3PURE_PAR_MATMUL_CHUNK_ROWS=128 \
+LLAMA3PURE_PAR_ATTN_MIN_HEADS=16 \
+LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 \
+/usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 12 -show-tokens
+```
+
+### quick ablation checks
+
+```bash
+# disable MR4 only
+LLAMA3PURE_X86_QK_MR4=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+
+# disable AVX2/FMA path only
+LLAMA3PURE_X86_AVX2=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+
+# disable F16C path only
+LLAMA3PURE_X86_F16C=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+```
+
+### notes
+
+- Keep benchmark inputs fixed: same model file, prompt, sampling params, `max_tokens`, and `context_size`.
+- Use `-temperature 0 -top_k 1 -top_p 1` for deterministic decoding and higher comparability.
+- Compare both `real` and `achieved tok/s`; watch `involuntary context switches` for oversubscription.

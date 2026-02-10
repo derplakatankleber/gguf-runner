@@ -13,7 +13,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,6 +90,14 @@ static PROF_FFN_NS: AtomicU64 = AtomicU64::new(0);
 static PROF_FORWARD_PASSES: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "aarch64")]
 static AARCH64_DOTPROD_Q8_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+static AARCH64_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+static AARCH64_Q4K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
+#[cfg(target_arch = "aarch64")]
+static AARCH64_Q5K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
+#[cfg(target_arch = "aarch64")]
+static AARCH64_Q6K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 static LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>> = OnceLock::new();
 
 #[inline]
@@ -146,6 +154,12 @@ fn use_aarch64_dotprod_q8() -> bool {
         parse_env_bool("LLAMA3PURE_AARCH64_DOTPROD_Q8", false)
             && std::arch::is_aarch64_feature_detected!("dotprod")
     })
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn use_aarch64_qk_mr4() -> bool {
+    *AARCH64_QK_MR4_CFG.get_or_init(|| parse_env_bool("LLAMA3PURE_AARCH64_QK_MR4", true))
 }
 
 #[inline(always)]
@@ -2679,6 +2693,88 @@ fn matmul_qk_mr4_chunk(
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+fn mr4_status(ttype: i32) -> &'static AtomicU8 {
+    match ttype {
+        GGML_TYPE_Q4_K => &AARCH64_Q4K_MR4_STATUS,
+        GGML_TYPE_Q5_K => &AARCH64_Q5K_MR4_STATUS,
+        GGML_TYPE_Q6_K => &AARCH64_Q6K_MR4_STATUS,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn validate_qk_mr4_once(
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) -> bool {
+    let status = mr4_status(ttype);
+    match status.load(AtomicOrdering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+
+    let r0 = &mapped[data_offset..data_offset + row_size];
+    let r1 = &mapped[data_offset + row_size..data_offset + 2 * row_size];
+    let r2 = &mapped[data_offset + 2 * row_size..data_offset + 3 * row_size];
+    let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
+
+    let mr4 = match ttype {
+        GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
+        _ => unreachable!(),
+    };
+    let scalar = match ttype {
+        GGML_TYPE_Q4_K => [
+            vec_dot_q4_k(x, r0, n),
+            vec_dot_q4_k(x, r1, n),
+            vec_dot_q4_k(x, r2, n),
+            vec_dot_q4_k(x, r3, n),
+        ],
+        GGML_TYPE_Q5_K => [
+            vec_dot_q5_k(x, r0, n),
+            vec_dot_q5_k(x, r1, n),
+            vec_dot_q5_k(x, r2, n),
+            vec_dot_q5_k(x, r3, n),
+        ],
+        GGML_TYPE_Q6_K => [
+            vec_dot_q6_k(x, r0, n),
+            vec_dot_q6_k(x, r1, n),
+            vec_dot_q6_k(x, r2, n),
+            vec_dot_q6_k(x, r3, n),
+        ],
+        _ => unreachable!(),
+    };
+
+    let mut ok = true;
+    for i in 0..4 {
+        let a = mr4[i];
+        let b = scalar[i];
+        let tol = 1e-4f32 * b.abs().max(1.0);
+        if (a - b).abs() > tol {
+            ok = false;
+            break;
+        }
+    }
+
+    status.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
+    if !ok {
+        eprintln!(
+            "Warning: disabling aarch64 MR4 kernel for type {} due to validation mismatch",
+            ttype
+        );
+    }
+    ok
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
 fn try_matmul_qk_mr4(
     xout: &mut [f32],
     x: &[f32],
@@ -2688,6 +2784,9 @@ fn try_matmul_qk_mr4(
     n: usize,
     ttype: i32,
 ) -> bool {
+    if !use_aarch64_qk_mr4() {
+        return false;
+    }
     if !matches!(ttype, GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K) {
         return false;
     }
@@ -2696,6 +2795,12 @@ fn try_matmul_qk_mr4(
     }
 
     let d = xout.len();
+    if d < 4 {
+        return false;
+    }
+    if !validate_qk_mr4_once(x, mapped, data_offset, row_size, n, ttype) {
+        return false;
+    }
     const PAR_CHUNK_ROWS: usize = 32;
     if d >= par_matmul_min_rows() {
         xout.par_chunks_mut(PAR_CHUNK_ROWS)
@@ -3369,17 +3474,17 @@ fn init_weights_from_gguf(
         Vec::new()
     };
 
-    let mut attn_q_norm = if p.is_gemma3 || p.is_qwen3moe || p.is_qwen3next {
+    let mut attn_q_norm = if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
         vec![0.0f32; n_layers * head_size]
     } else {
         Vec::new()
     };
-    let mut attn_k_norm = if p.is_gemma3 || p.is_qwen3moe || p.is_qwen3next {
+    let mut attn_k_norm = if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
         vec![0.0f32; n_layers * head_size]
     } else {
         Vec::new()
     };
-    let mut attn_qk_norm_present = if p.is_gemma3 || p.is_qwen3moe || p.is_qwen3next {
+    let mut attn_qk_norm_present = if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
         vec![false; n_layers]
     } else {
         Vec::new()
@@ -3601,7 +3706,7 @@ fn init_weights_from_gguf(
             attn_q_norm[l * head_size..(l + 1) * head_size].copy_from_slice(&q_norm);
             attn_k_norm[l * head_size..(l + 1) * head_size].copy_from_slice(&k_norm);
             attn_qk_norm_present[l] = true;
-        } else if p.is_qwen3next
+        } else if (p.is_qwen3next || p.is_qwen2)
             && find_gguf_tensor(gguf, &format!("blk.{l}.attn_q_norm.weight")).is_some()
             && find_gguf_tensor(gguf, &format!("blk.{l}.attn_k_norm.weight")).is_some()
         {

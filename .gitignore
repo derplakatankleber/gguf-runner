@@ -1,0 +1,4 @@
+target/
+*.gguf
+.DS_Store
+*.crdownload

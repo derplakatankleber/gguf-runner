@@ -301,13 +301,12 @@ pub(crate) fn apply_context_size_overrides(
 ) {
     if context_size > 0 {
         config.seq_len = context_size;
-    } else if (config.is_qwen3moe || config.is_qwen3next) && config.seq_len > 8192 {
+    } else if config.is_qwen3moe || config.is_qwen3next {
         if debug_mode {
             eprintln!(
-                "Clamping context length from {} to 8192 for qwen3 model; pass -context_size to override",
+                "Using qwen3 native context length {} (model may require a large workspace)",
                 config.seq_len
             );
         }
-        config.seq_len = 8192;
     }
 }

@@ -7,10 +7,15 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 mod model;
 
@@ -67,13 +72,117 @@ const GEMMA3_BOS_TOKEN: i32 = 2;
 const GEMMA3_START_TURN: i32 = 106;
 const GEMMA3_END_TURN: i32 = 107;
 
-const PAR_MATMUL_MIN_ROWS: usize = 128;
-const PAR_ATTN_MIN_HEADS: usize = 4;
+const PAR_MATMUL_MIN_ROWS_DEFAULT: usize = 256;
+const PAR_ATTN_MIN_HEADS_DEFAULT: usize = 8;
+const PAR_QWEN3NEXT_MIN_HEADS_DEFAULT: usize = 8;
+
+static PAR_MATMUL_MIN_ROWS_CFG: OnceLock<usize> = OnceLock::new();
+static PAR_ATTN_MIN_HEADS_CFG: OnceLock<usize> = OnceLock::new();
+static PAR_QWEN3NEXT_MIN_HEADS_CFG: OnceLock<usize> = OnceLock::new();
+
+static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+static PROF_TRANSFORMER_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_MATMUL_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_SSM_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_ATTN_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_MOE_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_FFN_NS: AtomicU64 = AtomicU64::new(0);
+static PROF_FORWARD_PASSES: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "aarch64")]
+static AARCH64_DOTPROD_Q8_CFG: OnceLock<bool> = OnceLock::new();
+static LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>> = OnceLock::new();
+
+#[inline]
+fn parse_env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+#[inline]
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(default)
+}
+
+#[inline]
+fn par_matmul_min_rows() -> usize {
+    *PAR_MATMUL_MIN_ROWS_CFG.get_or_init(|| {
+        parse_env_usize("LLAMA3PURE_PAR_MATMUL_MIN_ROWS", PAR_MATMUL_MIN_ROWS_DEFAULT)
+    })
+}
+
+#[inline]
+fn par_attn_min_heads() -> usize {
+    *PAR_ATTN_MIN_HEADS_CFG.get_or_init(|| {
+        parse_env_usize("LLAMA3PURE_PAR_ATTN_MIN_HEADS", PAR_ATTN_MIN_HEADS_DEFAULT)
+    })
+}
+
+#[inline]
+fn par_qwen3next_min_heads() -> usize {
+    *PAR_QWEN3NEXT_MIN_HEADS_CFG.get_or_init(|| {
+        parse_env_usize(
+            "LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS",
+            PAR_QWEN3NEXT_MIN_HEADS_DEFAULT,
+        )
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn use_aarch64_dotprod_q8() -> bool {
+    *AARCH64_DOTPROD_Q8_CFG.get_or_init(|| {
+        parse_env_bool("LLAMA3PURE_AARCH64_DOTPROD_Q8", false)
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+    })
+}
+
+#[inline(always)]
+fn profiling_enabled() -> bool {
+    PROFILING_ENABLED.load(AtomicOrdering::Relaxed)
+}
+
+#[inline(always)]
+fn prof_start() -> Option<Instant> {
+    if profiling_enabled() {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn prof_end(counter: &AtomicU64, start: Option<Instant>) {
+    if let Some(t0) = start {
+        counter.fetch_add(t0.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    }
+}
+
+fn profiling_reset() {
+    PROF_TRANSFORMER_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_MATMUL_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_SSM_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_ATTN_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_MOE_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_FFN_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_FORWARD_PASSES.store(0, AtomicOrdering::Relaxed);
+}
 
 #[cfg(unix)]
 const PROT_READ: i32 = 0x1;
 #[cfg(unix)]
-const MAP_PRIVATE: i32 = 0x0002;
+const MAP_SHARED: i32 = 0x0001;
 
 #[cfg(unix)]
 extern "C" {
@@ -119,7 +228,7 @@ impl MappedFile {
             ));
         }
         let fd = file.as_raw_fd();
-        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_SHARED, fd, 0) };
         if ptr as isize == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -140,6 +249,308 @@ impl Drop for MappedFile {
         unsafe {
             let _ = munmap(self.ptr as *mut c_void, self.len);
         }
+    }
+}
+
+const LAZY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const LAZY_BOOTSTRAP_START_BYTES: usize = 8 * 1024 * 1024;
+const LAZY_BOOTSTRAP_MAX_BYTES: usize = 512 * 1024 * 1024;
+const LAZY_FETCH_RETRIES: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LazyChunkState {
+    Missing,
+    Fetching,
+    Ready,
+    Failed,
+}
+
+struct LazyModelLoader {
+    url: String,
+    file: File,
+    file_len: usize,
+    chunk_bytes: usize,
+    chunk_count: usize,
+    states: Mutex<Vec<LazyChunkState>>,
+    cv: Condvar,
+    debug_mode: bool,
+    ready_chunks: AtomicUsize,
+    fetch_attempts: AtomicUsize,
+    fetch_waits: AtomicUsize,
+    foreground_fetches: AtomicUsize,
+    background_fetches: AtomicUsize,
+}
+
+impl LazyModelLoader {
+    fn new(url: &str, model_path: &str, debug_mode: bool) -> Result<Self, String> {
+        let file_len = Self::probe_remote_len(url)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(model_path)
+            .map_err(|e| format!("cannot open local cache file {model_path}: {e}"))?;
+        file.set_len(file_len as u64)
+            .map_err(|e| format!("cannot size cache file {model_path}: {e}"))?;
+
+        let chunk_bytes = LAZY_CHUNK_BYTES;
+        let chunk_count = file_len.div_ceil(chunk_bytes);
+        let states = vec![LazyChunkState::Missing; chunk_count];
+
+        Ok(Self {
+            url: url.to_string(),
+            file,
+            file_len,
+            chunk_bytes,
+            chunk_count,
+            states: Mutex::new(states),
+            cv: Condvar::new(),
+            debug_mode,
+            ready_chunks: AtomicUsize::new(0),
+            fetch_attempts: AtomicUsize::new(0),
+            fetch_waits: AtomicUsize::new(0),
+            foreground_fetches: AtomicUsize::new(0),
+            background_fetches: AtomicUsize::new(0),
+        })
+    }
+
+    fn probe_remote_len(url: &str) -> Result<usize, String> {
+        if let Ok(resp) = ureq::head(url).call() {
+            if let Some(v) = resp.header("Content-Length") {
+                if let Ok(n) = v.parse::<u64>() {
+                    if n > 0 {
+                        return Ok(n as usize);
+                    }
+                }
+            }
+        }
+
+        let resp = ureq::get(url)
+            .set("Range", "bytes=0-0")
+            .call()
+            .map_err(|e| format!("cannot query remote size from {url}: {e}"))?;
+        if let Some(cr) = resp.header("Content-Range") {
+            return Self::parse_content_range_total(cr);
+        }
+        if let Some(v) = resp.header("Content-Length") {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    return Ok(n as usize);
+                }
+            }
+        }
+        Err(format!(
+            "cannot determine remote size for {url} (missing Content-Length/Content-Range)"
+        ))
+    }
+
+    fn parse_content_range_total(content_range: &str) -> Result<usize, String> {
+        let total = content_range
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| format!("invalid Content-Range header: {content_range}"))?;
+        total
+            .parse::<u64>()
+            .map(|v| v as usize)
+            .map_err(|e| format!("invalid Content-Range total in {content_range}: {e}"))
+    }
+
+    fn chunk_bounds(&self, chunk_idx: usize) -> (usize, usize) {
+        let start = chunk_idx * self.chunk_bytes;
+        let end = (start + self.chunk_bytes).min(self.file_len);
+        (start, end)
+    }
+
+    fn fetch_chunk_into_cache(&self, chunk_idx: usize) -> Result<(), String> {
+        let (start, end) = self.chunk_bounds(chunk_idx);
+        let mut last_err: Option<String> = None;
+
+        for _ in 0..LAZY_FETCH_RETRIES {
+            match self.fetch_chunk_once(start, end) {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| "unknown chunk fetch failure".to_string()))
+    }
+
+    fn fetch_chunk_once(&self, start: usize, end: usize) -> Result<(), String> {
+        let range = format!("bytes={start}-{}", end - 1);
+        let resp = ureq::get(&self.url)
+            .set("Range", &range)
+            .call()
+            .map_err(|e| format!("range request failed ({range}): {e}"))?;
+
+        let status = resp.status();
+        if status != 206 && !(status == 200 && start == 0 && end == self.file_len) {
+            return Err(format!(
+                "unexpected HTTP status {} for range {}",
+                status, range
+            ));
+        }
+
+        let mut body = Vec::with_capacity(end - start);
+        resp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(|e| format!("failed reading HTTP body for range {range}: {e}"))?;
+        if body.len() != end - start {
+            return Err(format!(
+                "short read for range {range}: got {} bytes, expected {}",
+                body.len(),
+                end - start
+            ));
+        }
+
+        write_all_at(&self.file, &body, start as u64)
+            .map_err(|e| format!("failed writing cache bytes [{start}..{end}): {e}"))?;
+        Ok(())
+    }
+
+    fn ensure_chunk_ready(&self, chunk_idx: usize, is_background: bool) -> Result<(), String> {
+        let mut states = self
+            .states
+            .lock()
+            .map_err(|_| "lazy loader state lock poisoned".to_string())?;
+        loop {
+            match states[chunk_idx] {
+                LazyChunkState::Ready => return Ok(()),
+                LazyChunkState::Missing | LazyChunkState::Failed => {
+                    states[chunk_idx] = LazyChunkState::Fetching;
+                    self.fetch_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                    if is_background {
+                        self.background_fetches
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    } else {
+                        self.foreground_fetches
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    break;
+                }
+                LazyChunkState::Fetching => {
+                    self.fetch_waits.fetch_add(1, AtomicOrdering::Relaxed);
+                    states = self
+                        .cv
+                        .wait(states)
+                        .map_err(|_| "lazy loader state lock poisoned".to_string())?;
+                }
+            }
+        }
+        drop(states);
+
+        let result = self.fetch_chunk_into_cache(chunk_idx);
+        let mut states = self
+            .states
+            .lock()
+            .map_err(|_| "lazy loader state lock poisoned".to_string())?;
+        states[chunk_idx] = if result.is_ok() {
+            self.ready_chunks.fetch_add(1, AtomicOrdering::Relaxed);
+            LazyChunkState::Ready
+        } else {
+            LazyChunkState::Failed
+        };
+        self.cv.notify_all();
+        result
+    }
+
+    fn debug_stats_line(&self) -> String {
+        let ready = self.ready_chunks.load(AtomicOrdering::Relaxed);
+        let pct = if self.chunk_count == 0 {
+            100.0
+        } else {
+            100.0 * ready as f64 / self.chunk_count as f64
+        };
+        let attempts = self.fetch_attempts.load(AtomicOrdering::Relaxed);
+        let waits = self.fetch_waits.load(AtomicOrdering::Relaxed);
+        let fg = self.foreground_fetches.load(AtomicOrdering::Relaxed);
+        let bg = self.background_fetches.load(AtomicOrdering::Relaxed);
+        format!(
+            "Lazy model: ready={}/{} ({:.1}%), fetch_attempts={}, waits={}, fg_fetches={}, bg_fetches={}",
+            ready, self.chunk_count, pct, attempts, waits, fg, bg
+        )
+    }
+
+    fn ensure_range(&self, offset: usize, len: usize) -> Result<(), String> {
+        if len == 0 || self.chunk_count == 0 {
+            return Ok(());
+        }
+        if offset >= self.file_len {
+            return Err(format!(
+                "lazy ensure_range offset {} outside file size {}",
+                offset, self.file_len
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| "lazy ensure_range overflow".to_string())?
+            .min(self.file_len);
+        let first = offset / self.chunk_bytes;
+        let last = (end - 1) / self.chunk_bytes;
+        for c in first..=last {
+            self.ensure_chunk_ready(c, false)?;
+        }
+        Ok(())
+    }
+
+    fn start_background_download(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            for chunk_idx in 0..this.chunk_count {
+                if let Err(e) = this.ensure_chunk_ready(chunk_idx, true) {
+                    if this.debug_mode {
+                        eprintln!(
+                            "Lazy model background download stopped at chunk {}: {}",
+                            chunk_idx, e
+                        );
+                    }
+                    return;
+                }
+                if this.debug_mode
+                    && (chunk_idx + 1 == this.chunk_count || (chunk_idx + 1) % 128 == 0)
+                {
+                    eprintln!("{}", this.debug_stats_line());
+                }
+            }
+            if this.debug_mode {
+                eprintln!("Lazy model background download finished");
+                eprintln!("{}", this.debug_stats_line());
+            }
+        });
+    }
+}
+
+fn ensure_model_range(offset: usize, len: usize) -> Result<(), String> {
+    if let Some(loader) = LAZY_MODEL_LOADER.get() {
+        loader.ensure_range(offset, len)?;
+    }
+    Ok(())
+}
+
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        while !buf.is_empty() {
+            let n = file.write_at(buf, offset)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write model cache",
+                ));
+            }
+            buf = &buf[n..];
+            offset += n as u64;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        let _ = buf;
+        let _ = offset;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "lazy model cache writes require unix platform",
+        ))
     }
 }
 
@@ -175,6 +586,17 @@ struct GGUFFile {
     vocab_scores: Vec<f32>,
     vocab_merges: Vec<String>,
     mapped: MappedFile,
+    lazy_loader: Option<Arc<LazyModelLoader>>,
+}
+
+impl GGUFFile {
+    #[inline]
+    fn ensure_range(&self, offset: usize, len: usize) -> Result<(), String> {
+        if let Some(loader) = &self.lazy_loader {
+            loader.ensure_range(offset, len)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -265,8 +687,11 @@ struct RunState {
     moe_logits: Vec<f32>,
     moe_topk_indices: Vec<usize>,
     moe_topk_weights: Vec<f32>,
+    moe_scores: Vec<f32>,
+    moe_selected_group: Vec<bool>,
+    moe_group_scores: Vec<f32>,
+    moe_group_rank: Vec<usize>,
     q: Vec<f32>,
-    q_gate: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
     ssm_qkv: Vec<f32>,
@@ -279,6 +704,8 @@ struct RunState {
     ssm_gate_exp: Vec<f32>,
     ssm_beta: Vec<f32>,
     ssm_proj: Vec<f32>,
+    ssm_kv_mem: Vec<f32>,
+    ssm_delta: Vec<f32>,
     ssm_conv_state: Vec<f32>,
     ssm_state: Vec<f32>,
     att: Vec<f32>,
@@ -505,7 +932,7 @@ fn read_gguf_scalar(r: &mut File, value_type: u32) -> io::Result<GgufValue> {
     }
 }
 
-fn parse_gguf_file(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
+fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
     let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
 
     let magic = read_u32(&mut file).map_err(|e| format!("failed to read magic number: {e}"))?;
@@ -644,7 +1071,94 @@ fn parse_gguf_file(filename: &str, debug_mode: bool) -> Result<GGUFFile, String>
         vocab_scores,
         vocab_merges,
         mapped,
+        lazy_loader: None,
     })
+}
+
+fn parse_gguf_file(
+    filename: &str,
+    model_url: Option<&str>,
+    debug_mode: bool,
+) -> Result<GGUFFile, String> {
+    let model_path = Path::new(filename);
+    let local_exists = model_path.exists();
+
+    if local_exists {
+        match parse_gguf_file_local(filename, debug_mode) {
+            Ok(gguf) => {
+                if debug_mode {
+                    eprintln!("Using local model file: {filename}");
+                }
+                return Ok(gguf);
+            }
+            Err(e) => {
+                if model_url.is_none() {
+                    return Err(e);
+                }
+                eprintln!(
+                    "Warning: local model file parse failed ({}). Falling back to remote lazy load.",
+                    e
+                );
+            }
+        }
+    } else if model_url.is_none() {
+        return Err(format!(
+            "model file not found: {} (provide -url to lazily fetch it)",
+            filename
+        ));
+    }
+
+    let url = model_url.ok_or_else(|| "missing model url".to_string())?;
+    let loader = Arc::new(LazyModelLoader::new(url, filename, debug_mode)?);
+    let _ = LAZY_MODEL_LOADER.set(Arc::clone(&loader));
+
+    let mut bootstrap = LAZY_BOOTSTRAP_START_BYTES.min(loader.file_len.max(1));
+    let max_bootstrap = LAZY_BOOTSTRAP_MAX_BYTES.min(loader.file_len.max(1));
+
+    loop {
+        if debug_mode {
+            eprintln!(
+                "Lazy model bootstrap: ensuring first {} bytes of {}",
+                bootstrap, loader.file_len
+            );
+        }
+        loader.ensure_range(0, bootstrap)?;
+        match parse_gguf_file_local(filename, debug_mode) {
+            Ok(mut gguf) => {
+                gguf.lazy_loader = Some(Arc::clone(&loader));
+                loader.start_background_download();
+                if debug_mode {
+                    eprintln!(
+                        "Lazy model mode enabled: url={}, local_cache={}, bytes_bootstrapped={}",
+                        url, filename, bootstrap
+                    );
+                }
+                return Ok(gguf);
+            }
+            Err(e) => {
+                if bootstrap >= max_bootstrap {
+                    return Err(format!(
+                        "failed to parse GGUF metadata after bootstrapping {} bytes: {}",
+                        bootstrap, e
+                    ));
+                }
+                let next = (bootstrap.saturating_mul(2)).min(max_bootstrap);
+                if next == bootstrap {
+                    return Err(format!(
+                        "failed to parse GGUF metadata at {} bytes: {}",
+                        bootstrap, e
+                    ));
+                }
+                if debug_mode {
+                    eprintln!(
+                        "Lazy model bootstrap parse retry: {} -> {} bytes ({})",
+                        bootstrap, next, e
+                    );
+                }
+                bootstrap = next;
+            }
+        }
+    }
 }
 
 fn get_gguf_int_from_map(kv: &HashMap<String, GgufValue>, key: &str, default_val: i64) -> i64 {
@@ -1099,7 +1613,26 @@ fn dot_f32_scalar_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
 #[inline(always)]
 unsafe fn dot_f32_simd_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
     let mut i = 0usize;
-    let mut acc = vdupq_n_f32(0.0);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    while i + 16 <= n {
+        let a0 = vld1q_f32(a.add(i));
+        let b0 = vld1q_f32(b.add(i));
+        let a1 = vld1q_f32(a.add(i + 4));
+        let b1 = vld1q_f32(b.add(i + 4));
+        let a2 = vld1q_f32(a.add(i + 8));
+        let b2 = vld1q_f32(b.add(i + 8));
+        let a3 = vld1q_f32(a.add(i + 12));
+        let b3 = vld1q_f32(b.add(i + 12));
+        acc0 = vfmaq_f32(acc0, a0, b0);
+        acc1 = vfmaq_f32(acc1, a1, b1);
+        acc2 = vfmaq_f32(acc2, a2, b2);
+        acc3 = vfmaq_f32(acc3, a3, b3);
+        i += 16;
+    }
+    let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
     while i + 4 <= n {
         let av = vld1q_f32(a.add(i));
         let bv = vld1q_f32(b.add(i));
@@ -1151,6 +1684,21 @@ fn dot_f32_simd(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn axpy_simd_ptr(dst: *mut f32, src: *const f32, a: f32, n: usize) {
     let mut i = 0usize;
     let av = vdupq_n_f32(a);
+    while i + 16 <= n {
+        let dv0 = vld1q_f32(dst.add(i));
+        let sv0 = vld1q_f32(src.add(i));
+        let dv1 = vld1q_f32(dst.add(i + 4));
+        let sv1 = vld1q_f32(src.add(i + 4));
+        let dv2 = vld1q_f32(dst.add(i + 8));
+        let sv2 = vld1q_f32(src.add(i + 8));
+        let dv3 = vld1q_f32(dst.add(i + 12));
+        let sv3 = vld1q_f32(src.add(i + 12));
+        vst1q_f32(dst.add(i), vfmaq_f32(dv0, sv0, av));
+        vst1q_f32(dst.add(i + 4), vfmaq_f32(dv1, sv1, av));
+        vst1q_f32(dst.add(i + 8), vfmaq_f32(dv2, sv2, av));
+        vst1q_f32(dst.add(i + 12), vfmaq_f32(dv3, sv3, av));
+        i += 16;
+    }
     while i + 4 <= n {
         let dv = vld1q_f32(dst.add(i));
         let sv = vld1q_f32(src.add(i));
@@ -1201,6 +1749,17 @@ fn axpy_inplace(dst: &mut [f32], a: f32, src: &[f32]) {
 unsafe fn scale_simd_inplace(x: *mut f32, alpha: f32, n: usize) {
     let mut i = 0usize;
     let av = vdupq_n_f32(alpha);
+    while i + 16 <= n {
+        let xv0 = vld1q_f32(x.add(i));
+        let xv1 = vld1q_f32(x.add(i + 4));
+        let xv2 = vld1q_f32(x.add(i + 8));
+        let xv3 = vld1q_f32(x.add(i + 12));
+        vst1q_f32(x.add(i), vmulq_f32(xv0, av));
+        vst1q_f32(x.add(i + 4), vmulq_f32(xv1, av));
+        vst1q_f32(x.add(i + 8), vmulq_f32(xv2, av));
+        vst1q_f32(x.add(i + 12), vmulq_f32(xv3, av));
+        i += 16;
+    }
     while i + 4 <= n {
         let xv = vld1q_f32(x.add(i));
         let out = vmulq_f32(xv, av);
@@ -1447,6 +2006,13 @@ fn vec_dot_q5_1(x: &[f32], w: &[u8], n: usize) -> f32 {
 }
 
 fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    if use_aarch64_dotprod_q8() {
+        unsafe {
+            return vec_dot_q8_0_dotprod(x, w, n);
+        }
+    }
+
     let nb = n / QK8_0;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
     let mut sum = 0.0;
@@ -1460,6 +2026,58 @@ fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
         }
         let block_sum = dot_f32_simd(xb, &qf);
         sum += block_sum * d;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_i8_16_neon(a: *const i8, b: *const i8) -> i32 {
+    let av = vld1q_s8(a);
+    let bv = vld1q_s8(b);
+    let prod0 = vmull_s8(vget_low_s8(av), vget_low_s8(bv));
+    let prod1 = vmull_s8(vget_high_s8(av), vget_high_s8(bv));
+    let sum0 = vpaddlq_s16(prod0);
+    let sum1 = vpaddlq_s16(prod1);
+    vaddvq_s32(vaddq_s32(sum0, sum1))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_i8_32_dotprod(a: *const i8, b: *const i8) -> i32 {
+    dot_i8_16_neon(a, b) + dot_i8_16_neon(a.add(16), b.add(16))
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn vec_dot_q8_0_dotprod(x: &[f32], w: &[u8], n: usize) -> f32 {
+    let nb = n / QK8_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
+    let mut sum = 0.0f32;
+    let mut xq = [0i8; QK8_0];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off));
+        let xb = &x[i * QK8_0..(i + 1) * QK8_0];
+        let mut abs_max = 0.0f32;
+        for &v in xb {
+            let a = v.abs();
+            if a > abs_max {
+                abs_max = a;
+            }
+        }
+        if abs_max == 0.0 {
+            continue;
+        }
+        let x_scale = abs_max / 127.0;
+        let inv_x_scale = 1.0 / x_scale;
+        for j in 0..QK8_0 {
+            let q = (xb[j] * inv_x_scale).round().clamp(-127.0, 127.0);
+            xq[j] = q as i8;
+        }
+        let q_ptr = w[off + 2..off + 2 + QK8_0].as_ptr() as *const i8;
+        let dot_i32 = dot_i8_32_dotprod(xq.as_ptr(), q_ptr);
+        sum += dot_i32 as f32 * x_scale * d;
     }
     sum
 }
@@ -1562,6 +2180,38 @@ fn vec_dot_q4_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
     let mut sum = 0.0;
 
+    #[cfg(target_arch = "aarch64")]
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off));
+        let dmin = fp16_to_fp32(read_u16_le(w, off + 2));
+        let scales = &w[off + 4..off + 16];
+        let mut q_off = off + 16;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+
+        let mut is = 0usize;
+        let mut block_sum = 0.0f32;
+        for j in (0..QK_K).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc1 as f32;
+            let m1f = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;
+            let m2f = dmin * m2 as f32;
+            let q = &w[q_off..q_off + 32];
+            for l in 0..32 {
+                let qv = q[l];
+                let w0 = d1 * (qv & 0x0f) as f32 - m1f;
+                let w1 = d2 * (qv >> 4) as f32 - m2f;
+                block_sum += xb[j + l] * w0 + xb[j + 32 + l] * w1;
+            }
+            q_off += 32;
+            is += 2;
+        }
+        sum += block_sum;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..nb {
         let off = i * block_sz;
         let d = fp16_to_fp32(read_u16_le(w, off));
@@ -1603,6 +2253,45 @@ fn vec_dot_q5_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
     let mut sum = 0.0;
 
+    #[cfg(target_arch = "aarch64")]
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off));
+        let dmin = fp16_to_fp32(read_u16_le(w, off + 2));
+        let scales = &w[off + 4..off + 16];
+        let qh = &w[off + 16..off + 16 + QK_K / 8];
+        let mut ql_off = off + 16 + QK_K / 8;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        let mut block_sum = 0.0f32;
+        for j in (0..QK_K).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc1 as f32;
+            let m1f = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;
+            let m2f = dmin * m2 as f32;
+            let ql = &w[ql_off..ql_off + 32];
+            for l in 0..32 {
+                let qv = ql[l];
+                let lo = (qv & 0x0f) + if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let hi = (qv >> 4) + if (qh[l] & u2) != 0 { 16 } else { 0 };
+                let w0 = d1 * lo as f32 - m1f;
+                let w1 = d2 * hi as f32 - m2f;
+                block_sum += xb[j + l] * w0 + xb[j + 32 + l] * w1;
+            }
+            ql_off += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        sum += block_sum;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..nb {
         let off = i * block_sz;
         let d = fp16_to_fp32(read_u16_le(w, off));
@@ -1652,6 +2341,43 @@ fn vec_dot_q6_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
     let mut sum = 0.0;
 
+    #[cfg(target_arch = "aarch64")]
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off + QK_K / 2 + QK_K / 4 + QK_K / 16));
+        let mut ql_off = off;
+        let mut qh_off = off + QK_K / 2;
+        let mut sc_off = off + QK_K / 2 + QK_K / 4;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+
+        let mut block_sum = 0.0f32;
+        for n_outer in (0..QK_K).step_by(128) {
+            let ql = &w[ql_off..ql_off + 64];
+            let qh = &w[qh_off..qh_off + 32];
+            let sc = &w[sc_off..sc_off + 8];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = (((ql[l] & 0x0f) | (((qh[l] >> 0) & 0x03) << 4)) as i8) - 32;
+                let q2 = (((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 0x03) << 4)) as i8) - 32;
+                let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i8) - 32;
+                let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i8) - 32;
+                let s0 = d * sc[is] as i8 as f32;
+                let s1 = d * sc[is + 2] as i8 as f32;
+                let s2 = d * sc[is + 4] as i8 as f32;
+                let s3 = d * sc[is + 6] as i8 as f32;
+                block_sum += xb[n_outer + l] * (s0 * q1 as f32);
+                block_sum += xb[n_outer + 32 + l] * (s1 * q2 as f32);
+                block_sum += xb[n_outer + 64 + l] * (s2 * q3 as f32);
+                block_sum += xb[n_outer + 96 + l] * (s3 * q4 as f32);
+            }
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+        }
+        sum += block_sum;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..nb {
         let off = i * block_sz;
         let d = fp16_to_fp32(read_u16_le(w, off + QK_K / 2 + QK_K / 4 + QK_K / 16));
@@ -1696,6 +2422,294 @@ fn vec_dot_q6_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     sum
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn vec_dot_q4_k_4rows(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            q_off[r] = off + 16;
+        }
+
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+            }
+            for l in 0..32 {
+                let x0 = xb[j + l];
+                let x1 = xb[j + 32 + l];
+                for r in 0..4 {
+                    let qv = rows[r][q_off[r] + l];
+                    sums[r] += x0 * (a_lo[r] * (qv & 0x0f) as f32 - b_lo[r])
+                        + x1 * (a_hi[r] * (qv >> 4) as f32 - b_hi[r]);
+                }
+            }
+            for r in 0..4 {
+                q_off[r] += 32;
+            }
+            is += 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn vec_dot_q5_k_4rows(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut qh = [&[][..]; 4];
+        let mut ql_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            qh[r] = &rows[r][off + 16..off + 16 + QK_K / 8];
+            ql_off[r] = off + 16 + QK_K / 8;
+        }
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in (0..QK_K).step_by(64) {
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+            }
+            for l in 0..32 {
+                let x0 = xb[j + l];
+                let x1 = xb[j + 32 + l];
+                for r in 0..4 {
+                    let qv = rows[r][ql_off[r] + l];
+                    let lo = (qv & 0x0f) + if (qh[r][l] & u1) != 0 { 16 } else { 0 };
+                    let hi = (qv >> 4) + if (qh[r][l] & u2) != 0 { 16 } else { 0 };
+                    sums[r] += x0 * (a_lo[r] * lo as f32 - b_lo[r])
+                        + x1 * (a_hi[r] * hi as f32 - b_hi[r]);
+                }
+            }
+            for r in 0..4 {
+                ql_off[r] += 32;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn vec_dot_q6_k_4rows(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut ql_off = [0usize; 4];
+        let mut qh_off = [0usize; 4];
+        let mut sc_off = [0usize; 4];
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(
+                rows[r],
+                off + QK_K / 2 + QK_K / 4 + QK_K / 16,
+            ));
+            ql_off[r] = off;
+            qh_off[r] = off + QK_K / 2;
+            sc_off[r] = off + QK_K / 2 + QK_K / 4;
+        }
+
+        for n_outer in (0..QK_K).step_by(128) {
+            let mut ql = [&[][..]; 4];
+            let mut qh = [&[][..]; 4];
+            let mut sc = [&[][..]; 4];
+            for r in 0..4 {
+                ql[r] = &rows[r][ql_off[r]..ql_off[r] + 64];
+                qh[r] = &rows[r][qh_off[r]..qh_off[r] + 32];
+                sc[r] = &rows[r][sc_off[r]..sc_off[r] + 8];
+            }
+
+            for l in 0..32 {
+                let is = l / 16;
+                let x0 = xb[n_outer + l];
+                let x1 = xb[n_outer + 32 + l];
+                let x2 = xb[n_outer + 64 + l];
+                let x3 = xb[n_outer + 96 + l];
+                for r in 0..4 {
+                    let ql0 = ql[r][l];
+                    let ql1 = ql[r][l + 32];
+                    let qh0 = qh[r][l];
+                    let q1 = (((ql0 & 0x0f) | (((qh0 >> 0) & 0x03) << 4)) as i8) - 32;
+                    let q2 = (((ql1 & 0x0f) | (((qh0 >> 2) & 0x03) << 4)) as i8) - 32;
+                    let q3 = (((ql0 >> 4) | (((qh0 >> 4) & 0x03) << 4)) as i8) - 32;
+                    let q4 = (((ql1 >> 4) | (((qh0 >> 6) & 0x03) << 4)) as i8) - 32;
+                    let s0 = d[r] * sc[r][is] as i8 as f32;
+                    let s1 = d[r] * sc[r][is + 2] as i8 as f32;
+                    let s2 = d[r] * sc[r][is + 4] as i8 as f32;
+                    let s3 = d[r] * sc[r][is + 6] as i8 as f32;
+                    sums[r] += x0 * (s0 * q1 as f32)
+                        + x1 * (s1 * q2 as f32)
+                        + x2 * (s2 * q3 as f32)
+                        + x3 * (s3 * q4 as f32);
+                }
+            }
+            for r in 0..4 {
+                ql_off[r] += 64;
+                qh_off[r] += 32;
+                sc_off[r] += 8;
+            }
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn matmul_qk_mr4_chunk(
+    out: &mut [f32],
+    base_row: usize,
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) {
+    let mut i = 0usize;
+    while i + 4 <= out.len() {
+        let row0_off = data_offset + (base_row + i) * row_size;
+        let row1_off = row0_off + row_size;
+        let row2_off = row1_off + row_size;
+        let row3_off = row2_off + row_size;
+        let r0 = &mapped[row0_off..row0_off + row_size];
+        let r1 = &mapped[row1_off..row1_off + row_size];
+        let r2 = &mapped[row2_off..row2_off + row_size];
+        let r3 = &mapped[row3_off..row3_off + row_size];
+        let sums = match ttype {
+            GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        };
+        out[i] = sums[0];
+        out[i + 1] = sums[1];
+        out[i + 2] = sums[2];
+        out[i + 3] = sums[3];
+        i += 4;
+    }
+    while i < out.len() {
+        let row_off = data_offset + (base_row + i) * row_size;
+        let row = &mapped[row_off..row_off + row_size];
+        out[i] = match ttype {
+            GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn try_matmul_qk_mr4(
+    xout: &mut [f32],
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) -> bool {
+    if !matches!(ttype, GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K) {
+        return false;
+    }
+    if n < QK_K || n % QK_K != 0 {
+        return false;
+    }
+
+    let d = xout.len();
+    const PAR_CHUNK_ROWS: usize = 32;
+    if d >= par_matmul_min_rows() {
+        xout.par_chunks_mut(PAR_CHUNK_ROWS)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_row = chunk_idx * PAR_CHUNK_ROWS;
+                matmul_qk_mr4_chunk(chunk, base_row, x, mapped, data_offset, row_size, n, ttype);
+            });
+    } else {
+        matmul_qk_mr4_chunk(xout, 0, x, mapped, data_offset, row_size, n, ttype);
+    }
+    true
+}
+
 fn vec_dot_iq4_nl(x: &[f32], w: &[u8], n: usize) -> f32 {
     let nb = n / QK4_NL;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_IQ4_NL));
@@ -1727,60 +2741,124 @@ fn matmul_quantized(
     qw: &QuantizedTensor,
     mapped: &[u8],
 ) -> Result<(), String> {
+    let prof_t0 = prof_start();
     let d = qw.rows;
     let n = qw.cols;
     let row_size = get_row_size(n, qw.ttype);
     if xout.len() < d || x.len() < n {
         return Err("matmul shape mismatch".to_string());
     }
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = qw
+        .data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    let data_offset = qw.data_offset;
+    ensure_model_range(data_offset, data_size)?;
+    macro_rules! run_rows {
+        ($dot:path) => {{
+            if d >= par_matmul_min_rows() {
+                xout[..d].par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let row_off = data_offset + i * row_size;
+                    let row = &mapped[row_off..row_off + row_size];
+                    *out = $dot(x, row, n);
+                });
+            } else {
+                for (i, out) in xout[..d].iter_mut().enumerate() {
+                    let row_off = data_offset + i * row_size;
+                    let row = &mapped[row_off..row_off + row_size];
+                    *out = $dot(x, row, n);
+                }
+            }
+        }};
+    }
 
-    let dot: fn(&[f32], &[u8], usize) -> f32 = match qw.ttype.0 {
-        GGML_TYPE_Q4_0 => vec_dot_q4_0,
-        GGML_TYPE_Q4_1 => vec_dot_q4_1,
-        GGML_TYPE_Q5_0 => vec_dot_q5_0,
-        GGML_TYPE_Q5_1 => vec_dot_q5_1,
-        GGML_TYPE_Q8_0 => vec_dot_q8_0,
-        GGML_TYPE_Q2_K => vec_dot_q2_k,
-        GGML_TYPE_Q3_K => vec_dot_q3_k,
-        GGML_TYPE_Q4_K => vec_dot_q4_k,
-        GGML_TYPE_Q5_K => vec_dot_q5_k,
-        GGML_TYPE_Q6_K => vec_dot_q6_k,
-        GGML_TYPE_IQ4_NL => vec_dot_iq4_nl,
-        GGML_TYPE_F16 => vec_dot_f16,
-        GGML_TYPE_BF16 | 30 => vec_dot_bf16,
-        GGML_TYPE_F32 => vec_dot_f32,
+    match qw.ttype.0 {
+        GGML_TYPE_Q4_0 => run_rows!(vec_dot_q4_0),
+        GGML_TYPE_Q4_1 => run_rows!(vec_dot_q4_1),
+        GGML_TYPE_Q5_0 => run_rows!(vec_dot_q5_0),
+        GGML_TYPE_Q5_1 => run_rows!(vec_dot_q5_1),
+        GGML_TYPE_Q8_0 => run_rows!(vec_dot_q8_0),
+        GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
+        GGML_TYPE_Q3_K => run_rows!(vec_dot_q3_k),
+        GGML_TYPE_Q4_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_K,
+                ) {
+                    run_rows!(vec_dot_q4_k);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                run_rows!(vec_dot_q4_k);
+            }
+        }
+        GGML_TYPE_Q5_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_K,
+                ) {
+                    run_rows!(vec_dot_q5_k);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                run_rows!(vec_dot_q5_k);
+            }
+        }
+        GGML_TYPE_Q6_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q6_K,
+                ) {
+                    run_rows!(vec_dot_q6_k);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                run_rows!(vec_dot_q6_k);
+            }
+        }
+        GGML_TYPE_IQ4_NL => run_rows!(vec_dot_iq4_nl),
+        GGML_TYPE_F16 => run_rows!(vec_dot_f16),
+        GGML_TYPE_BF16 | 30 => run_rows!(vec_dot_bf16),
+        GGML_TYPE_F32 => run_rows!(vec_dot_f32),
         _ => {
             return Err(format!(
                 "unsupported quantization type in matmul: {}",
                 qw.ttype.0
             ))
         }
-    };
-
-    if d >= PAR_MATMUL_MIN_ROWS {
-        xout[..d]
-            .par_iter_mut()
-            .enumerate()
-            .try_for_each(|(i, out)| -> Result<(), String> {
-                let row_off = qw.data_offset + i * row_size;
-                if row_off + row_size > mapped.len() {
-                    return Err("quantized row outside mapped file".to_string());
-                }
-                let row = &mapped[row_off..row_off + row_size];
-                *out = dot(x, row, n);
-                Ok(())
-            })?;
-    } else {
-        for (i, out) in xout[..d].iter_mut().enumerate() {
-            let row_off = qw.data_offset + i * row_size;
-            if row_off + row_size > mapped.len() {
-                return Err("quantized row outside mapped file".to_string());
-            }
-            let row = &mapped[row_off..row_off + row_size];
-            *out = dot(x, row, n);
-        }
     }
 
+    prof_end(&PROF_MATMUL_NS, prof_t0);
     Ok(())
 }
 
@@ -1792,6 +2870,7 @@ fn matmul_quantized_rows(
     n_rows: usize,
     mapped: &[u8],
 ) -> Result<(), String> {
+    let prof_t0 = prof_start();
     let d = n_rows;
     let n = qw.cols;
     let row_size = get_row_size(n, qw.ttype);
@@ -1801,54 +2880,122 @@ fn matmul_quantized_rows(
     if xout.len() < d || x.len() < n {
         return Err("matmul shape mismatch".to_string());
     }
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+    macro_rules! run_rows {
+        ($dot:path) => {{
+            if d >= par_matmul_min_rows() {
+                xout[..d].par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let row_start = data_offset + i * row_size;
+                    let row = &mapped[row_start..row_start + row_size];
+                    *out = $dot(x, row, n);
+                });
+            } else {
+                for (i, out) in xout[..d].iter_mut().enumerate() {
+                    let row_start = data_offset + i * row_size;
+                    let row = &mapped[row_start..row_start + row_size];
+                    *out = $dot(x, row, n);
+                }
+            }
+        }};
+    }
 
-    let dot: fn(&[f32], &[u8], usize) -> f32 = match qw.ttype.0 {
-        GGML_TYPE_Q4_0 => vec_dot_q4_0,
-        GGML_TYPE_Q4_1 => vec_dot_q4_1,
-        GGML_TYPE_Q5_0 => vec_dot_q5_0,
-        GGML_TYPE_Q5_1 => vec_dot_q5_1,
-        GGML_TYPE_Q8_0 => vec_dot_q8_0,
-        GGML_TYPE_Q2_K => vec_dot_q2_k,
-        GGML_TYPE_Q3_K => vec_dot_q3_k,
-        GGML_TYPE_Q4_K => vec_dot_q4_k,
-        GGML_TYPE_Q5_K => vec_dot_q5_k,
-        GGML_TYPE_Q6_K => vec_dot_q6_k,
-        GGML_TYPE_IQ4_NL => vec_dot_iq4_nl,
-        GGML_TYPE_F16 => vec_dot_f16,
-        GGML_TYPE_BF16 | 30 => vec_dot_bf16,
-        GGML_TYPE_F32 => vec_dot_f32,
+    match qw.ttype.0 {
+        GGML_TYPE_Q4_0 => run_rows!(vec_dot_q4_0),
+        GGML_TYPE_Q4_1 => run_rows!(vec_dot_q4_1),
+        GGML_TYPE_Q5_0 => run_rows!(vec_dot_q5_0),
+        GGML_TYPE_Q5_1 => run_rows!(vec_dot_q5_1),
+        GGML_TYPE_Q8_0 => run_rows!(vec_dot_q8_0),
+        GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
+        GGML_TYPE_Q3_K => run_rows!(vec_dot_q3_k),
+        GGML_TYPE_Q4_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_K,
+                ) {
+                    run_rows!(vec_dot_q4_k);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                run_rows!(vec_dot_q4_k);
+            }
+        }
+        GGML_TYPE_Q5_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_K,
+                ) {
+                    run_rows!(vec_dot_q5_k);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                run_rows!(vec_dot_q5_k);
+            }
+        }
+        GGML_TYPE_Q6_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q6_K,
+                ) {
+                    run_rows!(vec_dot_q6_k);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                run_rows!(vec_dot_q6_k);
+            }
+        }
+        GGML_TYPE_IQ4_NL => run_rows!(vec_dot_iq4_nl),
+        GGML_TYPE_F16 => run_rows!(vec_dot_f16),
+        GGML_TYPE_BF16 | 30 => run_rows!(vec_dot_bf16),
+        GGML_TYPE_F32 => run_rows!(vec_dot_f32),
         _ => {
             return Err(format!(
                 "unsupported quantization type in matmul: {}",
                 qw.ttype.0
             ))
         }
-    };
-
-    if d >= PAR_MATMUL_MIN_ROWS {
-        xout[..d]
-            .par_iter_mut()
-            .enumerate()
-            .try_for_each(|(i, out)| -> Result<(), String> {
-                let row_off = qw.data_offset + (row_start + i) * row_size;
-                if row_off + row_size > mapped.len() {
-                    return Err("quantized row outside mapped file".to_string());
-                }
-                let row = &mapped[row_off..row_off + row_size];
-                *out = dot(x, row, n);
-                Ok(())
-            })?;
-    } else {
-        for (i, out) in xout[..d].iter_mut().enumerate() {
-            let row_off = qw.data_offset + (row_start + i) * row_size;
-            if row_off + row_size > mapped.len() {
-                return Err("quantized row outside mapped file".to_string());
-            }
-            let row = &mapped[row_off..row_off + row_size];
-            *out = dot(x, row, n);
-        }
     }
 
+    prof_end(&PROF_MATMUL_NS, prof_t0);
     Ok(())
 }
 
@@ -1859,11 +3006,18 @@ fn select_topk_softmax(
     topk_group: usize,
     normalize_topk: bool,
     scale: f32,
+    scores_scratch: &mut Vec<f32>,
+    selected_group_scratch: &mut Vec<bool>,
+    group_scores_scratch: &mut Vec<f32>,
+    rank_scratch: &mut Vec<usize>,
     out_indices: &mut [usize],
     out_weights: &mut [f32],
 ) -> usize {
     let top_k = k.max(1).min(logits.len());
-    let mut scores = vec![0.0f32; logits.len()];
+    if scores_scratch.len() < logits.len() {
+        scores_scratch.resize(logits.len(), 0.0);
+    }
+    let scores = &mut scores_scratch[..logits.len()];
     let mut max_logit = f32::NEG_INFINITY;
     for &v in logits {
         if v > max_logit {
@@ -1877,7 +3031,7 @@ fn select_topk_softmax(
         sum += e;
     }
     let inv_sum = 1.0 / sum.max(f32::MIN_POSITIVE);
-    for s in &mut scores {
+    for s in scores.iter_mut() {
         *s *= inv_sum;
     }
 
@@ -1888,9 +3042,18 @@ fn select_topk_softmax(
         logits.len()
     };
 
-    let mut selected_group = vec![true; n_group.max(1)];
+    let selected_group_len = n_group.max(1);
+    if selected_group_scratch.len() < selected_group_len {
+        selected_group_scratch.resize(selected_group_len, true);
+    }
+    let selected_group = &mut selected_group_scratch[..selected_group_len];
+    selected_group.fill(true);
+
     if use_grouped {
-        let mut group_scores = vec![0.0f32; n_group];
+        if group_scores_scratch.len() < n_group {
+            group_scores_scratch.resize(n_group, 0.0);
+        }
+        let group_scores = &mut group_scores_scratch[..n_group];
         for g in 0..n_group {
             let start = g * group_size;
             let end = start + group_size;
@@ -1908,7 +3071,10 @@ fn select_topk_softmax(
         }
 
         selected_group.fill(false);
-        let mut rank = vec![0usize; n_group];
+        if rank_scratch.len() < n_group {
+            rank_scratch.resize(n_group, 0);
+        }
+        let rank = &mut rank_scratch[..n_group];
         for (i, r) in rank.iter_mut().enumerate() {
             *r = i;
         }
@@ -2029,6 +3195,7 @@ fn load_tensor_float(
     if tensor.data_offset + src_size > mapped.len() {
         return Err(format!("tensor {name} exceeds mapped file bounds"));
     }
+    gguf.ensure_range(tensor.data_offset, src_size)?;
     let src = &mapped[tensor.data_offset..tensor.data_offset + src_size];
 
     dequantize_tensor(src, n_elements, tensor.ttype)
@@ -2581,8 +3748,11 @@ fn malloc_run_state(p: &Config) -> RunState {
         moe_logits: vec![0.0; p.n_experts],
         moe_topk_indices: vec![0usize; p.n_experts_used.max(1)],
         moe_topk_weights: vec![0.0f32; p.n_experts_used.max(1)],
+        moe_scores: vec![0.0; p.n_experts],
+        moe_selected_group: vec![true; p.moe_n_group.max(1)],
+        moe_group_scores: vec![0.0; p.moe_n_group.max(1)],
+        moe_group_rank: vec![0usize; p.moe_n_group.max(1)],
         q: vec![0.0; q_dim],
-        q_gate: vec![0.0; q_dim],
         k: vec![0.0; kv_dim],
         v: vec![0.0; kv_dim],
         ssm_qkv: vec![0.0; ssm_conv_dim],
@@ -2595,6 +3765,8 @@ fn malloc_run_state(p: &Config) -> RunState {
         ssm_gate_exp: vec![0.0; ssm_v_heads],
         ssm_beta: vec![0.0; ssm_v_heads],
         ssm_proj: vec![0.0; ssm_inner],
+        ssm_kv_mem: vec![0.0; ssm_inner],
+        ssm_delta: vec![0.0; ssm_inner],
         ssm_conv_state: vec![0.0; p.n_layers * ssm_conv_stride],
         ssm_state: vec![0.0; p.n_layers * ssm_state_stride],
         att: vec![0.0; p.n_heads * p.seq_len],
@@ -2739,6 +3911,65 @@ fn l2_norm(x: &[f32]) -> f32 {
     ss.sqrt()
 }
 
+#[inline(always)]
+fn qwen3next_state_head_step(
+    state_h: &mut [f32],
+    out_h: &mut [f32],
+    kv_mem: &mut [f32],
+    delta: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+) {
+    let head_dim = q.len();
+    debug_assert_eq!(k.len(), head_dim);
+    debug_assert_eq!(v.len(), head_dim);
+    debug_assert_eq!(out_h.len(), head_dim);
+    debug_assert_eq!(kv_mem.len(), head_dim);
+    debug_assert_eq!(delta.len(), head_dim);
+    debug_assert_eq!(state_h.len(), head_dim * head_dim);
+
+    scale_slice_inplace(state_h, g);
+
+    kv_mem.fill(0.0);
+    for j in 0..head_dim {
+        let kj = k[j];
+        if kj == 0.0 {
+            continue;
+        }
+        let col = &state_h[j * head_dim..(j + 1) * head_dim];
+        axpy_inplace(kv_mem, kj, col);
+    }
+    for i in 0..head_dim {
+        kv_mem[i] = finite_or_zero(kv_mem[i]);
+        delta[i] = finite_or_zero((v[i] - kv_mem[i]) * beta);
+    }
+
+    for j in 0..head_dim {
+        let kj = k[j];
+        if kj == 0.0 {
+            continue;
+        }
+        let col = &mut state_h[j * head_dim..(j + 1) * head_dim];
+        axpy_inplace(col, kj, delta);
+    }
+
+    out_h.fill(0.0);
+    for j in 0..head_dim {
+        let qj = q[j];
+        if qj == 0.0 {
+            continue;
+        }
+        let col = &state_h[j * head_dim..(j + 1) * head_dim];
+        axpy_inplace(out_h, qj, col);
+    }
+    for v in out_h {
+        *v = finite_or_zero(*v);
+    }
+}
+
 fn qwen3next_linear_attention_autoregressive(
     l: usize,
     p: &Config,
@@ -2747,6 +3978,7 @@ fn qwen3next_linear_attention_autoregressive(
     mapped: &[u8],
     eps: f32,
 ) -> Result<(), String> {
+    let prof_t0 = prof_start();
     let d_inner = p.ssm_inner_size;
     let n_k_heads = p.ssm_group_count;
     let n_v_heads = p.ssm_time_step_rank;
@@ -2914,62 +4146,68 @@ fn qwen3next_linear_attention_autoregressive(
         return Err("qwen3next state buffer too small".to_string());
     }
     let state = &mut s.ssm_state[state_off..state_off + state_stride];
-    for h in 0..n_v_heads {
-        let q = &s.ssm_q[h * head_dim..(h + 1) * head_dim];
-        let k = &s.ssm_k[h * head_dim..(h + 1) * head_dim];
-        let v = &s.ssm_v[h * head_dim..(h + 1) * head_dim];
-        let g = s.ssm_gate_exp[h];
-        let beta = s.ssm_beta[h];
-        let state_h = &mut state[h * head_dim * head_dim..(h + 1) * head_dim * head_dim];
-        let out_h = &mut s.ssm_proj[h * head_dim..(h + 1) * head_dim];
+    let q_all = &s.ssm_q[..d_inner];
+    let k_all = &s.ssm_k[..d_inner];
+    let v_all = &s.ssm_v[..d_inner];
+    let gate_all = &s.ssm_gate_exp[..n_v_heads];
+    let beta_all = &s.ssm_beta[..n_v_heads];
+    let proj_all = &mut s.ssm_proj[..d_inner];
+    let kv_mem_all = &mut s.ssm_kv_mem[..d_inner];
+    let delta_all = &mut s.ssm_delta[..d_inner];
 
-        // state is laid out as [value_dim, key_dim] in ggml order for qwen3next:
-        // kv_mem[i] = sum_j state[i, j] * k[j]
-        // state[i, j] = state[i, j] * g + delta[i] * k[j]
-        // out[i] = sum_j state[i, j] * q[j]
-        for i in 0..head_dim {
-            let row_off = i;
-            let mut kv_mem = 0.0f32;
-            for j in 0..head_dim {
-                let idx = row_off + head_dim * j;
-                state_h[idx] = finite_or_zero(state_h[idx] * g);
-                kv_mem += state_h[idx] * k[j];
-            }
-            s.hb[i] = finite_or_zero(kv_mem);
-            s.hb2[i] = (v[i] - s.hb[i]) * beta;
-        }
-
-        for i in 0..head_dim {
-            let di = s.hb2[i];
-            let row_off = i;
-            for j in 0..head_dim {
-                let idx = row_off + head_dim * j;
-                state_h[idx] = finite_or_zero(state_h[idx] + di * k[j]);
-            }
-        }
-
-        for i in 0..head_dim {
-            let row_off = i;
-            let mut out = 0.0f32;
-            for j in 0..head_dim {
-                let idx = row_off + head_dim * j;
-                out += state_h[idx] * q[j];
-            }
-            out_h[i] = finite_or_zero(out);
+    if n_v_heads >= par_qwen3next_min_heads() {
+        state
+            .par_chunks_mut(head_dim * head_dim)
+            .zip(proj_all.par_chunks_mut(head_dim))
+            .zip(kv_mem_all.par_chunks_mut(head_dim))
+            .zip(delta_all.par_chunks_mut(head_dim))
+            .enumerate()
+            .for_each(|(h, (((state_h, out_h), kv_mem), delta))| {
+                let q = &q_all[h * head_dim..(h + 1) * head_dim];
+                let k = &k_all[h * head_dim..(h + 1) * head_dim];
+                let v = &v_all[h * head_dim..(h + 1) * head_dim];
+                qwen3next_state_head_step(state_h, out_h, kv_mem, delta, q, k, v, gate_all[h], beta_all[h]);
+            });
+    } else {
+        for h in 0..n_v_heads {
+            let q = &q_all[h * head_dim..(h + 1) * head_dim];
+            let k = &k_all[h * head_dim..(h + 1) * head_dim];
+            let v = &v_all[h * head_dim..(h + 1) * head_dim];
+            let state_h = &mut state[h * head_dim * head_dim..(h + 1) * head_dim * head_dim];
+            let out_h = &mut proj_all[h * head_dim..(h + 1) * head_dim];
+            let kv_mem = &mut kv_mem_all[h * head_dim..(h + 1) * head_dim];
+            let delta = &mut delta_all[h * head_dim..(h + 1) * head_dim];
+            qwen3next_state_head_step(state_h, out_h, kv_mem, delta, q, k, v, gate_all[h], beta_all[h]);
         }
     }
 
     let ssm_norm = &w.ssm_norm[l * head_dim..(l + 1) * head_dim];
-    for h in 0..n_v_heads {
-        let out_h = &mut s.ssm_proj[h * head_dim..(h + 1) * head_dim];
-        let z_h = &s.ssm_z[h * head_dim..(h + 1) * head_dim];
-        let mut ss = 0.0f32;
-        for i in 0..head_dim {
-            ss += out_h[i] * out_h[i];
-        }
-        let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
-        for i in 0..head_dim {
-            out_h[i] = finite_or_zero(ssm_norm[i] * (out_h[i] * inv) * siluf(z_h[i]));
+    if n_v_heads >= par_qwen3next_min_heads() {
+        proj_all
+            .par_chunks_mut(head_dim)
+            .zip(s.ssm_z[..d_inner].par_chunks(head_dim))
+            .for_each(|(out_h, z_h)| {
+                let mut ss = 0.0f32;
+                for i in 0..head_dim {
+                    ss += out_h[i] * out_h[i];
+                }
+                let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+                for i in 0..head_dim {
+                    out_h[i] = finite_or_zero(ssm_norm[i] * (out_h[i] * inv) * siluf(z_h[i]));
+                }
+            });
+    } else {
+        for h in 0..n_v_heads {
+            let out_h = &mut proj_all[h * head_dim..(h + 1) * head_dim];
+            let z_h = &s.ssm_z[h * head_dim..(h + 1) * head_dim];
+            let mut ss = 0.0f32;
+            for i in 0..head_dim {
+                ss += out_h[i] * out_h[i];
+            }
+            let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+            for i in 0..head_dim {
+                out_h[i] = finite_or_zero(ssm_norm[i] * (out_h[i] * inv) * siluf(z_h[i]));
+            }
         }
     }
 
@@ -2982,6 +4220,7 @@ fn qwen3next_linear_attention_autoregressive(
     for v in &mut s.xb2[..p.dim] {
         *v = finite_or_zero(*v);
     }
+    prof_end(&PROF_SSM_NS, prof_t0);
     Ok(())
 }
 
@@ -3050,6 +4289,8 @@ fn transformer(
         if is_qwen3next_ssm_layer {
             qwen3next_linear_attention_autoregressive(l, p, s, w, mapped, eps)?;
         } else {
+            let attn_prof = prof_start();
+            let mut qwen3next_packed_q_gate = false;
             if p.is_qwen3next {
                 if w.wq[l].rows >= 2 * q_dim {
                     // Qwen3Next full-attn packs Q and gate interleaved per head:
@@ -3062,17 +4303,26 @@ fn transformer(
                         2 * q_dim,
                         mapped,
                     )?;
-                    for h in 0..p.n_heads {
-                        let src_base = h * 2 * head_size;
-                        let dst_base = h * head_size;
-                        s.q[dst_base..dst_base + head_size]
-                            .copy_from_slice(&s.hb[src_base..src_base + head_size]);
-                        s.q_gate[dst_base..dst_base + head_size]
-                            .copy_from_slice(&s.hb[src_base + head_size..src_base + 2 * head_size]);
+                    if p.n_heads >= par_attn_min_heads() {
+                        let hb_src = &s.hb[..2 * q_dim];
+                        s.q[..q_dim]
+                            .par_chunks_mut(head_size)
+                            .enumerate()
+                            .for_each(|(h, q_dst)| {
+                                let src_base = h * 2 * head_size;
+                                q_dst.copy_from_slice(&hb_src[src_base..src_base + head_size]);
+                            });
+                    } else {
+                        for h in 0..p.n_heads {
+                            let src_base = h * 2 * head_size;
+                            let dst_base = h * head_size;
+                            s.q[dst_base..dst_base + head_size]
+                                .copy_from_slice(&s.hb[src_base..src_base + head_size]);
+                        }
                     }
+                    qwen3next_packed_q_gate = true;
                 } else if w.wq[l].rows == q_dim {
                     matmul_quantized(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], mapped)?;
-                    s.q_gate[..q_dim].fill(1.0);
                 } else {
                     matmul_quantized_rows(
                         &mut s.q[..q_dim],
@@ -3082,7 +4332,6 @@ fn transformer(
                         q_dim,
                         mapped,
                     )?;
-                    s.q_gate[..q_dim].fill(1.0);
                 }
                 if w.wk[l].rows == kv_dim {
                     matmul_quantized(&mut s.k[..kv_dim], &s.xb[..dim], &w.wk[l], mapped)?;
@@ -3228,7 +4477,7 @@ fn transformer(
             let value_cache = &s.value_cache;
             let (att_all, xb_all) = (&mut s.att[..p.n_heads * p.seq_len], &mut s.xb[..q_dim]);
 
-            if p.n_heads >= PAR_ATTN_MIN_HEADS {
+            if p.n_heads >= par_attn_min_heads() {
                 att_all
                     .par_chunks_mut(p.seq_len)
                     .zip(xb_all.par_chunks_mut(head_size))
@@ -3290,15 +4539,21 @@ fn transformer(
                 }
             }
 
-            if p.is_qwen3next && w.wq[l].rows >= 2 * q_dim {
-                for i in 0..q_dim {
-                    s.xb[i] = finite_or_zero(s.xb[i] * sigmoidf(finite_or_zero(s.q_gate[i])));
+            if qwen3next_packed_q_gate {
+                for h in 0..p.n_heads {
+                    let src_base = h * 2 * head_size + head_size;
+                    let dst_base = h * head_size;
+                    for i in 0..head_size {
+                        s.xb[dst_base + i] =
+                            finite_or_zero(s.xb[dst_base + i] * sigmoidf(s.hb[src_base + i]));
+                    }
                 }
             }
             matmul_quantized(&mut s.xb2[..dim], &s.xb[..q_dim], &w.wo[l], mapped)?;
             for v in &mut s.xb2[..dim] {
                 *v = finite_or_zero(*v);
             }
+            prof_end(&PROF_ATTN_NS, attn_prof);
         }
 
         if do_layer_debug {
@@ -3339,6 +4594,7 @@ fn transformer(
         }
 
         if p.is_qwen3moe || p.is_qwen3next {
+            let moe_prof = prof_start();
             let expert_hidden = p.expert_hidden_dim;
             s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
             matmul_quantized(
@@ -3354,6 +4610,10 @@ fn transformer(
                 p.moe_topk_group,
                 p.moe_norm_topk_prob,
                 p.moe_routed_scaling_factor,
+                &mut s.moe_scores,
+                &mut s.moe_selected_group,
+                &mut s.moe_group_scores,
+                &mut s.moe_group_rank,
                 &mut s.moe_topk_indices,
                 &mut s.moe_topk_weights,
             );
@@ -3429,7 +4689,9 @@ fn transformer(
                     s.xb[i] += gate * s.moe_tmp[i];
                 }
             }
+            prof_end(&PROF_MOE_NS, moe_prof);
         } else {
+            let ffn_prof = prof_start();
             matmul_quantized(&mut s.hb[..hidden_dim], &s.xb[..dim], &w.w1[l], mapped)?;
             matmul_quantized(&mut s.hb2[..hidden_dim], &s.xb[..dim], &w.w3[l], mapped)?;
 
@@ -3448,6 +4710,7 @@ fn transformer(
             }
 
             matmul_quantized(&mut s.xb[..dim], &s.hb[..hidden_dim], &w.w2[l], mapped)?;
+            prof_end(&PROF_FFN_NS, ffn_prof);
         }
 
         if p.is_gemma3 && !w.ffn_post_norm.is_empty() {
@@ -4101,20 +5364,47 @@ fn time_in_ms() -> i64 {
     (now.as_secs() * 1000 + (now.subsec_nanos() as u64 / 1_000_000)) as i64
 }
 
+fn configure_rayon_threads(num_threads: usize, debug_mode: bool) {
+    if num_threads == 0 {
+        return;
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+    {
+        Ok(()) => {
+            if debug_mode {
+                eprintln!("Parallel: configured rayon worker threads={num_threads}");
+            }
+        }
+        Err(e) => {
+            if debug_mode {
+                eprintln!(
+                    "Parallel: keeping existing rayon global thread pool (requested {num_threads}, reason: {e})"
+                );
+            }
+        }
+    }
+}
+
 fn usage(program: &str) {
-    println!("Usage: {program} -model <model.gguf> -prompt <text> [options]");
+    println!("Usage: {program} -model <model.gguf> -prompt <text> [-url <remote.gguf>] [options]");
     println!();
     println!("Required arguments:");
     println!("  -model         path to GGUF model file");
     println!("  -prompt        input prompt text");
     println!();
     println!("Optional arguments:");
+    println!("  -url           remote GGUF URL (used only when local -model file is missing/invalid)");
     println!("  -system_prompt system prompt (default: \"You are a helpful assistant.\")");
     println!("  -temperature   sampling temperature (default: 0.9, use 0.0 for greedy)");
     println!("  -top_k         top-k sampling cutoff (default: 0 = disabled)");
     println!("  -top_p         top-p nucleus threshold in (0,1] (default: 1.0 = disabled)");
     println!("  -max_tokens    number of tokens to generate (default: 256)");
     println!("  -context_size  context size for the AI model (default: model's max)");
+    println!("  -threads       rayon worker threads (default: auto)");
+    println!("  -show-tokens   always print achieved tok/s at the end");
+    println!("  -profiling     print token-level profiling counters");
     println!("  -debug         show detailed model loading and performance logs");
     println!();
     println!("Example:");
@@ -4134,9 +5424,16 @@ fn run() -> Result<(), String> {
     let mut top_p: f32 = 1.0;
     let mut max_tokens: usize = 256;
     let mut context_size: usize = 0;
+    let mut rayon_threads: Option<usize> = env::var("LLAMA3PURE_RAYON_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0);
     let mut system_prompt = String::from("You are a helpful assistant.");
     let mut checkpoint: Option<String> = None;
+    let mut model_url: Option<String> = None;
     let mut prompt: Option<String> = None;
+    let mut profiling_mode = false;
+    let mut show_tokens = false;
     let mut debug_mode = false;
 
     let args: Vec<String> = env::args().collect();
@@ -4150,6 +5447,10 @@ fn run() -> Result<(), String> {
         match args[i].as_str() {
             "-model" if i + 1 < args.len() => {
                 checkpoint = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-url" if i + 1 < args.len() => {
+                model_url = Some(args[i + 1].clone());
                 i += 2;
             }
             "-temperature" if i + 1 < args.len() => {
@@ -4185,6 +5486,25 @@ fn run() -> Result<(), String> {
                     .map_err(|e| format!("invalid -context_size: {e}"))?;
                 i += 2;
             }
+            "-threads" if i + 1 < args.len() => {
+                rayon_threads = Some(
+                    args[i + 1]
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid -threads: {e}"))?,
+                );
+                if rayon_threads == Some(0) {
+                    return Err("invalid -threads: expected >= 1".to_string());
+                }
+                i += 2;
+            }
+            "-profiling" => {
+                profiling_mode = true;
+                i += 1;
+            }
+            "-show-tokens" | "-show_tokens" => {
+                show_tokens = true;
+                i += 1;
+            }
             "-prompt" if i + 1 < args.len() => {
                 prompt = Some(args[i + 1].clone());
                 i += 2;
@@ -4217,13 +5537,18 @@ fn run() -> Result<(), String> {
         eprintln!("Sampling: temperature={temperature}, top_k={top_k}, top_p={top_p}");
     }
 
-    let gguf = parse_gguf_file(&checkpoint, debug_mode)?;
+    let gguf = parse_gguf_file(&checkpoint, model_url.as_deref(), debug_mode)?;
+    let lazy_debug_loader = gguf.lazy_loader.as_ref().map(Arc::clone);
+    let mut next_lazy_debug_ms = time_in_ms() + 2_000;
 
     if debug_mode {
         eprintln!(
             "GGUF metadata: version={}, tensors={}, kv={}, tensor_data_start={} bytes",
             gguf.version, gguf.n_tensors, gguf.n_kv, gguf.tensor_data_start
         );
+        if let Some(loader) = &lazy_debug_loader {
+            eprintln!("{}", loader.debug_stats_line());
+        }
     }
 
     let mut config = model::config::build_config_from_gguf(&gguf, debug_mode)?;
@@ -4234,6 +5559,24 @@ fn run() -> Result<(), String> {
     model::config::apply_context_size_overrides(&mut config, context_size, debug_mode);
     if max_tokens == 0 || max_tokens > config.seq_len {
         max_tokens = config.seq_len;
+    }
+
+    if let Some(n_threads) = rayon_threads {
+        configure_rayon_threads(n_threads, debug_mode);
+    }
+
+    PROFILING_ENABLED.store(profiling_mode, AtomicOrdering::Relaxed);
+    if profiling_mode {
+        profiling_reset();
+    }
+
+    if debug_mode {
+        eprintln!(
+            "Parallel thresholds: matmul_min_rows={}, attn_min_heads={}, qwen3next_min_heads={}",
+            par_matmul_min_rows(),
+            par_attn_min_heads(),
+            par_qwen3next_min_heads()
+        );
     }
 
     let weights = init_weights_from_gguf(&gguf, &config, debug_mode)?;
@@ -4305,6 +5648,7 @@ fn run() -> Result<(), String> {
             return Err(format!("token id out of bounds: {token}"));
         }
 
+        let prof_t0 = prof_start();
         transformer(
             token as usize,
             pos,
@@ -4313,6 +5657,19 @@ fn run() -> Result<(), String> {
             &weights,
             gguf.mapped.as_slice(),
         )?;
+        prof_end(&PROF_TRANSFORMER_NS, prof_t0);
+        if profiling_mode {
+            PROF_FORWARD_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        if debug_mode {
+            if let Some(loader) = &lazy_debug_loader {
+                let now = time_in_ms();
+                if now >= next_lazy_debug_ms {
+                    eprintln!("{}", loader.debug_stats_line());
+                    next_lazy_debug_ms = now + 2_000;
+                }
+            }
+        }
 
         if debug_mode
             && pos >= prompt_tokens.len().saturating_sub(1)
@@ -4426,7 +5783,7 @@ fn run() -> Result<(), String> {
     }
 
     let end = time_in_ms();
-    if debug_mode && pos > 1 {
+    if (debug_mode || show_tokens) && pos > 1 {
         let elapsed_ms = (end - start).max(1) as f64;
         eprintln!(
             "\nachieved tok/s: {:.3}",
@@ -4434,6 +5791,44 @@ fn run() -> Result<(), String> {
         );
     } else {
         println!();
+    }
+
+    if profiling_mode {
+        let total_ns = PROF_TRANSFORMER_NS.load(AtomicOrdering::Relaxed);
+        let matmul_ns = PROF_MATMUL_NS.load(AtomicOrdering::Relaxed);
+        let ssm_ns = PROF_SSM_NS.load(AtomicOrdering::Relaxed);
+        let attn_ns = PROF_ATTN_NS.load(AtomicOrdering::Relaxed);
+        let moe_ns = PROF_MOE_NS.load(AtomicOrdering::Relaxed);
+        let ffn_ns = PROF_FFN_NS.load(AtomicOrdering::Relaxed);
+        let passes = PROF_FORWARD_PASSES.load(AtomicOrdering::Relaxed);
+        let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let pct = |part: u64| {
+            if total_ns == 0 {
+                0.0
+            } else {
+                (part as f64 * 100.0) / total_ns as f64
+            }
+        };
+        eprintln!("\n[PROFILE] forward_passes={passes}");
+        eprintln!(
+            "[PROFILE] transformer_total={:.3} ms ({:.3} ms/pass)",
+            to_ms(total_ns),
+            if passes == 0 { 0.0 } else { to_ms(total_ns) / passes as f64 }
+        );
+        eprintln!(
+            "[PROFILE] matmul={:.3} ms ({:.1}%)",
+            to_ms(matmul_ns),
+            pct(matmul_ns)
+        );
+        eprintln!("[PROFILE] ssm={:.3} ms ({:.1}%)", to_ms(ssm_ns), pct(ssm_ns));
+        eprintln!(
+            "[PROFILE] attention={:.3} ms ({:.1}%)",
+            to_ms(attn_ns),
+            pct(attn_ns)
+        );
+        eprintln!("[PROFILE] moe={:.3} ms ({:.1}%)", to_ms(moe_ns), pct(moe_ns));
+        eprintln!("[PROFILE] ffn={:.3} ms ({:.1}%)", to_ms(ffn_ns), pct(ffn_ns));
+        eprintln!("[PROFILE] note: counters overlap (e.g. matmul is included in SSM/attention/MoE/FFN)");
     }
 
     Ok(())

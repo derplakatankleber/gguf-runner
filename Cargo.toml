@@ -11,3 +11,4 @@ panic = "abort"
 
 [dependencies]
 rayon = "1.10"
+ureq = "2.10"

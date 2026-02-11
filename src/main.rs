@@ -1719,7 +1719,6 @@ unsafe fn dot_f32_simd_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_f32_avx2_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
     let mut i = 0usize;
@@ -1746,7 +1745,6 @@ unsafe fn dot_f32_avx2_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
 #[target_feature(enable = "avx,f16c,fma")]
 unsafe fn vec_dot_f16_f16c_prefix(x: *const f32, w: *const u8, n: usize) -> f32 {
     let mut i = 0usize;
@@ -1764,7 +1762,6 @@ unsafe fn vec_dot_f16_f16c_prefix(x: *const f32, w: *const u8, n: usize) -> f32 
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vec_dot_bf16_avx2_prefix(x: *const f32, w: *const u8, n: usize) -> f32 {
     let mut i = 0usize;
@@ -1851,7 +1848,6 @@ unsafe fn axpy_simd_ptr(dst: *mut f32, src: *const f32, a: f32, n: usize) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn axpy_avx2_ptr(dst: *mut f32, src: *const f32, a: f32, n: usize) {
     let mut i = 0usize;
@@ -1941,7 +1937,6 @@ unsafe fn scale_simd_inplace(x: *mut f32, alpha: f32, n: usize) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
 #[target_feature(enable = "avx2")]
 unsafe fn scale_avx2_inplace(x: *mut f32, alpha: f32, n: usize) {
     let mut i = 0usize;

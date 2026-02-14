@@ -316,6 +316,7 @@ LLAMA3PURE_PAR_ATTN_MIN_HEADS=16 \
 LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 \
 /usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 12 -show-tokens
 ```
+./target/release/llama3pure -model Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 12 -show-tokens
 
 ### quick ablation checks
 

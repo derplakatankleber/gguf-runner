@@ -150,7 +150,7 @@ src/
   - Builds `Config` from family-specific key conventions.
   - Routes chat prompt encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
-  - Family-specific defaults, validations, and prompt rendering.
+  - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling).
 
 ## Runtime Data Flow
 

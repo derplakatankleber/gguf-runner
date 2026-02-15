@@ -11,6 +11,17 @@ fn parse_top_p(raw: &str) -> Result<f32, String> {
     }
 }
 
+fn parse_positive_f32(raw: &str) -> Result<f32, String> {
+    let v = raw
+        .parse::<f32>()
+        .map_err(|e| format!("invalid value '{raw}': {e}"))?;
+    if v > 0.0 {
+        Ok(v)
+    } else {
+        Err(format!("invalid value '{raw}': expected > 0"))
+    }
+}
+
 fn parse_positive_usize(raw: &str) -> Result<usize, String> {
     let v = raw
         .parse::<usize>()
@@ -71,6 +82,16 @@ struct Cli {
         default_value_t = 1.0
     )]
     top_p: f32,
+
+    #[arg(
+        long = "repeat-penalty",
+        value_parser = parse_positive_f32,
+        default_value_t = 1.0
+    )]
+    repeat_penalty: f32,
+
+    #[arg(long = "repeat-last-n", default_value_t = 64)]
+    repeat_last_n: usize,
 
     #[arg(long = "max-tokens", default_value_t = 0)]
     max_tokens: usize,
@@ -214,6 +235,8 @@ pub(crate) struct CliOptions {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
     pub(crate) top_p: f32,
+    pub(crate) repeat_penalty: f32,
+    pub(crate) repeat_last_n: usize,
     pub(crate) max_tokens: usize,
     pub(crate) context_size: usize,
     pub(crate) threads: Option<usize>,
@@ -255,6 +278,8 @@ impl CliOptions {
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,
+            repeat_penalty: cli.repeat_penalty,
+            repeat_last_n: cli.repeat_last_n,
             max_tokens: cli.max_tokens,
             context_size: cli.context_size,
             threads: cli.threads,

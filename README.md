@@ -40,6 +40,8 @@ Common optional flags:
 - `--temperature <float>`
 - `--top-k <int>`
 - `--top-p <float>`
+- `--repeat-penalty <float>`
+- `--repeat-last-n <int>`
 - `--max-tokens <int>`
 - `--context-size <int>`
 - `--threads <int>`

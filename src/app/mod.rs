@@ -11,6 +11,8 @@ use crate::engine::switches::{
 };
 use crate::engine::types::{XorShiftRng, GEMMA3_END_TURN};
 use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -52,6 +54,8 @@ pub(crate) fn run() -> Result<(), String> {
     let temperature = cli.temperature;
     let top_k = cli.top_k;
     let top_p = cli.top_p;
+    let repetition_penalty = cli.repeat_penalty;
+    let repeat_last_n = cli.repeat_last_n;
     let mut max_tokens = cli.max_tokens;
     let context_size = cli.context_size;
     let rayon_threads = cli.threads;
@@ -66,7 +70,9 @@ pub(crate) fn run() -> Result<(), String> {
 
     if debug_mode {
         eprintln!("Loading GGUF model: {checkpoint}");
-        eprintln!("Sampling: temperature={temperature}, top_k={top_k}, top_p={top_p}");
+        eprintln!(
+            "Sampling: temperature={temperature}, top_k={top_k}, top_p={top_p}, repeat_penalty={repetition_penalty}, repeat_last_n={repeat_last_n}"
+        );
     }
 
     let gguf = parse_gguf_file(&checkpoint, model_url.as_deref(), debug_mode)?;
@@ -154,9 +160,17 @@ pub(crate) fn run() -> Result<(), String> {
     let mut topk_sampler = TopKSampler::new();
     let mut warned_top_p_without_top_k = false;
 
-    let mut recent_tokens = [0i32; 64];
-    let mut recent_count = 0usize;
-    let repetition_penalty = 1.0f32;
+    let use_repetition_penalty = repetition_penalty != 1.0 && repeat_last_n > 0;
+    let mut recent_tokens = if use_repetition_penalty {
+        VecDeque::with_capacity(repeat_last_n)
+    } else {
+        VecDeque::new()
+    };
+    let mut unique_recent_tokens = if use_repetition_penalty {
+        HashSet::with_capacity(repeat_last_n)
+    } else {
+        HashSet::new()
+    };
     let mut pending_newline = false;
 
     let gemma3_end_turn = if config.is_gemma3 {
@@ -228,14 +242,19 @@ pub(crate) fn run() -> Result<(), String> {
         if pos < prompt_tokens.len().saturating_sub(1) {
             next = prompt_tokens[pos + 1];
         } else {
-            for i in 0..recent_count {
-                let tok = recent_tokens[i];
-                if tok >= 0 && (tok as usize) < config.vocab_size {
-                    let idx = tok as usize;
-                    if state.logits[idx] > 0.0 {
-                        state.logits[idx] /= repetition_penalty;
-                    } else {
-                        state.logits[idx] *= repetition_penalty;
+            if use_repetition_penalty {
+                unique_recent_tokens.clear();
+                for &tok in &recent_tokens {
+                    unique_recent_tokens.insert(tok);
+                }
+                for tok in unique_recent_tokens.iter().copied() {
+                    if tok >= 0 && (tok as usize) < config.vocab_size {
+                        let idx = tok as usize;
+                        if state.logits[idx] > 0.0 {
+                            state.logits[idx] /= repetition_penalty;
+                        } else {
+                            state.logits[idx] *= repetition_penalty;
+                        }
                     }
                 }
             }
@@ -262,14 +281,11 @@ pub(crate) fn run() -> Result<(), String> {
                 next = sample(&state.logits[..config.vocab_size], &mut rng) as i32;
             }
 
-            if recent_count < 64 {
-                recent_tokens[recent_count] = next;
-                recent_count += 1;
-            } else {
-                for i in 0..63 {
-                    recent_tokens[i] = recent_tokens[i + 1];
+            if use_repetition_penalty {
+                if recent_tokens.len() == repeat_last_n {
+                    recent_tokens.pop_front();
                 }
-                recent_tokens[63] = next;
+                recent_tokens.push_back(next);
             }
         }
 

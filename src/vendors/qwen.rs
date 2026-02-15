@@ -23,7 +23,7 @@ pub(super) fn apply_qwen3moe_defaults(config: &mut Config) {
     config.moe_n_group = 8;
     config.moe_topk_group = 4;
     config.moe_norm_topk_prob = true;
-    config.moe_routed_scaling_factor = 2.5;
+    config.moe_routed_scaling_factor = 1.0;
 }
 
 pub(super) fn validate_qwen3next(config: &mut Config) -> Result<(), String> {

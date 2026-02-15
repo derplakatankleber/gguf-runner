@@ -33,6 +33,7 @@ Supported tensor data paths include:
   - greedy (`--temperature 0`)
   - stochastic temperature sampling
   - top-k / top-p (note: `top-p` is applied when `top-k > 0`)
+  - repetition control (`--repeat-penalty`, `--repeat-last-n`)
 - runtime diagnostics:
   - `--debug`
   - `--show-tokens`

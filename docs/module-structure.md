@@ -168,6 +168,7 @@ src/
 - Includes:
   - `RuntimeSwitchConfig` (engine-owned overrides struct)
   - Parallel thresholds (`par_matmul_min_rows`, `par_matmul_chunk_rows`, `par_attn_min_heads`, `par_qwen3next_min_heads`)
+  - KV cache selection switch (`kv_cache_mode`: `auto` / `q8` / `q4`)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
   - Layer debug toggles
   - MR4 status atomics

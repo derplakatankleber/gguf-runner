@@ -54,6 +54,26 @@ fn parse_boolish(raw: &str) -> Result<bool, String> {
     ))
 }
 
+fn parse_kv_cache_mode(raw: &str) -> Result<CliKvCacheMode, String> {
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        Ok(CliKvCacheMode::Auto)
+    } else if v.eq_ignore_ascii_case("q8") {
+        Ok(CliKvCacheMode::Q8)
+    } else if v.eq_ignore_ascii_case("q4") {
+        Ok(CliKvCacheMode::Q4)
+    } else {
+        Err(format!("invalid value '{raw}': expected one of auto/q8/q4"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliKvCacheMode {
+    Auto,
+    Q8,
+    Q4,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     about = "Run GGUF language models",
@@ -136,6 +156,14 @@ struct Cli {
 
     #[arg(long)]
     debug: bool,
+
+    #[arg(
+        long = "kv-cache-mode",
+        hide = true,
+        env = "GGUF_KV_CACHE_MODE",
+        value_parser = parse_kv_cache_mode
+    )]
+    kv_cache_mode: Option<CliKvCacheMode>,
 
     #[arg(
         long = "par-matmul-min-rows",
@@ -265,6 +293,7 @@ pub(crate) struct CliOptions {
     pub(crate) show_tokens: bool,
     pub(crate) show_timings: bool,
     pub(crate) debug: bool,
+    pub(crate) kv_cache_mode: Option<CliKvCacheMode>,
     pub(crate) par_matmul_min_rows: Option<usize>,
     pub(crate) par_matmul_chunk_rows: Option<usize>,
     pub(crate) par_attn_min_heads: Option<usize>,
@@ -312,6 +341,7 @@ impl CliOptions {
             show_tokens: cli.show_tokens,
             show_timings: cli.show_timings,
             debug: cli.debug,
+            kv_cache_mode: cli.kv_cache_mode,
             par_matmul_min_rows: cli.par_matmul_min_rows,
             par_matmul_chunk_rows: cli.par_matmul_chunk_rows,
             par_attn_min_heads: cli.par_attn_min_heads,

@@ -59,6 +59,7 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_PAR_MATMUL_CHUNK_ROWS`
 - `GGUF_PAR_ATTN_MIN_HEADS`
 - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
+- `GGUF_KV_CACHE_MODE` (`auto`, `q8`, `q4`)
 - `GGUF_LAYER_DEBUG`
 - `GGUF_LAYER_DEBUG_POS`
 - `GGUF_AARCH64_DOTPROD_Q8` (aarch64 only)

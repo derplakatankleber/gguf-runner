@@ -95,6 +95,14 @@ pub(crate) static X86_Q5K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 pub(crate) static X86_Q6K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 static LAYER_DEBUG_CFG: OnceLock<bool> = OnceLock::new();
 static LAYER_DEBUG_POS_CFG: OnceLock<Option<usize>> = OnceLock::new();
+static KV_CACHE_MODE_CFG: OnceLock<KvCacheMode> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KvCacheMode {
+    Auto,
+    Q8,
+    Q4,
+}
 
 pub(crate) struct RuntimeSwitchConfig {
     pub(crate) par_matmul_min_rows: Option<usize>,
@@ -117,6 +125,7 @@ pub(crate) struct RuntimeSwitchConfig {
     pub(crate) x86_avx512vnni_q8: Option<bool>,
     pub(crate) layer_debug: Option<bool>,
     pub(crate) layer_debug_pos: Option<usize>,
+    pub(crate) kv_cache_mode: Option<KvCacheMode>,
 }
 
 #[inline]
@@ -147,6 +156,11 @@ pub(crate) fn par_attn_min_heads() -> usize {
 #[inline]
 pub(crate) fn par_qwen3next_min_heads() -> usize {
     *PAR_QWEN3NEXT_MIN_HEADS_CFG.get_or_init(par_qwen3next_min_heads_default)
+}
+
+#[inline]
+pub(crate) fn kv_cache_mode() -> KvCacheMode {
+    *KV_CACHE_MODE_CFG.get_or_init(|| KvCacheMode::Auto)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -218,6 +232,9 @@ pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
     }
     if let Some(v) = config.layer_debug_pos {
         let _ = LAYER_DEBUG_POS_CFG.set(Some(v));
+    }
+    if let Some(v) = config.kv_cache_mode {
+        let _ = KV_CACHE_MODE_CFG.set(v);
     }
 
     #[cfg(target_arch = "aarch64")]

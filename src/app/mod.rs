@@ -5,10 +5,18 @@ mod tools;
 use crate::cli::CliOptions;
 use crate::engine::profiling::{print_profile_report, profiling_reset, set_profiling_enabled};
 use crate::engine::switches::{
-    init_runtime_config, par_attn_min_heads, par_matmul_chunk_rows, par_matmul_min_rows,
-    par_qwen3next_min_heads, RuntimeSwitchConfig,
+    init_runtime_config, kv_cache_mode, par_attn_min_heads, par_matmul_chunk_rows,
+    par_matmul_min_rows, par_qwen3next_min_heads, KvCacheMode, RuntimeSwitchConfig,
 };
 use std::time::Instant;
+
+fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCacheMode> {
+    mode.map(|v| match v {
+        crate::cli::CliKvCacheMode::Auto => KvCacheMode::Auto,
+        crate::cli::CliKvCacheMode::Q8 => KvCacheMode::Q8,
+        crate::cli::CliKvCacheMode::Q4 => KvCacheMode::Q4,
+    })
+}
 
 pub(crate) fn run() -> Result<(), String> {
     let cli = CliOptions::parse()?;
@@ -33,6 +41,7 @@ pub(crate) fn run() -> Result<(), String> {
         x86_avx512vnni_q8: cli.x86_avx512vnni_q8,
         layer_debug: cli.layer_debug,
         layer_debug_pos: cli.layer_debug_pos,
+        kv_cache_mode: map_kv_cache_mode(cli.kv_cache_mode),
     };
     init_runtime_config(&runtime_switch_config);
     let run_started = Instant::now();
@@ -50,6 +59,7 @@ pub(crate) fn run() -> Result<(), String> {
             par_attn_min_heads(),
             par_qwen3next_min_heads()
         );
+        eprintln!("KV cache mode request: {:?}", kv_cache_mode());
     }
 
     let mut runtime = generation::ModelRuntime::load(&cli)?;

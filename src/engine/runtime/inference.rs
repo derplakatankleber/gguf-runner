@@ -5,7 +5,10 @@ use crate::engine::kernels::{
     sigmoidf, softmax,
 };
 use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
-use crate::engine::switches::{layer_debug_enabled, layer_debug_pos, par_attn_min_heads};
+use crate::engine::switches::{
+    kv_cache_mode, layer_debug_enabled, layer_debug_pos, par_attn_min_heads,
+    KvCacheMode as SwitchKvCacheMode,
+};
 use crate::engine::types::{Config, KvCacheFormat, RunState, TransformerWeights};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
@@ -222,24 +225,37 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         .ok_or_else(|| "overflow while computing kv cache size".to_string())?;
     let kv_cache_q4_len = kv_cache_len.div_ceil(2);
 
-    let (kv_cache_format, key_cache_q8, value_cache_q8, key_cache_q4, value_cache_q4) = {
-        let q8_try = (|| -> Result<(Vec<i8>, Vec<i8>), String> {
-            let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
-            let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
-            Ok((key, value))
-        })();
-
-        match q8_try {
-            Ok((key, value)) => (KvCacheFormat::Q8, key, value, Vec::new(), Vec::new()),
-            Err(q8_err) => {
-                eprintln!("KV cache Q8 allocation failed: {q8_err}");
-                eprintln!("Falling back to KV cache Q4 format.");
+    let requested_mode = kv_cache_mode();
+    let (kv_cache_format, key_cache_q8, value_cache_q8, key_cache_q4, value_cache_q4) =
+        match requested_mode {
+            SwitchKvCacheMode::Q8 => {
+                let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
+                let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
+                (KvCacheFormat::Q8, key, value, Vec::new(), Vec::new())
+            }
+            SwitchKvCacheMode::Q4 => {
                 let key = alloc_u8(kv_cache_q4_len, "Q4 key cache")?;
                 let value = alloc_u8(kv_cache_q4_len, "Q4 value cache")?;
                 (KvCacheFormat::Q4, Vec::new(), Vec::new(), key, value)
             }
-        }
-    };
+            SwitchKvCacheMode::Auto => {
+                let q8_try = (|| -> Result<(Vec<i8>, Vec<i8>), String> {
+                    let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
+                    let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
+                    Ok((key, value))
+                })();
+                match q8_try {
+                    Ok((key, value)) => (KvCacheFormat::Q8, key, value, Vec::new(), Vec::new()),
+                    Err(q8_err) => {
+                        eprintln!("KV cache Q8 allocation failed: {q8_err}");
+                        eprintln!("Falling back to KV cache Q4 format.");
+                        let key = alloc_u8(kv_cache_q4_len, "Q4 key cache")?;
+                        let value = alloc_u8(kv_cache_q4_len, "Q4 value cache")?;
+                        (KvCacheFormat::Q4, Vec::new(), Vec::new(), key, value)
+                    }
+                }
+            }
+        };
 
     Ok(RunState {
         x: vec![0.0; p.dim],

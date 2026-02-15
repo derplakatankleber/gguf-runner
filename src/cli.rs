@@ -72,7 +72,7 @@ struct Cli {
     )]
     top_p: f32,
 
-    #[arg(long = "max-tokens", default_value_t = 256)]
+    #[arg(long = "max-tokens", default_value_t = 0)]
     max_tokens: usize,
 
     #[arg(long = "context-size", default_value_t = 0)]

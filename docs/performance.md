@@ -48,7 +48,6 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 
 - Results come from different dates, machines, and code revisions.
 - Some runs include profiling or debug behavior that affects runtime.
-- Some commands use the old binary name (`llama3pure`), others use `gguf-runner`.
 
 ## Legacy README Snapshots
 
@@ -63,21 +62,6 @@ Prompt: `Tell me in 1 line what is Microsoft.`
 | Rust + SIMD | 2:02.36 |
 | Rust + Rayon | 15.553s |
 | Rust + Rayon + `RUSTFLAGS="-C target-cpu=native"` | 14.758s |
-
-### Qwen3-Coder-Next full run (legacy README)
-
-Command pattern:
-
-```bash
-./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf \
-  -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" \
-  -max_tokens 50000 -context_size 250000
-```
-
-Reported:
-- `real`: `4:54.93`
-- `user`: `1055.66s`
-- `sys`: `452.01s`
 
 ### Legacy comparison: `llama-cli` vs `llama3pure`
 
@@ -109,28 +93,6 @@ Workload used repeatedly:
 Notes:
 - The profiling-enabled run is expected to be slower.
 - Memory footprint trends downward across most optimization passes.
-
-## `test.md` Short Profiling Snapshot (120 tokens)
-
-Default short profiling run:
-- `real`: `62.28s`
-- `[PROFILE] transformer_total`: `60900.578 ms` (`507.505 ms/pass`)
-- `[PROFILE] matmul`: `59851.859 ms` (`98.3%`)
-
-Tuned short profiling run (`-threads 8` + threshold env vars):
-- `real`: `60.13s`
-- `[PROFILE] transformer_total`: `59018.606 ms` (`491.822 ms/pass`)
-- `[PROFILE] matmul`: `58015.625 ms` (`98.3%`)
-
-## Device Throughput Snippets (from `test.md`)
-
-Reported rough throughput values for a Qwen3-4B workload:
-
-| Device | Throughput |
-|---|---:|
-| Beelink Intel N150 | ~1.5 tok/s |
-| Framework Intel i5-1340P | ~3.4 tok/s |
-| MacBook Air M4 | ~5 tok/s |
 
 ## Reproducibility Guidance
 

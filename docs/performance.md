@@ -38,10 +38,10 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 | 2026-02-15 | mac-m4-32g | Qwen3-0.6B-Q4_K_M.gguf | png_to_jpeg_v1 | 24.575 | 46.232 | |
 | 2026-02-15 | lnx-9700-64g | Qwen3-0.6B-Q4_K_M.gguf | png_to_jpeg_v1 | 27.721 | 41.037 | |
 | 2026-02-15 | lnx-n150-12g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 1.607 | 528.286 | |
-| 2026-02-15 | lnx-13600k-8g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 3.813 | 222.872 | |
+| 2026-02-15 | lnx-13600k-8g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 3.836 | 221.583 | |
 | 2026-02-15 | mac-m4-32g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 4.881 | 175.791 | |
-| 2026-02-15 | lnx-125h-32g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 4.982 | 170.833 | |
-| 2026-02-15 | lnx-9700-64g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 |  |  | |
+| 2026-02-15 | lnx-125h-32g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 5.020 | 169.513 | |
+| 2026-02-15 | lnx-9700-64g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 6.462 | 132.128 | |
 | 2026-02-15 | mac-m4-32g | Qwen3-Coder-Next-Q4_K_M.gguf | png_to_jpeg_v1 | 1.613 | 530.794 | |
 
 ## Benchmark Caveats

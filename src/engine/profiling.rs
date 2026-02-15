@@ -83,13 +83,27 @@ pub(crate) fn print_profile_report() {
         to_ms(matmul_ns),
         pct(matmul_ns)
     );
-    eprintln!("[PROFILE] ssm={:.3} ms ({:.1}%)", to_ms(ssm_ns), pct(ssm_ns));
+    eprintln!(
+        "[PROFILE] ssm={:.3} ms ({:.1}%)",
+        to_ms(ssm_ns),
+        pct(ssm_ns)
+    );
     eprintln!(
         "[PROFILE] attention={:.3} ms ({:.1}%)",
         to_ms(attn_ns),
         pct(attn_ns)
     );
-    eprintln!("[PROFILE] moe={:.3} ms ({:.1}%)", to_ms(moe_ns), pct(moe_ns));
-    eprintln!("[PROFILE] ffn={:.3} ms ({:.1}%)", to_ms(ffn_ns), pct(ffn_ns));
-    eprintln!("[PROFILE] note: counters overlap (e.g. matmul is included in SSM/attention/MoE/FFN)");
+    eprintln!(
+        "[PROFILE] moe={:.3} ms ({:.1}%)",
+        to_ms(moe_ns),
+        pct(moe_ns)
+    );
+    eprintln!(
+        "[PROFILE] ffn={:.3} ms ({:.1}%)",
+        to_ms(ffn_ns),
+        pct(ffn_ns)
+    );
+    eprintln!(
+        "[PROFILE] note: counters overlap (e.g. matmul is included in SSM/attention/MoE/FFN)"
+    );
 }

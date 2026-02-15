@@ -50,8 +50,8 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
         identity.family = ModelFamily::Qwen3Moe;
         identity.key_prefix = arch.to_string();
         let probe = format!("{}.embedding_length", identity.key_prefix);
-        if get_gguf_int_from_map(&gguf.kv, &probe, 0)
-            == 0 && get_gguf_int_from_map(&gguf.kv, "qwen3moe.embedding_length", 0) != 0
+        if get_gguf_int_from_map(&gguf.kv, &probe, 0) == 0
+            && get_gguf_int_from_map(&gguf.kv, "qwen3moe.embedding_length", 0) != 0
         {
             identity.key_prefix = "qwen3moe".to_string();
         }
@@ -65,8 +65,8 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
         identity.family = ModelFamily::Qwen3Next;
         identity.key_prefix = arch.to_string();
         let probe = format!("{}.embedding_length", identity.key_prefix);
-        if get_gguf_int_from_map(&gguf.kv, &probe, 0)
-            == 0 && get_gguf_int_from_map(&gguf.kv, "qwen3next.embedding_length", 0) != 0
+        if get_gguf_int_from_map(&gguf.kv, &probe, 0) == 0
+            && get_gguf_int_from_map(&gguf.kv, "qwen3next.embedding_length", 0) != 0
         {
             identity.key_prefix = "qwen3next".to_string();
         }

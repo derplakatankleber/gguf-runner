@@ -115,7 +115,11 @@ pub(crate) fn softplusf(x: f32) -> f32 {
 
 #[inline(always)]
 pub(crate) fn finite_or_zero(x: f32) -> f32 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 #[inline(always)]
@@ -382,7 +386,17 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
                 let q = &q_all[h * head_dim..(h + 1) * head_dim];
                 let k = &k_all[h * head_dim..(h + 1) * head_dim];
                 let v = &v_all[h * head_dim..(h + 1) * head_dim];
-                qwen3next_state_head_step(state_h, out_h, kv_mem, delta, q, k, v, gate_all[h], beta_all[h]);
+                qwen3next_state_head_step(
+                    state_h,
+                    out_h,
+                    kv_mem,
+                    delta,
+                    q,
+                    k,
+                    v,
+                    gate_all[h],
+                    beta_all[h],
+                );
             });
     } else {
         for h in 0..n_v_heads {
@@ -393,7 +407,17 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
             let out_h = &mut proj_all[h * head_dim..(h + 1) * head_dim];
             let kv_mem = &mut kv_mem_all[h * head_dim..(h + 1) * head_dim];
             let delta = &mut delta_all[h * head_dim..(h + 1) * head_dim];
-            qwen3next_state_head_step(state_h, out_h, kv_mem, delta, q, k, v, gate_all[h], beta_all[h]);
+            qwen3next_state_head_step(
+                state_h,
+                out_h,
+                kv_mem,
+                delta,
+                q,
+                k,
+                v,
+                gate_all[h],
+                beta_all[h],
+            );
         }
     }
 
@@ -440,7 +464,13 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
     Ok(())
 }
 
-pub(crate) fn matmul_f32_embeddings(logits: &mut [f32], x: &[f32], emb: &[f32], rows: usize, cols: usize) {
+pub(crate) fn matmul_f32_embeddings(
+    logits: &mut [f32],
+    x: &[f32],
+    emb: &[f32],
+    rows: usize,
+    cols: usize,
+) {
     for r in 0..rows {
         let row = &emb[r * cols..(r + 1) * cols];
         logits[r] = dot_f32_simd(row, &x[..cols]);

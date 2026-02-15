@@ -85,10 +85,7 @@ struct Cli {
     )]
     threads: Option<usize>,
 
-    #[arg(
-        long = "system-prompt",
-        default_value = "You are a helpful assistant."
-    )]
+    #[arg(long = "system-prompt", default_value = "You are a helpful assistant.")]
     system_prompt: String,
 
     #[arg(long)]
@@ -197,11 +194,7 @@ struct Cli {
     )]
     layer_debug: Option<bool>,
 
-    #[arg(
-        long = "layer-debug-pos",
-        hide = true,
-        env = "GGUF_LAYER_DEBUG_POS"
-    )]
+    #[arg(long = "layer-debug-pos", hide = true, env = "GGUF_LAYER_DEBUG_POS")]
     layer_debug_pos: Option<usize>,
 }
 
@@ -242,8 +235,7 @@ pub(crate) struct CliOptions {
 
 impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
-        let cli = Cli::try_parse()
-            .map_err(|e| e.to_string())?;
+        let cli = Cli::try_parse().map_err(|e| e.to_string())?;
 
         Ok(Self {
             model: cli.model,

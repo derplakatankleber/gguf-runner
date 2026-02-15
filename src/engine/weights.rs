@@ -267,19 +267,13 @@ pub(crate) fn init_weights_from_gguf(
                 if attn_qkv[l].rows < ssm_conv_dim {
                     return Err(format!(
                         "blk.{l}.attn_qkv.weight has {} rows, expected at least {}",
-                        attn_qkv[l].rows,
-                        ssm_conv_dim
+                        attn_qkv[l].rows, ssm_conv_dim
                     ));
                 }
                 wo[l] = load_layer_tensor_quantized(gguf, l, "attn_gate.weight", ssm_inner, p.dim)?;
                 wv[l] = load_layer_tensor_quantized(gguf, l, "ssm_out.weight", p.dim, ssm_inner)?;
-                ssm_ba[l] = load_layer_tensor_quantized(
-                    gguf,
-                    l,
-                    "ssm_ba.weight",
-                    2 * ssm_v_heads,
-                    p.dim,
-                )?;
+                ssm_ba[l] =
+                    load_layer_tensor_quantized(gguf, l, "ssm_ba.weight", 2 * ssm_v_heads, p.dim)?;
                 ssm_conv1d[l] = load_tensor_float(
                     gguf,
                     &format!("blk.{l}.ssm_conv1d.weight"),

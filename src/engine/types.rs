@@ -65,6 +65,10 @@ pub(crate) const GEMMA3_END_TURN: i32 = 107;
 pub(crate) const PROT_READ: i32 = 0x1;
 #[cfg(unix)]
 pub(crate) const MAP_SHARED: i32 = 0x0001;
+#[cfg(target_os = "linux")]
+const MADV_WILLNEED: i32 = 3;
+#[cfg(target_os = "linux")]
+const MADV_HUGEPAGE: i32 = 14;
 
 #[cfg(unix)]
 extern "C" {
@@ -77,6 +81,11 @@ extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +109,15 @@ pub(crate) struct MappedFile {
 }
 
 impl MappedFile {
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn apply_linux_mmap_advice(ptr: *mut c_void, len: usize) {
+        unsafe {
+            let _ = madvise(ptr, len, MADV_WILLNEED);
+            let _ = madvise(ptr, len, MADV_HUGEPAGE);
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn map(file: &File) -> io::Result<Self> {
         let len = file.metadata()?.len() as usize;
@@ -114,6 +132,8 @@ impl MappedFile {
         if ptr as isize == -1 {
             return Err(io::Error::last_os_error());
         }
+        #[cfg(target_os = "linux")]
+        Self::apply_linux_mmap_advice(ptr, len);
         Ok(Self {
             ptr: ptr as *mut u8,
             len,

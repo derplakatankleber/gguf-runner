@@ -447,7 +447,13 @@ pub(crate) fn init_tokenizer_from_gguf(
                 .iter()
                 .position(|s| s == "<|begin_of_text|>")
                 .map(|i| i as i32)
-                .or_else(|| tokenizer.vocab.iter().position(|s| s == "<s>").map(|i| i as i32))
+                .or_else(|| {
+                    tokenizer
+                        .vocab
+                        .iter()
+                        .position(|s| s == "<s>")
+                        .map(|i| i as i32)
+                })
                 .unwrap_or(LLAMA3_BOS_TOKEN);
         }
     }

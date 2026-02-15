@@ -46,10 +46,7 @@ pub(crate) fn malloc_run_state(p: &Config) -> RunState {
         .hidden_dim
         .max(p.expert_hidden_dim)
         .max(p.shared_expert_hidden_dim);
-    let scratch_dim = ffn_dim
-        .max(ssm_conv_dim)
-        .max(ssm_inner)
-        .max(ssm_head_dim);
+    let scratch_dim = ffn_dim.max(ssm_conv_dim).max(ssm_inner).max(ssm_head_dim);
 
     let rope_dim = if p.rope_dim > 0 {
         p.rope_dim
@@ -191,13 +188,12 @@ pub(crate) fn transformer(
                     )?;
                     if p.n_heads >= par_attn_min_heads() {
                         let hb_src = &s.hb[..2 * q_dim];
-                        s.q[..q_dim]
-                            .par_chunks_mut(head_size)
-                            .enumerate()
-                            .for_each(|(h, q_dst)| {
+                        s.q[..q_dim].par_chunks_mut(head_size).enumerate().for_each(
+                            |(h, q_dst)| {
                                 let src_base = h * 2 * head_size;
                                 q_dst.copy_from_slice(&hb_src[src_base..src_base + head_size]);
-                            });
+                            },
+                        );
                     } else {
                         for h in 0..p.n_heads {
                             let src_base = h * 2 * head_size;

@@ -2,15 +2,66 @@ use std::sync::atomic::AtomicU8;
 use std::sync::OnceLock;
 
 #[cfg(target_arch = "x86_64")]
-const PAR_MATMUL_MIN_ROWS_DEFAULT: usize = 384;
+#[inline]
+fn par_matmul_min_rows_default() -> usize {
+    let n_threads = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    if n_threads <= 4 {
+        192
+    } else {
+        384
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
-const PAR_MATMUL_MIN_ROWS_DEFAULT: usize = 256;
+#[inline]
+fn par_matmul_min_rows_default() -> usize {
+    256
+}
+
 #[cfg(target_arch = "x86_64")]
-const PAR_MATMUL_CHUNK_ROWS_DEFAULT: usize = 64;
+#[inline]
+fn par_matmul_chunk_rows_default() -> usize {
+    let n_threads = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    if n_threads <= 4 {
+        32
+    } else {
+        64
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
-const PAR_MATMUL_CHUNK_ROWS_DEFAULT: usize = 32;
-const PAR_ATTN_MIN_HEADS_DEFAULT: usize = 8;
-const PAR_QWEN3NEXT_MIN_HEADS_DEFAULT: usize = 8;
+#[inline]
+fn par_matmul_chunk_rows_default() -> usize {
+    32
+}
+
+#[inline]
+fn par_attn_min_heads_default() -> usize {
+    let n_threads = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    if n_threads <= 4 {
+        4
+    } else {
+        8
+    }
+}
+
+#[inline]
+fn par_qwen3next_min_heads_default() -> usize {
+    let n_threads = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    if n_threads <= 4 {
+        4
+    } else {
+        8
+    }
+}
 
 static PAR_MATMUL_MIN_ROWS_CFG: OnceLock<usize> = OnceLock::new();
 static PAR_MATMUL_CHUNK_ROWS_CFG: OnceLock<usize> = OnceLock::new();
@@ -76,22 +127,22 @@ pub(crate) fn layer_debug_pos() -> Option<usize> {
 
 #[inline]
 pub(crate) fn par_matmul_min_rows() -> usize {
-    *PAR_MATMUL_MIN_ROWS_CFG.get_or_init(|| PAR_MATMUL_MIN_ROWS_DEFAULT)
+    *PAR_MATMUL_MIN_ROWS_CFG.get_or_init(par_matmul_min_rows_default)
 }
 
 #[inline]
 pub(crate) fn par_matmul_chunk_rows() -> usize {
-    *PAR_MATMUL_CHUNK_ROWS_CFG.get_or_init(|| PAR_MATMUL_CHUNK_ROWS_DEFAULT)
+    *PAR_MATMUL_CHUNK_ROWS_CFG.get_or_init(par_matmul_chunk_rows_default)
 }
 
 #[inline]
 pub(crate) fn par_attn_min_heads() -> usize {
-    *PAR_ATTN_MIN_HEADS_CFG.get_or_init(|| PAR_ATTN_MIN_HEADS_DEFAULT)
+    *PAR_ATTN_MIN_HEADS_CFG.get_or_init(par_attn_min_heads_default)
 }
 
 #[inline]
 pub(crate) fn par_qwen3next_min_heads() -> usize {
-    *PAR_QWEN3NEXT_MIN_HEADS_CFG.get_or_init(|| PAR_QWEN3NEXT_MIN_HEADS_DEFAULT)
+    *PAR_QWEN3NEXT_MIN_HEADS_CFG.get_or_init(par_qwen3next_min_heads_default)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -110,8 +161,7 @@ pub(crate) fn use_aarch64_qk_mr4() -> bool {
 #[inline]
 pub(crate) fn use_x86_avx2_fma() -> bool {
     *X86_AVX2_FMA_CFG.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     })
 }
 

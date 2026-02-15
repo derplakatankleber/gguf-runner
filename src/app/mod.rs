@@ -9,7 +9,7 @@ use crate::engine::switches::{
     init_runtime_config, par_attn_min_heads, par_matmul_chunk_rows, par_matmul_min_rows,
     par_qwen3next_min_heads, RuntimeSwitchConfig,
 };
-use crate::engine::types::{GEMMA3_END_TURN, XorShiftRng};
+use crate::engine::types::{XorShiftRng, GEMMA3_END_TURN};
 use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -83,11 +83,8 @@ pub(crate) fn run() -> Result<(), String> {
 
     let mut config = crate::vendors::build_config_from_gguf(&gguf, debug_mode)?;
 
-    let mut tokenizer = crate::engine::tokenizer::init_tokenizer_from_gguf(
-        &gguf,
-        &mut config,
-        debug_mode,
-    )?;
+    let mut tokenizer =
+        crate::engine::tokenizer::init_tokenizer_from_gguf(&gguf, &mut config, debug_mode)?;
     tokenizer.use_sentencepiece = config.is_gemma3;
 
     crate::engine::runtime::apply_context_size_overrides(&mut config, context_size, debug_mode);
@@ -331,7 +328,10 @@ pub(crate) fn run() -> Result<(), String> {
     }
 
     if show_timings {
-        eprintln!("overall runtime: {:.3}s", run_started.elapsed().as_secs_f64());
+        eprintln!(
+            "overall runtime: {:.3}s",
+            run_started.elapsed().as_secs_f64()
+        );
     }
 
     Ok(())

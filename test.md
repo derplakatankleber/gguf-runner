@@ -336,3 +336,21 @@ LLAMA3PURE_X86_F16C=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M
 - Keep benchmark inputs fixed: same model file, prompt, sampling params, `max_tokens`, and `context_size`.
 - Use `-temperature 0 -top_k 1 -top_p 1` for deterministic decoding and higher comparability.
 - Compare both `real` and `achieved tok/s`; watch `involuntary context switches` for oversubscription.
+
+# beelink - intel n150
+
+time ./target/release/gguf-runner -model Qwen3-4B-Instruct-2507-Q4_K_M.gguf -url https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -show-tokens
+
+1.5token/s
+
+# framwork - intel i5-1340P
+
+3.4token/s
+
+# macbook air - m4
+
+5 token/s
+
+# macbook air
+
+./target/release/gguf-runner -model Qwen3-4B-Instruct-2507-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -show-tokens

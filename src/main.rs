@@ -1,3 +1,4 @@
+use clap::Parser;
 use rayon::prelude::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -6150,28 +6151,112 @@ fn configure_rayon_threads(num_threads: usize, debug_mode: bool) {
     }
 }
 
-fn usage(program: &str) {
-    println!("Usage: {program} -model <model.gguf> -prompt <text> [-url <remote.gguf>] [options]");
-    println!();
-    println!("Required arguments:");
-    println!("  -model         path to GGUF model file");
-    println!("  -prompt        input prompt text");
-    println!();
-    println!("Optional arguments:");
-    println!("  -url           remote GGUF URL (used only when local -model file is missing/invalid)");
-    println!("  -system_prompt system prompt (default: \"You are a helpful assistant.\")");
-    println!("  -temperature   sampling temperature (default: 0.9, use 0.0 for greedy)");
-    println!("  -top_k         top-k sampling cutoff (default: 0 = disabled)");
-    println!("  -top_p         top-p nucleus threshold in (0,1] (default: 1.0 = disabled)");
-    println!("  -max_tokens    number of tokens to generate (default: 256)");
-    println!("  -context_size  context size for the AI model (default: model's max)");
-    println!("  -threads       rayon worker threads (default: auto)");
-    println!("  -show-tokens   always print achieved tok/s at the end");
-    println!("  -profiling     print token-level profiling counters");
-    println!("  -debug         show detailed model loading and performance logs");
-    println!();
-    println!("Example:");
-    println!("  {program} -model Llama3.gguf -prompt \"tell me what is microsoft\"");
+fn parse_top_p(raw: &str) -> Result<f32, String> {
+    let v = raw
+        .parse::<f32>()
+        .map_err(|e| format!("invalid value '{raw}': {e}"))?;
+    if v > 0.0 && v <= 1.0 {
+        Ok(v)
+    } else {
+        Err(format!("invalid value '{raw}': expected value in (0, 1]"))
+    }
+}
+
+fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let v = raw
+        .parse::<usize>()
+        .map_err(|e| format!("invalid value '{raw}': {e}"))?;
+    if v > 0 {
+        Ok(v)
+    } else {
+        Err(format!("invalid value '{raw}': expected >= 1"))
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    about = "Run GGUF language models",
+    long_about = None,
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[arg(long, required = true, value_name = "model.gguf")]
+    model: String,
+
+    #[arg(long, required = true)]
+    prompt: String,
+
+    #[arg(long)]
+    url: Option<String>,
+
+    #[arg(long, default_value_t = 0.9)]
+    temperature: f32,
+
+    #[arg(long = "top-k", visible_alias = "top_k", default_value_t = 0)]
+    top_k: usize,
+
+    #[arg(
+        long = "top-p",
+        visible_alias = "top_p",
+        value_parser = parse_top_p,
+        default_value_t = 1.0
+    )]
+    top_p: f32,
+
+    #[arg(
+        long = "max-tokens",
+        visible_alias = "max_tokens",
+        default_value_t = 256
+    )]
+    max_tokens: usize,
+
+    #[arg(
+        long = "context-size",
+        visible_alias = "context_size",
+        default_value_t = 0
+    )]
+    context_size: usize,
+
+    #[arg(long, value_parser = parse_positive_usize)]
+    threads: Option<usize>,
+
+    #[arg(
+        long = "system-prompt",
+        visible_alias = "system_prompt",
+        default_value = "You are a helpful assistant."
+    )]
+    system_prompt: String,
+
+    #[arg(long)]
+    profiling: bool,
+
+    #[arg(long = "show-tokens", visible_alias = "show_tokens")]
+    show_tokens: bool,
+
+    #[arg(long)]
+    debug: bool,
+}
+
+fn normalize_legacy_args(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .map(|arg| match arg.as_str() {
+            "-model" => "--model".to_string(),
+            "-prompt" => "--prompt".to_string(),
+            "-url" => "--url".to_string(),
+            "-temperature" => "--temperature".to_string(),
+            "-top_k" => "--top_k".to_string(),
+            "-top_p" => "--top_p".to_string(),
+            "-max_tokens" => "--max_tokens".to_string(),
+            "-context_size" => "--context_size".to_string(),
+            "-threads" => "--threads".to_string(),
+            "-system_prompt" => "--system_prompt".to_string(),
+            "-profiling" => "--profiling".to_string(),
+            "-show-tokens" => "--show-tokens".to_string(),
+            "-show_tokens" => "--show_tokens".to_string(),
+            "-debug" => "--debug".to_string(),
+            _ => arg,
+        })
+        .collect()
 }
 
 fn main() {
@@ -6182,118 +6267,27 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut temperature: f32 = 0.9;
-    let mut top_k: usize = 0;
-    let mut top_p: f32 = 1.0;
-    let mut max_tokens: usize = 256;
-    let mut context_size: usize = 0;
-    let mut rayon_threads: Option<usize> = env::var("LLAMA3PURE_RAYON_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0);
-    let mut system_prompt = String::from("You are a helpful assistant.");
-    let mut checkpoint: Option<String> = None;
-    let mut model_url: Option<String> = None;
-    let mut prompt: Option<String> = None;
-    let mut profiling_mode = false;
-    let mut show_tokens = false;
-    let mut debug_mode = false;
+    let cli = Cli::try_parse_from(normalize_legacy_args(env::args().collect::<Vec<_>>()))
+        .map_err(|e| e.to_string())?;
 
-    let args: Vec<String> = env::args().collect();
-    let program = args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "llama3pure".to_string());
-
-    let mut i = 1usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-model" if i + 1 < args.len() => {
-                checkpoint = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "-url" if i + 1 < args.len() => {
-                model_url = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "-temperature" if i + 1 < args.len() => {
-                temperature = args[i + 1]
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid -temperature: {e}"))?;
-                i += 2;
-            }
-            "-top_k" if i + 1 < args.len() => {
-                top_k = args[i + 1]
-                    .parse::<usize>()
-                    .map_err(|e| format!("invalid -top_k: {e}"))?;
-                i += 2;
-            }
-            "-top_p" if i + 1 < args.len() => {
-                top_p = args[i + 1]
-                    .parse::<f32>()
-                    .map_err(|e| format!("invalid -top_p: {e}"))?;
-                if !(top_p > 0.0 && top_p <= 1.0) {
-                    return Err("invalid -top_p: expected value in (0, 1]".to_string());
-                }
-                i += 2;
-            }
-            "-max_tokens" if i + 1 < args.len() => {
-                max_tokens = args[i + 1]
-                    .parse::<usize>()
-                    .map_err(|e| format!("invalid -max_tokens: {e}"))?;
-                i += 2;
-            }
-            "-context_size" if i + 1 < args.len() => {
-                context_size = args[i + 1]
-                    .parse::<usize>()
-                    .map_err(|e| format!("invalid -context_size: {e}"))?;
-                i += 2;
-            }
-            "-threads" if i + 1 < args.len() => {
-                rayon_threads = Some(
-                    args[i + 1]
-                        .parse::<usize>()
-                        .map_err(|e| format!("invalid -threads: {e}"))?,
-                );
-                if rayon_threads == Some(0) {
-                    return Err("invalid -threads: expected >= 1".to_string());
-                }
-                i += 2;
-            }
-            "-profiling" => {
-                profiling_mode = true;
-                i += 1;
-            }
-            "-show-tokens" | "-show_tokens" => {
-                show_tokens = true;
-                i += 1;
-            }
-            "-prompt" if i + 1 < args.len() => {
-                prompt = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "-system_prompt" if i + 1 < args.len() => {
-                system_prompt = args[i + 1].clone();
-                i += 2;
-            }
-            "-debug" => {
-                debug_mode = true;
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    let checkpoint = checkpoint.ok_or_else(|| {
-        usage(&program);
-        "missing required -model".to_string()
-    })?;
-    let prompt = prompt.ok_or_else(|| {
-        usage(&program);
-        "missing required -prompt".to_string()
-    })?;
+    let temperature = cli.temperature;
+    let top_k = cli.top_k;
+    let top_p = cli.top_p;
+    let mut max_tokens = cli.max_tokens;
+    let context_size = cli.context_size;
+    let rayon_threads: Option<usize> = cli.threads.or_else(|| {
+        env::var("LLAMA3PURE_RAYON_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+    });
+    let system_prompt = cli.system_prompt;
+    let checkpoint = cli.model;
+    let model_url = cli.url;
+    let prompt = cli.prompt;
+    let profiling_mode = cli.profiling;
+    let show_tokens = cli.show_tokens;
+    let debug_mode = cli.debug;
 
     if debug_mode {
         eprintln!("Loading GGUF model: {checkpoint}");

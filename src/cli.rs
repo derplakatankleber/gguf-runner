@@ -180,6 +180,15 @@ struct Cli {
     )]
     x86_qk_mr4: Option<bool>,
 
+    #[cfg(target_arch = "x86_64")]
+    #[arg(
+        long = "x86-avxvnni",
+        hide = true,
+        env = "GGUF_X86_AVXVNNI",
+        value_parser = parse_boolish
+    )]
+    x86_avxvnni: Option<bool>,
+
     #[arg(
         long = "layer-debug",
         hide = true,
@@ -225,6 +234,8 @@ pub(crate) struct CliOptions {
     pub(crate) x86_f16c: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_qk_mr4: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_avxvnni: Option<bool>,
     pub(crate) layer_debug: Option<bool>,
     pub(crate) layer_debug_pos: Option<usize>,
 }
@@ -263,6 +274,8 @@ impl CliOptions {
             x86_f16c: cli.x86_f16c,
             #[cfg(target_arch = "x86_64")]
             x86_qk_mr4: cli.x86_qk_mr4,
+            #[cfg(target_arch = "x86_64")]
+            x86_avxvnni: cli.x86_avxvnni,
             layer_debug: cli.layer_debug,
             layer_debug_pos: cli.layer_debug_pos,
         })

@@ -8,8 +8,8 @@ use crate::engine::switches::{
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
-    use_x86_avx2_fma, use_x86_f16c, use_x86_qk_mr4, X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS,
-    X86_Q6K_MR4_STATUS,
+    use_x86_avx2_fma, use_x86_avx_vnni, use_x86_f16c, use_x86_qk_mr4, X86_Q4K_MR4_STATUS,
+    X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS,
 };
 use crate::engine::types::{
     ensure_model_range, GgmlType, QuantizedTensor, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
@@ -543,6 +543,107 @@ unsafe fn vec_dot_bf16_avx2_prefix(x: *const f32, w: *const u8, n: usize) -> f32
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn hsum256_ps(v: __m256) -> f32 {
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), v);
+    tmp.iter().copied().sum::<f32>()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cvt_u8x8_to_f32x8(v8: __m128i) -> __m256 {
+    let zero = _mm_setzero_si128();
+    let lo16 = _mm_unpacklo_epi8(v8, zero);
+    let lo32 = _mm256_cvtepu16_epi32(lo16);
+    _mm256_cvtepi32_ps(lo32)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cvt_i8x8_to_f32x8(v8: __m128i) -> __m256 {
+    let lo32 = _mm256_cvtepi8_epi32(v8);
+    _mm256_cvtepi32_ps(lo32)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_u8_vals_avx2_ptr(x: *const f32, q: *const u8, n: usize) -> f32 {
+    let mut i = 0usize;
+    let mut acc = _mm256_setzero_ps();
+    while i + 8 <= n {
+        let xv = _mm256_loadu_ps(x.add(i));
+        let q8 = _mm_loadl_epi64(q.add(i) as *const __m128i);
+        let qf = cvt_u8x8_to_f32x8(q8);
+        acc = _mm256_fmadd_ps(xv, qf, acc);
+        i += 8;
+    }
+    let mut sum = hsum256_ps(acc);
+    while i < n {
+        sum += *x.add(i) * *q.add(i) as f32;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_i8_vals_avx2_ptr(x: *const f32, q: *const i8, n: usize) -> f32 {
+    let mut i = 0usize;
+    let mut acc = _mm256_setzero_ps();
+    while i + 8 <= n {
+        let xv = _mm256_loadu_ps(x.add(i));
+        let q8 = _mm_loadl_epi64(q.add(i) as *const __m128i);
+        let qf = cvt_i8x8_to_f32x8(q8);
+        acc = _mm256_fmadd_ps(xv, qf, acc);
+        i += 8;
+    }
+    let mut sum = hsum256_ps(acc);
+    while i < n {
+        sum += *x.add(i) * *q.add(i) as f32;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q4_nibbles_pair_avx2_ptr(
+    x_lo: *const f32,
+    x_hi: *const f32,
+    q: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    let nib_mask = _mm_set1_epi8(0x0f);
+    let mut i = 0usize;
+    let mut acc_lo = _mm256_setzero_ps();
+    let mut acc_hi = _mm256_setzero_ps();
+
+    while i + 8 <= n {
+        let xv_lo = _mm256_loadu_ps(x_lo.add(i));
+        let xv_hi = _mm256_loadu_ps(x_hi.add(i));
+        let q8 = _mm_loadl_epi64(q.add(i) as *const __m128i);
+        let lo8 = _mm_and_si128(q8, nib_mask);
+        let hi8 = _mm_and_si128(_mm_srli_epi16(q8, 4), nib_mask);
+        let q_lo_f = cvt_u8x8_to_f32x8(lo8);
+        let q_hi_f = cvt_u8x8_to_f32x8(hi8);
+        acc_lo = _mm256_fmadd_ps(xv_lo, q_lo_f, acc_lo);
+        acc_hi = _mm256_fmadd_ps(xv_hi, q_hi_f, acc_hi);
+        i += 8;
+    }
+
+    let mut sum_lo = hsum256_ps(acc_lo);
+    let mut sum_hi = hsum256_ps(acc_hi);
+    while i < n {
+        let qv = *q.add(i);
+        sum_lo += *x_lo.add(i) * (qv & 0x0f) as f32;
+        sum_hi += *x_hi.add(i) * (qv >> 4) as f32;
+        i += 1;
+    }
+    (sum_lo, sum_hi)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_f32_simd_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
     if use_x86_avx2_fma() {
@@ -979,6 +1080,12 @@ pub(crate) fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
             return vec_dot_q8_0_dotprod(x, w, n);
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    if use_x86_avx_vnni() || use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q8_0_x86_avx2(x, w, n);
+        }
+    }
 
     let nb = n / QK8_0;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
@@ -992,6 +1099,23 @@ pub(crate) fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
             qf[j] = w[off + 2 + j] as i8 as f32;
         }
         let block_sum = dot_f32_simd(xb, &qf);
+        sum += block_sum * d;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q8_0_x86_avx2(x: &[f32], w: &[u8], n: usize) -> f32 {
+    let nb = n / QK8_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
+    let mut sum = 0.0f32;
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off));
+        let xb = &x[i * QK8_0..(i + 1) * QK8_0];
+        let q = &w[off + 2..off + 2 + QK8_0];
+        let block_sum = dot_f32_i8_vals_avx2_ptr(xb.as_ptr(), q.as_ptr() as *const i8, QK8_0);
         sum += block_sum * d;
     }
     sum
@@ -1769,6 +1893,12 @@ pub(crate) fn vec_dot_q4_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        }
+    }
+
     let rows = [r0, r1, r2, r3];
     let nb = n / QK_K;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
@@ -1831,6 +1961,12 @@ pub(crate) fn vec_dot_q5_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        }
+    }
+
     let rows = [r0, r1, r2, r3];
     let nb = n / QK_K;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
@@ -1901,6 +2037,12 @@ pub(crate) fn vec_dot_q6_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        }
+    }
+
     let rows = [r0, r1, r2, r3];
     let nb = n / QK_K;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
@@ -1964,6 +2106,234 @@ pub(crate) fn vec_dot_q6_k_4rows_x86(
             }
         }
     }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q4_k_4rows_x86_avx2(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            q_off[r] = off + 16;
+        }
+
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+                let q = &rows[r][q_off[r]..q_off[r] + 32];
+                let (dot_lo, dot_hi) =
+                    dot_q4_nibbles_pair_avx2_ptr(x0.as_ptr(), x1.as_ptr(), q.as_ptr(), 32);
+                sums[r] += a_lo[r] * dot_lo - b_lo[r] * x0_sum + a_hi[r] * dot_hi - b_hi[r] * x1_sum;
+                q_off[r] += 32;
+            }
+            is += 2;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q5_k_4rows_x86_avx2(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut qh = [&[][..]; 4];
+        let mut ql_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            qh[r] = &rows[r][off + 16..off + 16 + QK_K / 8];
+            ql_off[r] = off + 16 + QK_K / 8;
+        }
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+
+                let ql = &rows[r][ql_off[r]..ql_off[r] + 32];
+                let mut lo_vals = [0u8; 32];
+                let mut hi_vals = [0u8; 32];
+                for l in 0..32 {
+                    let qv = ql[l];
+                    lo_vals[l] = (qv & 0x0f) + if (qh[r][l] & u1) != 0 { 16 } else { 0 };
+                    hi_vals[l] = (qv >> 4) + if (qh[r][l] & u2) != 0 { 16 } else { 0 };
+                }
+                let dot_lo = dot_f32_u8_vals_avx2_ptr(x0.as_ptr(), lo_vals.as_ptr(), 32);
+                let dot_hi = dot_f32_u8_vals_avx2_ptr(x1.as_ptr(), hi_vals.as_ptr(), 32);
+                sums[r] += a_lo[r] * dot_lo - b_lo[r] * x0_sum + a_hi[r] * dot_hi - b_hi[r] * x1_sum;
+                ql_off[r] += 32;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q6_k_4rows_x86_avx2(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut ql_off = [0usize; 4];
+        let mut qh_off = [0usize; 4];
+        let mut sc_off = [0usize; 4];
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(
+                rows[r],
+                off + QK_K / 2 + QK_K / 4 + QK_K / 16,
+            ));
+            ql_off[r] = off;
+            qh_off[r] = off + QK_K / 2;
+            sc_off[r] = off + QK_K / 2 + QK_K / 4;
+        }
+
+        for n_outer in (0..QK_K).step_by(128) {
+            let x0 = &xb[n_outer..n_outer + 32];
+            let x1 = &xb[n_outer + 32..n_outer + 64];
+            let x2 = &xb[n_outer + 64..n_outer + 96];
+            let x3 = &xb[n_outer + 96..n_outer + 128];
+            for r in 0..4 {
+                let ql = &rows[r][ql_off[r]..ql_off[r] + 64];
+                let qh = &rows[r][qh_off[r]..qh_off[r] + 32];
+                let sc = &rows[r][sc_off[r]..sc_off[r] + 8];
+                let mut q1 = [0i8; 32];
+                let mut q2 = [0i8; 32];
+                let mut q3 = [0i8; 32];
+                let mut q4 = [0i8; 32];
+
+                for l in 0..32 {
+                    let ql0 = ql[l];
+                    let ql1 = ql[l + 32];
+                    let qh0 = qh[l];
+                    q1[l] = ((ql0 & 0x0f) | (((qh0 >> 0) & 0x03) << 4)) as i8 - 32;
+                    q2[l] = ((ql1 & 0x0f) | (((qh0 >> 2) & 0x03) << 4)) as i8 - 32;
+                    q3[l] = ((ql0 >> 4) | (((qh0 >> 4) & 0x03) << 4)) as i8 - 32;
+                    q4[l] = ((ql1 >> 4) | (((qh0 >> 6) & 0x03) << 4)) as i8 - 32;
+                }
+
+                let dot1_lo = dot_f32_i8_vals_avx2_ptr(x0.as_ptr(), q1.as_ptr(), 16);
+                let dot1_hi = dot_f32_i8_vals_avx2_ptr(x0.as_ptr().add(16), q1.as_ptr().add(16), 16);
+                let dot2_lo = dot_f32_i8_vals_avx2_ptr(x1.as_ptr(), q2.as_ptr(), 16);
+                let dot2_hi = dot_f32_i8_vals_avx2_ptr(x1.as_ptr().add(16), q2.as_ptr().add(16), 16);
+                let dot3_lo = dot_f32_i8_vals_avx2_ptr(x2.as_ptr(), q3.as_ptr(), 16);
+                let dot3_hi = dot_f32_i8_vals_avx2_ptr(x2.as_ptr().add(16), q3.as_ptr().add(16), 16);
+                let dot4_lo = dot_f32_i8_vals_avx2_ptr(x3.as_ptr(), q4.as_ptr(), 16);
+                let dot4_hi = dot_f32_i8_vals_avx2_ptr(x3.as_ptr().add(16), q4.as_ptr().add(16), 16);
+
+                let s00 = d[r] * sc[0] as i8 as f32;
+                let s01 = d[r] * sc[1] as i8 as f32;
+                let s10 = d[r] * sc[2] as i8 as f32;
+                let s11 = d[r] * sc[3] as i8 as f32;
+                let s20 = d[r] * sc[4] as i8 as f32;
+                let s21 = d[r] * sc[5] as i8 as f32;
+                let s30 = d[r] * sc[6] as i8 as f32;
+                let s31 = d[r] * sc[7] as i8 as f32;
+
+                sums[r] += s00 * dot1_lo
+                    + s01 * dot1_hi
+                    + s10 * dot2_lo
+                    + s11 * dot2_hi
+                    + s20 * dot3_lo
+                    + s21 * dot3_hi
+                    + s30 * dot4_lo
+                    + s31 * dot4_hi;
+            }
+            for r in 0..4 {
+                ql_off[r] += 64;
+                qh_off[r] += 32;
+                sc_off[r] += 8;
+            }
+        }
+    }
+
     sums
 }
 

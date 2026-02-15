@@ -26,6 +26,8 @@ static X86_AVX2_FMA_CFG: OnceLock<bool> = OnceLock::new();
 static X86_F16C_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static X86_AVXVNNI_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "aarch64")]
 pub(crate) static AARCH64_Q4K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_arch = "aarch64")]
@@ -56,6 +58,8 @@ pub(crate) struct RuntimeSwitchConfig {
     pub(crate) x86_f16c: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_qk_mr4: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_avxvnni: Option<bool>,
     pub(crate) layer_debug: Option<bool>,
     pub(crate) layer_debug_pos: Option<usize>,
 }
@@ -127,6 +131,15 @@ pub(crate) fn use_x86_qk_mr4() -> bool {
     *X86_QK_MR4_CFG.get_or_init(|| true)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn use_x86_avx_vnni() -> bool {
+    *X86_AVXVNNI_CFG.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avxvnni")
+    })
+}
+
 pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
     if let Some(v) = config.par_matmul_min_rows {
         let _ = PAR_MATMUL_MIN_ROWS_CFG.set(v);
@@ -175,6 +188,12 @@ pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
         }
         if let Some(v) = config.x86_qk_mr4 {
             let _ = X86_QK_MR4_CFG.set(v);
+        }
+        if let Some(v) = config.x86_avxvnni {
+            let enabled = v
+                && std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("avxvnni");
+            let _ = X86_AVXVNNI_CFG.set(enabled);
         }
     }
 }

@@ -29,20 +29,20 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 
 ### Benchmark Runs
 
-| date | host_id | model | prompts | tokens/sec | runtime sec | notes |
+| date | model | host_id | prompts | tokens/sec | runtime sec | notes |
 |---|---|---|---|---:|---:|---|
-| 2026-02-15 | mac-m4-32g | gemma-3-4b-it-Q4_K_M.gguf | png_to_jpeg_v1 | 4.753 | 206.488 | |
-| 2026-02-15 | mac-m4-32g | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | png_to_jpeg_v1 | 2.770 | 135.304 | |
-| 2026-02-15 | mac-m4-32g | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | png_to_jpeg_v1 | 1.251 | 421.389 | |
-| 2026-02-15 | lnx-n150-12g | Qwen3-0.6B-Q4_K_M.gguf | png_to_jpeg_v1 | 6.236 | 179.751 | |
-| 2026-02-15 | mac-m4-32g | Qwen3-0.6B-Q4_K_M.gguf | png_to_jpeg_v1 | 24.575 | 46.232 | |
-| 2026-02-15 | lnx-9700-64g | Qwen3-0.6B-Q4_K_M.gguf | png_to_jpeg_v1 | 27.721 | 41.037 | |
-| 2026-02-15 | lnx-n150-12g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 1.607 | 528.286 | |
-| 2026-02-15 | lnx-13600k-8g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 3.836 | 221.583 | |
-| 2026-02-15 | mac-m4-32g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 4.881 | 175.791 | |
-| 2026-02-15 | lnx-125h-32g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 5.020 | 169.513 | |
-| 2026-02-15 | lnx-9700-64g | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | png_to_jpeg_v1 | 6.462 | 132.128 | |
-| 2026-02-15 | mac-m4-32g | Qwen3-Coder-Next-Q4_K_M.gguf | png_to_jpeg_v1 | 1.613 | 530.794 | |
+| 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 4.753 | 206.488 | |
+| 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 2.770 | 135.304 | |
+| 2026-02-15 | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.251 | 421.389 | |
+| 2026-02-15 | Qwen3-0.6B-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 6.236 | 179.751 | |
+| 2026-02-15 | Qwen3-0.6B-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 24.575 | 46.232 | |
+| 2026-02-15 | Qwen3-0.6B-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 27.721 | 41.037 | |
+| 2026-02-15 | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 1.607 | 528.286 | |
+| 2026-02-15 | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.836 | 221.583 | |
+| 2026-02-15 | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 4.881 | 175.791 | |
+| 2026-02-15 | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | lnx-125h-32g | png_to_jpeg_v1 | 5.020 | 169.513 | |
+| 2026-02-15 | Qwen3-4B-Instruct-2507-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 6.462 | 132.128 | |
+| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.613 | 530.794 | |
 
 ## Benchmark Caveats
 

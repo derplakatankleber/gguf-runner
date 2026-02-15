@@ -29,6 +29,10 @@ Supported tensor data paths include:
 - tokenizer initialization from GGUF vocab/metadata
 - model-family-specific chat prompt rendering
 - autoregressive generation loop
+- optional tool-agent loop (`--agent`) with host-side file tools:
+  - `read_file`
+  - `list_dir`
+  - `write_file` (requires `--allow-write-tools`)
 - sampling modes:
   - greedy (`--temperature 0`)
   - stochastic temperature sampling

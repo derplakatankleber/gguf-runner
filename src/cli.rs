@@ -110,6 +110,22 @@ struct Cli {
     system_prompt: String,
 
     #[arg(long)]
+    agent: bool,
+
+    #[arg(long = "tool-root", value_name = "path")]
+    tool_root: Option<String>,
+
+    #[arg(long = "allow-write-tools")]
+    allow_write_tools: bool,
+
+    #[arg(
+        long = "max-tool-calls",
+        value_parser = parse_positive_usize,
+        default_value_t = 8
+    )]
+    max_tool_calls: usize,
+
+    #[arg(long)]
     profiling: bool,
 
     #[arg(long = "show-tokens")]
@@ -241,6 +257,10 @@ pub(crate) struct CliOptions {
     pub(crate) context_size: usize,
     pub(crate) threads: Option<usize>,
     pub(crate) system_prompt: String,
+    pub(crate) agent: bool,
+    pub(crate) tool_root: Option<String>,
+    pub(crate) allow_write_tools: bool,
+    pub(crate) max_tool_calls: usize,
     pub(crate) profiling: bool,
     pub(crate) show_tokens: bool,
     pub(crate) show_timings: bool,
@@ -284,6 +304,10 @@ impl CliOptions {
             context_size: cli.context_size,
             threads: cli.threads,
             system_prompt: cli.system_prompt,
+            agent: cli.agent,
+            tool_root: cli.tool_root,
+            allow_write_tools: cli.allow_write_tools,
+            max_tool_calls: cli.max_tool_calls,
             profiling: cli.profiling,
             show_tokens: cli.show_tokens,
             show_timings: cli.show_timings,

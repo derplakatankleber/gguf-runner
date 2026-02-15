@@ -79,6 +79,7 @@ src/
   - GGUF constants and ggml quantization constants
   - Core structs like `Config`, `GGUFFile`, `TransformerWeights`, `RunState`, `Tokenizer`, `QuantizedTensor`
   - Lazy loader implementation (`LazyModelLoader`)
+  - Unix mmap wrapper (`MappedFile`) including Linux memory advice hints for model mappings
   - Global lazy loader state:
     - `LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>>`
   - `ensure_model_range(...)` helper used by quantized matmul paths.
@@ -130,7 +131,7 @@ src/
 - Includes:
   - `RuntimeSwitchConfig` (engine-owned overrides struct)
   - Parallel thresholds (`par_matmul_min_rows`, `par_matmul_chunk_rows`, `par_attn_min_heads`, `par_qwen3next_min_heads`)
-  - Arch feature toggles (`use_x86_*`, `use_aarch64_*`)
+  - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI switches)
   - Layer debug toggles
   - MR4 status atomics
   - `init_runtime_config(&RuntimeSwitchConfig)`.

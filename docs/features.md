@@ -24,6 +24,7 @@ Supported tensor data paths include:
 ## Runtime Features
 
 - GGUF parsing from local files
+- Linux mmap memory-advice hints for mapped model pages (best-effort)
 - lazy model bootstrap/download flow with `--url`
 - tokenizer initialization from GGUF vocab/metadata
 - model-family-specific chat prompt rendering
@@ -57,6 +58,7 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_X86_AVX2` (x86_64 only)
 - `GGUF_X86_F16C` (x86_64 only)
 - `GGUF_X86_QK_MR4` (x86_64 only)
+- `GGUF_X86_AVXVNNI` (x86_64 only)
 
 ## Supported Platforms
 

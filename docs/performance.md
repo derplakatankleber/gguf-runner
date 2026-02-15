@@ -32,9 +32,11 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 
 | date | model | host_id | prompts | tokens/sec | runtime sec | notes |
 |---|---|---|---|---:|---:|---|
+| 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.106 | 317.936 | |
 | 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.522 | 275.898 | |
 | 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 4.753 | 206.488 | |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 2.770 | 135.304 | |
+| 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.109 | 124.928 |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.292 | 111.207 | |
 | 2026-02-15 | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.251 | 421.389 | |
 | 2026-02-15 | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 1.798 | 289.223 | |

@@ -59,6 +59,7 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_X86_F16C` (x86_64 only)
 - `GGUF_X86_QK_MR4` (x86_64 only)
 - `GGUF_X86_AVXVNNI` (x86_64 only)
+- `GGUF_X86_AVX512VNNI_Q8` (x86_64 only; optional Q8_0 VNNI path)
 
 ## Supported Platforms
 

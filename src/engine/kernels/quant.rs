@@ -8,8 +8,8 @@ use crate::engine::switches::{
 };
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
-    use_x86_avx2_fma, use_x86_avx_vnni, use_x86_f16c, use_x86_qk_mr4, X86_Q4K_MR4_STATUS,
-    X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS,
+    use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_avx_vnni, use_x86_f16c, use_x86_qk_mr4,
+    X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS,
 };
 use crate::engine::types::{
     ensure_model_range, GgmlType, QuantizedTensor, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
@@ -1114,7 +1114,19 @@ pub(crate) fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
         }
     }
     #[cfg(target_arch = "x86_64")]
-    if use_x86_avx_vnni() || use_x86_avx2_fma() {
+    if use_x86_avx512_vnni_q8() {
+        unsafe {
+            return vec_dot_q8_0_x86_avx512vnni(x, w, n);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if use_x86_avx_vnni() {
+        unsafe {
+            return vec_dot_q8_0_x86_avxvnni(x, w, n);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if use_x86_avx2_fma() {
         unsafe {
             return vec_dot_q8_0_x86_avx2(x, w, n);
         }
@@ -1150,6 +1162,114 @@ unsafe fn vec_dot_q8_0_x86_avx2(x: &[f32], w: &[u8], n: usize) -> f32 {
         let q = &w[off + 2..off + 2 + QK8_0];
         let block_sum = dot_f32_i8_vals_avx2_ptr(xb.as_ptr(), q.as_ptr() as *const i8, QK8_0);
         sum += block_sum * d;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sum_i8_32_ptr(v: *const i8) -> i32 {
+    let mut sum = 0i32;
+    for i in 0..QK8_0 {
+        sum += *v.add(i) as i32;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avxvnni")]
+unsafe fn dot_u8_i8_32_x86_avxvnni(a_u8: *const u8, b_i8: *const i8) -> i32 {
+    let src = _mm256_setzero_si256();
+    let a = _mm256_loadu_si256(a_u8 as *const __m256i);
+    let b = _mm256_loadu_si256(b_i8 as *const __m256i);
+    let acc = _mm256_dpbusd_avx_epi32(src, a, b);
+    let mut lanes = [0i32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+    lanes.iter().sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avxvnni")]
+unsafe fn vec_dot_q8_0_x86_avxvnni(x: &[f32], w: &[u8], n: usize) -> f32 {
+    let nb = n / QK8_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
+    let mut sum = 0.0f32;
+    let mut xq_u8 = [0u8; QK8_0];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off));
+        let xb = &x[i * QK8_0..(i + 1) * QK8_0];
+        let mut abs_max = 0.0f32;
+        for &v in xb {
+            let a = v.abs();
+            if a > abs_max {
+                abs_max = a;
+            }
+        }
+        if abs_max == 0.0 {
+            continue;
+        }
+        let x_scale = abs_max / 127.0;
+        let inv_x_scale = 1.0 / x_scale;
+        for j in 0..QK8_0 {
+            let q = (xb[j] * inv_x_scale).round().clamp(-127.0, 127.0) as i32;
+            xq_u8[j] = (q + 128) as u8;
+        }
+        let q_ptr = w[off + 2..off + 2 + QK8_0].as_ptr() as *const i8;
+        let dot_u = dot_u8_i8_32_x86_avxvnni(xq_u8.as_ptr(), q_ptr);
+        let sum_q = sum_i8_32_ptr(q_ptr);
+        let dot_s = dot_u - 128 * sum_q;
+        sum += dot_s as f32 * x_scale * d;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl")]
+unsafe fn dot_u8_i8_32_x86_avx512vnni(a_u8: *const u8, b_i8: *const i8) -> i32 {
+    let src = _mm256_setzero_si256();
+    let a = _mm256_loadu_si256(a_u8 as *const __m256i);
+    let b = _mm256_loadu_si256(b_i8 as *const __m256i);
+    let acc = _mm256_dpbusd_epi32(src, a, b);
+    let mut lanes = [0i32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+    lanes.iter().sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl")]
+unsafe fn vec_dot_q8_0_x86_avx512vnni(x: &[f32], w: &[u8], n: usize) -> f32 {
+    let nb = n / QK8_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
+    let mut sum = 0.0f32;
+    let mut xq_u8 = [0u8; QK8_0];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let d = fp16_to_fp32(read_u16_le(w, off));
+        let xb = &x[i * QK8_0..(i + 1) * QK8_0];
+        let mut abs_max = 0.0f32;
+        for &v in xb {
+            let a = v.abs();
+            if a > abs_max {
+                abs_max = a;
+            }
+        }
+        if abs_max == 0.0 {
+            continue;
+        }
+        let x_scale = abs_max / 127.0;
+        let inv_x_scale = 1.0 / x_scale;
+        for j in 0..QK8_0 {
+            let q = (xb[j] * inv_x_scale).round().clamp(-127.0, 127.0) as i32;
+            xq_u8[j] = (q + 128) as u8;
+        }
+        let q_ptr = w[off + 2..off + 2 + QK8_0].as_ptr() as *const i8;
+        let dot_u = dot_u8_i8_32_x86_avx512vnni(xq_u8.as_ptr(), q_ptr);
+        let sum_q = sum_i8_32_ptr(q_ptr);
+        let dot_s = dot_u - 128 * sum_q;
+        sum += dot_s as f32 * x_scale * d;
     }
     sum
 }

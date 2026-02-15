@@ -38,6 +38,7 @@ pub(crate) struct ModelRuntime {
     settings: GenerationSettings,
     lazy_debug_loader: Option<Arc<LazyModelLoader>>,
     next_lazy_debug_ms: i64,
+    kv_cache_format_logged: bool,
 }
 
 impl ModelRuntime {
@@ -107,6 +108,7 @@ impl ModelRuntime {
             settings,
             lazy_debug_loader,
             next_lazy_debug_ms,
+            kv_cache_format_logged: false,
         })
     }
 
@@ -154,7 +156,11 @@ impl ModelRuntime {
         let mut pos = 0usize;
         let mut start = 0i64;
 
-        let mut state = crate::engine::runtime::malloc_run_state(&self.config);
+        let mut state = crate::engine::runtime::malloc_run_state(&self.config)?;
+        if debug_mode && !self.kv_cache_format_logged {
+            eprintln!("KV cache format: {:?}", state.kv_cache_format);
+            self.kv_cache_format_logged = true;
+        }
         let mut rng = XorShiftRng::new(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -29,6 +29,9 @@ Supported tensor data paths include:
 - tokenizer initialization from GGUF vocab/metadata
 - model-family-specific chat prompt rendering
 - autoregressive generation loop
+- quantized KV cache for attention state:
+  - default `Q8` KV cache
+  - automatic `Q4` KV cache fallback if `Q8` allocation fails
 - optional tool-agent loop (`--agent`) with host-side file tools:
   - `read_file`
   - `list_dir`

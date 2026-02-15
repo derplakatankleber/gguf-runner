@@ -152,6 +152,9 @@ src/
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
   - `transformer(...)`
+  - quantized KV cache storage for attention state:
+    - default Q8 cache
+    - automatic Q4 fallback when Q8 allocation fails
 - `runtime/parallel.rs`:
   - `configure_rayon_threads(...)`
 - `runtime/mod.rs`:

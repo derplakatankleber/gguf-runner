@@ -1,16 +1,27 @@
+mod gemma;
+mod llama;
+mod qwen;
+
 use crate::{
-    get_gguf_float_from_map, get_gguf_int_from_map, get_gguf_string_from_map, Config, GGUFFile,
+    engine::io::{get_gguf_float_from_map, get_gguf_int_from_map, get_gguf_string_from_map},
+    Config, GGUFFile, Tokenizer,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelFamily {
+    Llama,
+    Gemma,
+    Qwen2,
+    Qwen3Moe,
+    Qwen3Next,
+}
 
 struct ModelIdentity {
     key_prefix: String,
-    is_gemma3: bool,
-    is_qwen2: bool,
-    is_qwen3moe: bool,
-    is_qwen3next: bool,
+    family: ModelFamily,
 }
 
-fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> Result<ModelIdentity, String> {
+fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
     let arch = get_gguf_string_from_map(&gguf.kv, "general.architecture").unwrap_or("llama");
     if debug_mode {
         eprintln!("Model architecture: {arch}");
@@ -18,14 +29,11 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> Result<ModelIdent
 
     let mut identity = ModelIdentity {
         key_prefix: "llama".to_string(),
-        is_gemma3: false,
-        is_qwen2: false,
-        is_qwen3moe: false,
-        is_qwen3next: false,
+        family: ModelFamily::Llama,
     };
 
     if arch == "gemma3" || arch == "gemma2" || arch == "gemma" {
-        identity.is_gemma3 = true;
+        identity.family = ModelFamily::Gemma;
         identity.key_prefix = "gemma3".to_string();
         if get_gguf_int_from_map(&gguf.kv, "gemma3.embedding_length", 0) == 0 {
             if get_gguf_int_from_map(&gguf.kv, "gemma2.embedding_length", 0) != 0 {
@@ -41,11 +49,11 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> Result<ModelIdent
             );
         }
     } else if arch == "qwen3moe" || arch.starts_with("qwen3moe") {
-        identity.is_qwen3moe = true;
+        identity.family = ModelFamily::Qwen3Moe;
         identity.key_prefix = arch.to_string();
         let probe = format!("{}.embedding_length", identity.key_prefix);
-        if get_gguf_int_from_map(&gguf.kv, &probe, 0) == 0
-            && get_gguf_int_from_map(&gguf.kv, "qwen3moe.embedding_length", 0) != 0
+        if get_gguf_int_from_map(&gguf.kv, &probe, 0)
+            == 0 && get_gguf_int_from_map(&gguf.kv, "qwen3moe.embedding_length", 0) != 0
         {
             identity.key_prefix = "qwen3moe".to_string();
         }
@@ -56,11 +64,11 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> Result<ModelIdent
             );
         }
     } else if arch == "qwen3next" || arch.starts_with("qwen3next") {
-        identity.is_qwen3next = true;
+        identity.family = ModelFamily::Qwen3Next;
         identity.key_prefix = arch.to_string();
         let probe = format!("{}.embedding_length", identity.key_prefix);
-        if get_gguf_int_from_map(&gguf.kv, &probe, 0) == 0
-            && get_gguf_int_from_map(&gguf.kv, "qwen3next.embedding_length", 0) != 0
+        if get_gguf_int_from_map(&gguf.kv, &probe, 0)
+            == 0 && get_gguf_int_from_map(&gguf.kv, "qwen3next.embedding_length", 0) != 0
         {
             identity.key_prefix = "qwen3next".to_string();
         }
@@ -71,7 +79,7 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> Result<ModelIdent
             );
         }
     } else if arch.starts_with("qwen") || arch == "qwen2" {
-        identity.is_qwen2 = true;
+        identity.family = ModelFamily::Qwen2;
         identity.key_prefix = arch.to_string();
         let probe = format!("{}.embedding_length", identity.key_prefix);
         if get_gguf_int_from_map(&gguf.kv, &probe, 0) == 0 {
@@ -89,11 +97,11 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> Result<ModelIdent
         }
     }
 
-    Ok(identity)
+    identity
 }
 
 pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Result<Config, String> {
-    let identity = detect_model_identity(gguf, debug_mode)?;
+    let identity = detect_model_identity(gguf, debug_mode);
     let key_prefix = identity.key_prefix;
 
     let key_dim = format!("{key_prefix}.embedding_length");
@@ -139,10 +147,10 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         rope_theta: 0.0,
         head_dim: 0,
         rope_dim: 0,
-        is_gemma3: identity.is_gemma3,
-        is_qwen2: identity.is_qwen2,
-        is_qwen3moe: identity.is_qwen3moe,
-        is_qwen3next: identity.is_qwen3next,
+        is_gemma3: identity.family == ModelFamily::Gemma,
+        is_qwen2: identity.family == ModelFamily::Qwen2,
+        is_qwen3moe: identity.family == ModelFamily::Qwen3Moe,
+        is_qwen3next: identity.family == ModelFamily::Qwen3Next,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
         rope_theta_swa: get_gguf_float_from_map(&gguf.kv, &key_rope_swa, 10_000.0),
@@ -155,69 +163,22 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     };
 
     if config.is_qwen3moe || config.is_qwen3next {
-        if config.expert_hidden_dim == 0 || config.n_experts == 0 {
-            return Err(
-                "qwen model is missing expert metadata (expert_count/expert_feed_forward_length)"
-                    .to_string(),
-            );
-        }
-        if config.n_experts_used == 0 {
-            config.n_experts_used = 1;
-        }
-        if config.n_experts_used > config.n_experts {
-            config.n_experts_used = config.n_experts;
-        }
+        qwen::finalize_moe_config(&mut config)?;
         if config.is_qwen3moe {
-            // Qwen3 MoE routing defaults from official config.json.
-            config.moe_n_group = 8;
-            config.moe_topk_group = 4;
-            config.moe_norm_topk_prob = true;
-            config.moe_routed_scaling_factor = 2.5;
+            qwen::apply_qwen3moe_defaults(&mut config);
         }
         if config.is_qwen3next {
-            // Qwen3Next uses normalized top-k expert weights with softmax gating.
-            config.moe_norm_topk_prob = true;
-            config.moe_routed_scaling_factor = 1.0;
-            if config.ssm_conv_kernel == 0
-                || config.ssm_inner_size == 0
-                || config.ssm_state_size == 0
-                || config.ssm_time_step_rank == 0
-                || config.ssm_group_count == 0
-            {
-                return Err(
-                    "qwen3next model is missing SSM metadata (ssm.conv_kernel/inner_size/state_size/time_step_rank/group_count)"
-                        .to_string(),
-                );
-            }
-            if config.ssm_inner_size % config.ssm_time_step_rank != 0 {
-                return Err(format!(
-                    "qwen3next invalid SSM metadata: inner_size {} not divisible by time_step_rank {}",
-                    config.ssm_inner_size, config.ssm_time_step_rank
-                ));
-            }
-            if config.ssm_time_step_rank % config.ssm_group_count != 0 {
-                return Err(format!(
-                    "qwen3next invalid SSM metadata: time_step_rank {} not divisible by group_count {}",
-                    config.ssm_time_step_rank, config.ssm_group_count
-                ));
-            }
-            let head_v_dim = config.ssm_inner_size / config.ssm_time_step_rank;
-            if head_v_dim != config.ssm_state_size {
-                return Err(format!(
-                    "qwen3next unsupported SSM shape: state_size {} != inner_size/time_step_rank {}",
-                    config.ssm_state_size, head_v_dim
-                ));
-            }
+            qwen::validate_qwen3next(&mut config)?;
         }
     }
 
     config.n_kv_heads =
         get_gguf_int_from_map(&gguf.kv, &key_kv_heads, config.n_heads as i64) as usize;
 
-    let default_rope_theta = if config.is_gemma3 {
-        1_000_000.0
+    let default_rope_theta = if identity.family == ModelFamily::Gemma {
+        gemma::default_rope_theta()
     } else {
-        500_000.0
+        llama::default_rope_theta()
     };
     config.rope_theta = get_gguf_float_from_map(&gguf.kv, &key_rope, default_rope_theta);
     config.head_dim = get_gguf_int_from_map(
@@ -259,54 +220,30 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
             config.rope_theta, config.head_dim, config.rope_dim
         );
         if config.is_gemma3 {
-            eprintln!(
-                "Gemma3: rms_norm_eps={}, final_logit_softcapping={}",
-                config.rms_norm_eps, config.final_logit_softcapping
-            );
+            gemma::print_config_debug(&config);
         } else if config.is_qwen3moe {
-            eprintln!(
-                "Qwen3MoE: experts={}, experts_used={}, n_group={}, topk_group={}, norm_topk_prob={}, routed_scaling_factor={}, rms_norm_eps={}",
-                config.n_experts,
-                config.n_experts_used,
-                config.moe_n_group,
-                config.moe_topk_group,
-                config.moe_norm_topk_prob,
-                config.moe_routed_scaling_factor,
-                config.rms_norm_eps
-            );
+            qwen::print_qwen3moe_debug(&config);
         } else if config.is_qwen3next {
-            eprintln!(
-                "Qwen3Next: experts={}, experts_used={}, expert_hidden_dim={}, shared_expert_hidden_dim={}, ssm_inner={}, ssm_state={}, ssm_heads={}, ssm_groups={}, ssm_conv_kernel={}, rms_norm_eps={}",
-                config.n_experts,
-                config.n_experts_used,
-                config.expert_hidden_dim,
-                config.shared_expert_hidden_dim,
-                config.ssm_inner_size,
-                config.ssm_state_size,
-                config.ssm_time_step_rank,
-                config.ssm_group_count,
-                config.ssm_conv_kernel,
-                config.rms_norm_eps
-            );
+            qwen::print_qwen3next_debug(&config);
         }
     }
 
     Ok(config)
 }
 
-pub(crate) fn apply_context_size_overrides(
-    config: &mut Config,
-    context_size: usize,
-    debug_mode: bool,
-) {
-    if context_size > 0 {
-        config.seq_len = context_size;
+pub(crate) fn encode_chat_prompt(
+    tokenizer: &mut Tokenizer,
+    config: &Config,
+    prompt: &str,
+    system_prompt: &str,
+) -> Vec<i32> {
+    if config.is_gemma3 {
+        gemma::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else if config.is_qwen3moe || config.is_qwen3next {
-        if debug_mode {
-            eprintln!(
-                "Using qwen3 native context length {} (model may require a large workspace)",
-                config.seq_len
-            );
-        }
+        qwen::encode_qwen3_chat(tokenizer, prompt, system_prompt)
+    } else if config.is_qwen2 {
+        qwen::encode_qwen2_chat(tokenizer, prompt, system_prompt)
+    } else {
+        llama::encode_chat_prompt(tokenizer, prompt, system_prompt)
     }
 }

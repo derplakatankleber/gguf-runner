@@ -12,4 +12,4 @@ panic = "abort"
 [dependencies]
 rayon = "1.10"
 ureq = "2.10"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }

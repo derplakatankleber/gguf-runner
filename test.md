@@ -65,7 +65,7 @@ Results:
 
 - Qwen3Next recurrent state update (`qwen3next_linear_attention_autoregressive`) now uses:
   - dedicated per-head scratch buffers (`ssm_kv_mem`, `ssm_delta`)
-  - optional parallel execution across heads (`LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS`, default `8`)
+  - optional parallel execution across heads (`GGUF_PAR_QWEN3NEXT_MIN_HEADS`, default `8`)
   - reduced hot-loop overhead by moving repeated work into `qwen3next_state_head_step`
 - Full-attn packed Q/gate path now avoids storing gate values into a separate `q_gate` buffer:
   - removed `q_gate` from `RunState`
@@ -74,10 +74,10 @@ Results:
 - Parallel tuning improvements:
   - raised defaults to `matmul_min_rows=256`, `attn_min_heads=8`
   - added runtime tuning via env vars:
-    - `LLAMA3PURE_PAR_MATMUL_MIN_ROWS`
-    - `LLAMA3PURE_PAR_ATTN_MIN_HEADS`
-    - `LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS`
-  - added `-threads` CLI option and `LLAMA3PURE_RAYON_THREADS` env var
+    - `GGUF_PAR_MATMUL_MIN_ROWS`
+    - `GGUF_PAR_ATTN_MIN_HEADS`
+    - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
+  - added `-threads` CLI option and `GGUF_RAYON_THREADS` env var
 - ARM (Apple Silicon) SIMD optimization:
   - unrolled aarch64 NEON kernels for `dot_f32_simd_ptr`, `axpy_simd_ptr`, and `scale_simd_inplace` (16-float stride)
 
@@ -124,10 +124,10 @@ Results:
   - `moe`
   - `ffn`
 - Added runtime parallel tuning controls:
-  - `LLAMA3PURE_PAR_MATMUL_MIN_ROWS`
-  - `LLAMA3PURE_PAR_ATTN_MIN_HEADS`
-  - `LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS`
-  - `-threads` / `LLAMA3PURE_RAYON_THREADS`
+  - `GGUF_PAR_MATMUL_MIN_ROWS`
+  - `GGUF_PAR_ATTN_MIN_HEADS`
+  - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
+  - `-threads` / `GGUF_RAYON_THREADS`
 
 ### current runtime and memory consumption
 
@@ -171,10 +171,10 @@ Results:
   - `ffn`
 - Kept profiling disabled by default; it only prints when `-profiling` is passed.
 - Added/kept runtime tuning knobs for parallelism:
-  - `-threads` and `LLAMA3PURE_RAYON_THREADS`
-  - `LLAMA3PURE_PAR_MATMUL_MIN_ROWS`
-  - `LLAMA3PURE_PAR_ATTN_MIN_HEADS`
-  - `LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS`
+  - `-threads` and `GGUF_RAYON_THREADS`
+  - `GGUF_PAR_MATMUL_MIN_ROWS`
+  - `GGUF_PAR_ATTN_MIN_HEADS`
+  - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
 
 Example profiling command:
 ```bash
@@ -192,7 +192,7 @@ Example profiling command:
 - Integrated these kernels into matmul row execution (`matmul_quantized` and `matmul_quantized_rows`) so they run directly for the above types.
 - Removed function-pointer dispatch from matmul hot loops:
   - switched to per-type direct match dispatch, enabling better inlining and specialization.
-- Added an ARM-specific, opt-in Q8 path (`LLAMA3PURE_AARCH64_DOTPROD_Q8=1`) that uses aarch64 int8 accumulation intrinsics for faster int8 dot-style accumulation.
+- Added an ARM-specific, opt-in Q8 path (`GGUF_AARCH64_DOTPROD_Q8=1`) that uses aarch64 int8 accumulation intrinsics for faster int8 dot-style accumulation.
   - This path is disabled by default.
 
 ### current runtime and memory/profile snapshot
@@ -217,7 +217,7 @@ sys 81.31
 
 Tuned short profiling run (`-threads 8` and coarser thresholds):
 ```bash
-LLAMA3PURE_PAR_MATMUL_MIN_ROWS=512 LLAMA3PURE_PAR_ATTN_MIN_HEADS=16 LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 /usr/bin/time -p ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 120 -context_size 250000 -profiling -threads 8
+GGUF_PAR_MATMUL_MIN_ROWS=512 GGUF_PAR_ATTN_MIN_HEADS=16 GGUF_PAR_QWEN3NEXT_MIN_HEADS=16 /usr/bin/time -p ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 120 -context_size 250000 -profiling -threads 8
 ```
 
 Results:
@@ -278,12 +278,12 @@ sys	63m43.536s
 ### x86 code paths now available
 
 - Added runtime-dispatched x86 SIMD paths.
-- `LLAMA3PURE_X86_AVX2=1` enables AVX2+FMA kernels for core `dot/axpy/scale` and BF16 prefix dot.
-- `LLAMA3PURE_X86_F16C=1` enables F16C-based F16 prefix dot.
-- `LLAMA3PURE_X86_QK_MR4=1` enables x86 `MR=4` matmul kernels for `Q4_K`, `Q5_K`, `Q6_K`.
+- `GGUF_X86_AVX2=1` enables AVX2+FMA kernels for core `dot/axpy/scale` and BF16 prefix dot.
+- `GGUF_X86_F16C=1` enables F16C-based F16 prefix dot.
+- `GGUF_X86_QK_MR4=1` enables x86 `MR=4` matmul kernels for `Q4_K`, `Q5_K`, `Q6_K`.
 - Added chunked parallel row scheduling for matmul.
-- `LLAMA3PURE_PAR_MATMUL_CHUNK_ROWS` (new)
-- `LLAMA3PURE_PAR_MATMUL_MIN_ROWS` (kept)
+- `GGUF_PAR_MATMUL_CHUNK_ROWS` (new)
+- `GGUF_PAR_MATMUL_MIN_ROWS` (kept)
 
 ### recommended baseline command (x86)
 
@@ -294,26 +294,26 @@ sys	63m43.536s
 ### intel ultra preset (starting point)
 
 ```bash
-LLAMA3PURE_X86_AVX2=1 \
-LLAMA3PURE_X86_F16C=1 \
-LLAMA3PURE_X86_QK_MR4=1 \
-LLAMA3PURE_PAR_MATMUL_MIN_ROWS=512 \
-LLAMA3PURE_PAR_MATMUL_CHUNK_ROWS=96 \
-LLAMA3PURE_PAR_ATTN_MIN_HEADS=16 \
-LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 \
+GGUF_X86_AVX2=1 \
+GGUF_X86_F16C=1 \
+GGUF_X86_QK_MR4=1 \
+GGUF_PAR_MATMUL_MIN_ROWS=512 \
+GGUF_PAR_MATMUL_CHUNK_ROWS=96 \
+GGUF_PAR_ATTN_MIN_HEADS=16 \
+GGUF_PAR_QWEN3NEXT_MIN_HEADS=16 \
 /usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 8 -show-tokens
 ```
 
 ### amd zen 5 preset (starting point)
 
 ```bash
-LLAMA3PURE_X86_AVX2=1 \
-LLAMA3PURE_X86_F16C=1 \
-LLAMA3PURE_X86_QK_MR4=1 \
-LLAMA3PURE_PAR_MATMUL_MIN_ROWS=640 \
-LLAMA3PURE_PAR_MATMUL_CHUNK_ROWS=128 \
-LLAMA3PURE_PAR_ATTN_MIN_HEADS=16 \
-LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 \
+GGUF_X86_AVX2=1 \
+GGUF_X86_F16C=1 \
+GGUF_X86_QK_MR4=1 \
+GGUF_PAR_MATMUL_MIN_ROWS=640 \
+GGUF_PAR_MATMUL_CHUNK_ROWS=128 \
+GGUF_PAR_ATTN_MIN_HEADS=16 \
+GGUF_PAR_QWEN3NEXT_MIN_HEADS=16 \
 /usr/bin/time -l ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 12 -show-tokens
 ```
 ./target/release/llama3pure -model Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -max_tokens 50000 -context_size 250000 -temperature 0 -top_k 1 -top_p 1 -threads 12 -show-tokens
@@ -322,13 +322,13 @@ LLAMA3PURE_PAR_QWEN3NEXT_MIN_HEADS=16 \
 
 ```bash
 # disable MR4 only
-LLAMA3PURE_X86_QK_MR4=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+GGUF_X86_QK_MR4=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
 
 # disable AVX2/FMA path only
-LLAMA3PURE_X86_AVX2=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+GGUF_X86_AVX2=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
 
 # disable F16C path only
-LLAMA3PURE_X86_F16C=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
+GGUF_X86_F16C=0 ./target/release/llama3pure -model Qwen3-Coder-Next-Q4_K_M.gguf -prompt "test" -max_tokens 512 -context_size 8192 -temperature 0 -top_k 1 -top_p 1 -show-tokens
 ```
 
 ### notes
@@ -353,4 +353,4 @@ time ./target/release/gguf-runner -model Qwen3-4B-Instruct-2507-Q4_K_M.gguf -url
 
 # macbook air
 
-./target/release/gguf-runner -model Qwen3-4B-Instruct-2507-Q4_K_M.gguf -prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" -show-tokens
+./target/release/gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" --show-tokens --show-timings

@@ -1,8 +1,6 @@
 use std::sync::atomic::AtomicU8;
 use std::sync::OnceLock;
 
-use crate::cli::CliOptions;
-
 #[cfg(target_arch = "x86_64")]
 const PAR_MATMUL_MIN_ROWS_DEFAULT: usize = 384;
 #[cfg(not(target_arch = "x86_64"))]
@@ -42,6 +40,25 @@ pub(crate) static X86_Q5K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 pub(crate) static X86_Q6K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 static LAYER_DEBUG_CFG: OnceLock<bool> = OnceLock::new();
 static LAYER_DEBUG_POS_CFG: OnceLock<Option<usize>> = OnceLock::new();
+
+pub(crate) struct RuntimeSwitchConfig {
+    pub(crate) par_matmul_min_rows: Option<usize>,
+    pub(crate) par_matmul_chunk_rows: Option<usize>,
+    pub(crate) par_attn_min_heads: Option<usize>,
+    pub(crate) par_qwen3next_min_heads: Option<usize>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_dotprod_q8: Option<bool>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_qk_mr4: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_avx2: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_f16c: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_qk_mr4: Option<bool>,
+    pub(crate) layer_debug: Option<bool>,
+    pub(crate) layer_debug_pos: Option<usize>,
+}
 
 #[inline]
 pub(crate) fn layer_debug_enabled() -> bool {
@@ -110,53 +127,53 @@ pub(crate) fn use_x86_qk_mr4() -> bool {
     *X86_QK_MR4_CFG.get_or_init(|| true)
 }
 
-pub(crate) fn init_runtime_config_from_cli(cli: &CliOptions) {
-    if let Some(v) = cli.par_matmul_min_rows {
+pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
+    if let Some(v) = config.par_matmul_min_rows {
         let _ = PAR_MATMUL_MIN_ROWS_CFG.set(v);
     }
-    if let Some(v) = cli.par_matmul_chunk_rows {
+    if let Some(v) = config.par_matmul_chunk_rows {
         let _ = PAR_MATMUL_CHUNK_ROWS_CFG.set(v);
     }
-    if let Some(v) = cli.par_attn_min_heads {
+    if let Some(v) = config.par_attn_min_heads {
         let _ = PAR_ATTN_MIN_HEADS_CFG.set(v);
     }
-    if let Some(v) = cli.par_qwen3next_min_heads {
+    if let Some(v) = config.par_qwen3next_min_heads {
         let _ = PAR_QWEN3NEXT_MIN_HEADS_CFG.set(v);
     }
-    if let Some(v) = cli.layer_debug {
+    if let Some(v) = config.layer_debug {
         let _ = LAYER_DEBUG_CFG.set(v);
     }
-    if let Some(v) = cli.layer_debug_pos {
+    if let Some(v) = config.layer_debug_pos {
         let _ = LAYER_DEBUG_POS_CFG.set(Some(v));
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        if let Some(v) = cli.aarch64_dotprod_q8 {
+        if let Some(v) = config.aarch64_dotprod_q8 {
             let enabled = v && std::arch::is_aarch64_feature_detected!("dotprod");
             let _ = AARCH64_DOTPROD_Q8_CFG.set(enabled);
         }
-        if let Some(v) = cli.aarch64_qk_mr4 {
+        if let Some(v) = config.aarch64_qk_mr4 {
             let _ = AARCH64_QK_MR4_CFG.set(v);
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        if let Some(v) = cli.x86_avx2 {
+        if let Some(v) = config.x86_avx2 {
             let enabled = v
                 && std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma");
             let _ = X86_AVX2_FMA_CFG.set(enabled);
         }
-        if let Some(v) = cli.x86_f16c {
+        if let Some(v) = config.x86_f16c {
             let enabled = v
                 && std::arch::is_x86_feature_detected!("avx")
                 && std::arch::is_x86_feature_detected!("f16c")
                 && std::arch::is_x86_feature_detected!("fma");
             let _ = X86_F16C_CFG.set(enabled);
         }
-        if let Some(v) = cli.x86_qk_mr4 {
+        if let Some(v) = config.x86_qk_mr4 {
             let _ = X86_QK_MR4_CFG.set(v);
         }
     }

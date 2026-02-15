@@ -1,4 +1,13 @@
-use crate::*;
+use crate::engine::kernels::{
+    accum, axpy_inplace, dot_f32_simd, finite_or_zero, l2_norm, matmul_f32_embeddings,
+    matmul_quantized, matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm,
+    rmsnorm_gemma, rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, scale_slice_inplace,
+    select_topk_softmax, sigmoidf, softmax,
+};
+use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
+use crate::engine::switches::{layer_debug_enabled, layer_debug_pos, par_attn_min_heads};
+use crate::engine::types::{Config, RunState, TransformerWeights};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 pub(crate) fn malloc_run_state(p: &Config) -> RunState {
     let head_size = if p.head_dim > 0 {

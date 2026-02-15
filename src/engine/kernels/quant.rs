@@ -1,5 +1,29 @@
-use crate::*;
+use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, read_u32_le};
+use crate::engine::profiling::{prof_end, prof_start, PROF_MATMUL_NS};
+#[cfg(target_arch = "aarch64")]
+use crate::engine::switches::{
+    use_aarch64_dotprod_q8, use_aarch64_qk_mr4, AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS,
+    AARCH64_Q6K_MR4_STATUS,
+};
+use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
+#[cfg(target_arch = "x86_64")]
+use crate::engine::switches::{
+    use_x86_avx2_fma, use_x86_f16c, use_x86_qk_mr4, X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS,
+    X86_Q6K_MR4_STATUS,
+};
+use crate::engine::types::{
+    ensure_model_range, GgmlType, QuantizedTensor, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0, KVALUES_IQ4NL, QK4_0, QK4_1, QK4_NL, QK5_0, QK5_1, QK8_0, QK_K,
+};
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 pub(crate) fn get_block_size(ttype: GgmlType) -> usize {
     match ttype.0 {
         GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_BF16 | 30 => 1,

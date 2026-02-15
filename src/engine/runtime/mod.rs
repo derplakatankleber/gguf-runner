@@ -1,7 +1,7 @@
 mod inference;
 mod parallel;
 
-use crate::Config;
+use crate::engine::types::Config;
 
 pub(crate) use inference::{malloc_run_state, transformer};
 pub(crate) use parallel::configure_rayon_threads;

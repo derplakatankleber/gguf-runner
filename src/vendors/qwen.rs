@@ -1,4 +1,4 @@
-use crate::{Config, Tokenizer};
+use crate::engine::types::{Config, Tokenizer};
 
 pub(super) fn finalize_moe_config(config: &mut Config) -> Result<(), String> {
     if config.expert_hidden_dim == 0 || config.n_experts == 0 {

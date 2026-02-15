@@ -1,4 +1,10 @@
-use crate::*;
+use crate::engine::kernels::{
+    axpy_inplace, dot_f32_simd, matmul_quantized, matmul_quantized_rows, scale_slice_inplace,
+};
+use crate::engine::profiling::{prof_end, prof_start, PROF_SSM_NS};
+use crate::engine::switches::par_qwen3next_min_heads;
+use crate::engine::types::{Config, RunState, TransformerWeights};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 pub(crate) fn accum(a: &mut [f32], b: &[f32], size: usize) {
     for i in 0..size {
         a[i] += b[i];
@@ -440,4 +446,3 @@ pub(crate) fn matmul_f32_embeddings(logits: &mut [f32], x: &[f32], emb: &[f32], 
         logits[r] = dot_f32_simd(row, &x[..cols]);
     }
 }
-

@@ -1,4 +1,6 @@
-use crate::{Config, Tokenizer, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN};
+use crate::engine::types::{
+    Config, Tokenizer, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
+};
 
 pub(super) fn default_rope_theta() -> f32 {
     1_000_000.0

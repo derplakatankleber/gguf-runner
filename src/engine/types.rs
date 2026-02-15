@@ -1,4 +1,3 @@
-use crate::LAZY_MODEL_LOADER;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -7,7 +6,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 pub(crate) const GGUF_MAGIC: u32 = 0x4655_4747;
 
@@ -139,6 +138,8 @@ pub(crate) const LAZY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const LAZY_BOOTSTRAP_START_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const LAZY_BOOTSTRAP_MAX_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const LAZY_FETCH_RETRIES: usize = 3;
+
+pub(crate) static LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LazyChunkState {

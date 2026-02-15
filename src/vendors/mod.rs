@@ -2,10 +2,8 @@ mod gemma;
 mod llama;
 mod qwen;
 
-use crate::{
-    engine::io::{get_gguf_float_from_map, get_gguf_int_from_map, get_gguf_string_from_map},
-    Config, GGUFFile, Tokenizer,
-};
+use crate::engine::io::{get_gguf_float_from_map, get_gguf_int_from_map, get_gguf_string_from_map};
+use crate::engine::types::{Config, GGUFFile, Tokenizer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelFamily {

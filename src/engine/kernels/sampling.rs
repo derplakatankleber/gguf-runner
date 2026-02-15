@@ -1,4 +1,4 @@
-use crate::*;
+use crate::engine::types::XorShiftRng;
 pub(crate) fn argmax(v: &[f32]) -> usize {
     let mut max_i = 0usize;
     let mut max_p = v[0];

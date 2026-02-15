@@ -1,5 +1,5 @@
 use crate::engine::io::get_gguf_int_from_map;
-use crate::{
+use crate::engine::types::{
     Config, GGUFFile, GgufValue, Tokenizer, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN,
     LLAMA3_EOT, LLAMA3_START_HEADER,
 };

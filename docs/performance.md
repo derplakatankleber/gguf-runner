@@ -57,6 +57,7 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | lnx-9700-64g | png_to_jpeg_v1 | 7.287 | 154.820 | |
 | 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 0.409 | 2240.847 | |
 | 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.613 | 530.794 | |
+| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-125h-32g | png_to_jpeg_v1 | 2.228 | 369.767 | |
 | 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 4.932 | 186.182 | |
 
 ## Benchmark Caveats

@@ -139,6 +139,14 @@ struct Cli {
     allow_write_tools: bool,
 
     #[arg(
+        long = "allow-shell-command",
+        value_name = "command",
+        env = "GGUF_ALLOW_SHELL_COMMANDS",
+        value_delimiter = ','
+    )]
+    allow_shell_commands: Vec<String>,
+
+    #[arg(
         long = "max-tool-calls",
         value_parser = parse_positive_usize,
         default_value_t = 8
@@ -288,6 +296,7 @@ pub(crate) struct CliOptions {
     pub(crate) agent: bool,
     pub(crate) tool_root: Option<String>,
     pub(crate) allow_write_tools: bool,
+    pub(crate) allow_shell_commands: Vec<String>,
     pub(crate) max_tool_calls: usize,
     pub(crate) profiling: bool,
     pub(crate) show_tokens: bool,
@@ -319,6 +328,14 @@ pub(crate) struct CliOptions {
 impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
+        let allow_shell_commands = cli
+            .allow_shell_commands
+            .iter()
+            .flat_map(|raw| raw.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
 
         Ok(Self {
             model: cli.model,
@@ -336,6 +353,7 @@ impl CliOptions {
             agent: cli.agent,
             tool_root: cli.tool_root,
             allow_write_tools: cli.allow_write_tools,
+            allow_shell_commands,
             max_tool_calls: cli.max_tool_calls,
             profiling: cli.profiling,
             show_tokens: cli.show_tokens,

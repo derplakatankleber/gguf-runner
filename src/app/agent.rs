@@ -17,7 +17,11 @@ enum AgentResponse {
 }
 
 pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Result<(), String> {
-    let tool_exec = ToolExecutor::new(cli.tool_root.as_deref(), cli.allow_write_tools)?;
+    let tool_exec = ToolExecutor::new(
+        cli.tool_root.as_deref(),
+        cli.allow_write_tools,
+        &cli.allow_shell_commands,
+    )?;
     let system_prompt = build_agent_system_prompt(&cli.system_prompt, &tool_exec);
     let mut transcript = vec![AgentMessage {
         role: "user",
@@ -67,12 +71,40 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
                 let args = args.unwrap_or_else(|| json!({}));
                 let tool_result = match tool_exec.execute(&tool, &args) {
                     Ok(v) => v,
-                    Err(e) => json!({
-                        "ok": false,
-                        "tool": tool,
-                        "error": e
-                    }),
+                    Err(e) => {
+                        if tool == "shell_exec" {
+                            eprintln!("shell_exec error: {e}");
+                        }
+                        json!({
+                            "ok": false,
+                            "tool": tool,
+                            "error": e
+                        })
+                    }
                 };
+                if tool == "shell_exec"
+                    && tool_result.get("ok").and_then(Value::as_bool) == Some(false)
+                    && tool_result.get("exit_code").is_some()
+                {
+                    let exit_code = tool_result
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let stderr = tool_result
+                        .get("stderr")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let stderr_preview = stderr.trim().chars().take(240).collect::<String>();
+                    if stderr_preview.is_empty() {
+                        eprintln!("shell_exec failed (exit_code={exit_code})");
+                    } else {
+                        eprintln!(
+                            "shell_exec failed (exit_code={exit_code}): {}",
+                            stderr_preview
+                        );
+                    }
+                }
                 let tool_result_text =
                     serde_json::to_string_pretty(&tool_result).map_err(|e| e.to_string())?;
                 transcript.push(AgentMessage {
@@ -121,27 +153,37 @@ fn build_agent_system_prompt(base_system_prompt: &str, tool_exec: &ToolExecutor)
     } else {
         "disabled"
     };
+    let shell_allowed_commands = if tool_exec.shell_allowed_commands().is_empty() {
+        "<none>".to_string()
+    } else {
+        tool_exec.shell_allowed_commands().join(", ")
+    };
     format!(
         "{base_system_prompt}\n\n\
 You are running with host tools. \
 Always respond with exactly one JSON object and no surrounding markdown.\n\
 Allowed response schemas:\n\
 1) Tool call:\n\
-{{\"type\":\"tool_call\",\"tool\":\"read_file|write_file|list_dir\",\"args\":{{...}}}}\n\
+{{\"type\":\"tool_call\",\"tool\":\"read_file|write_file|list_dir|shell_list_allowed|shell_exec|shell_request_allowed\",\"args\":{{...}}}}\n\
 2) Final answer:\n\
 {{\"type\":\"final\",\"content\":\"...\"}}\n\
 Rules:\n\
 - Use tools when you need filesystem state.\n\
 - If the user asks about files, code, directories, or repository contents, call a filesystem tool before answering.\n\
+- `shell_exec` can only execute commands already in the shell allowed list.\n\
+- Use `shell_list_allowed` when you need to inspect currently enabled tools or allowed shell commands.\n\
+- If a needed command is missing from the shell allowed list, call `shell_request_allowed` with command + reason.\n\
 - Keep tool arguments minimal and valid JSON.\n\
 - If a tool fails, adjust and retry.\n\
 - Return `type=final` when done.\n\
 Tool constraints:\n\
 - tool_root: {}\n\
 - write_file: {}\n\
+- shell allowed commands: {}\n\
 - max read/write payload per call: 262144 bytes\n",
         tool_exec.root().display(),
-        write_state
+        write_state,
+        shell_allowed_commands
     )
 }
 

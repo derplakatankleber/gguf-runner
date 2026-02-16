@@ -36,6 +36,9 @@ Supported tensor data paths include:
   - `read_file`
   - `list_dir`
   - `write_file` (requires `--allow-write-tools`)
+  - `shell_list_allowed` (reports currently enabled tools + allowed shell commands)
+  - `shell_exec` (restricted to operator-defined allowed commands)
+  - `shell_request_allowed` (asks operator to allow a specific shell command)
 - sampling modes:
   - greedy (`--temperature 0`)
   - stochastic temperature sampling
@@ -53,6 +56,7 @@ User-facing CLI options are defined in `src/cli.rs`.
 
 Exposed env var:
 - `GGUF_RAYON_THREADS` (same as `--threads`)
+- `GGUF_ALLOW_SHELL_COMMANDS` (comma-separated allowed commands for `shell_exec`)
 
 Hidden runtime tuning env vars (advanced use):
 - `GGUF_PAR_MATMUL_MIN_ROWS`

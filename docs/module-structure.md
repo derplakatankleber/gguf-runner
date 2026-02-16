@@ -87,6 +87,10 @@ src/
   - `read_file`
   - `write_file` (gated by CLI switch)
   - `list_dir`
+  - `shell_list_allowed`
+- Provides restricted external command tools:
+  - `shell_exec` (only for allowed command names)
+  - `shell_request_allowed` (structured request to operator)
 - Enforces tool root path constraints and per-call payload limits.
 
 ### `src/cli.rs`
@@ -99,6 +103,7 @@ src/
   - `--agent`
   - `--tool-root`
   - `--allow-write-tools`
+  - `--allow-shell-command`
   - `--max-tool-calls`
 
 ### `src/engine/mod.rs`
@@ -206,6 +211,7 @@ src/
   - tool transcript prompt encoded per turn
   - model emits JSON `tool_call` / `final`
   - host executes tool call (`app::tools`) and loops until final response or limit.
+  - `shell_exec` calls are restricted to CLI/env-provided allowed commands; model can request missing commands with `shell_request_allowed`.
 11. Profiling/timings printed from `engine::profiling` + `app::run()`.
 
 ## Placement Rules For Future Changes

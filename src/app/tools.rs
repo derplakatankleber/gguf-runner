@@ -1,20 +1,30 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const MAX_READ_BYTES: usize = 256 * 1024;
 const MAX_WRITE_BYTES: usize = 256 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
+const MAX_SHELL_ARGS: usize = 64;
+const MAX_SHELL_ARG_BYTES: usize = 4096;
+const MAX_SHELL_OUTPUT_BYTES: usize = 128 * 1024;
 
 pub(crate) struct ToolExecutor {
     root: PathBuf,
     allow_write: bool,
+    allow_shell_commands: Vec<String>,
 }
 
 impl ToolExecutor {
-    pub(crate) fn new(tool_root: Option<&str>, allow_write: bool) -> Result<Self, String> {
+    pub(crate) fn new(
+        tool_root: Option<&str>,
+        allow_write: bool,
+        allow_shell_commands: &[String],
+    ) -> Result<Self, String> {
         let root = match tool_root {
             Some(raw) => PathBuf::from(raw),
             None => std::env::current_dir()
@@ -26,7 +36,17 @@ impl ToolExecutor {
         if !root.is_dir() {
             return Err(format!("tool root is not a directory: {}", root.display()));
         }
-        Ok(Self { root, allow_write })
+        let mut uniq = BTreeSet::new();
+        for raw in allow_shell_commands {
+            let normalized = normalize_shell_command(raw)
+                .map_err(|e| format!("invalid shell command '{raw}': {e}"))?;
+            uniq.insert(normalized);
+        }
+        Ok(Self {
+            root,
+            allow_write,
+            allow_shell_commands: uniq.into_iter().collect(),
+        })
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -37,11 +57,18 @@ impl ToolExecutor {
         self.allow_write
     }
 
+    pub(crate) fn shell_allowed_commands(&self) -> &[String] {
+        &self.allow_shell_commands
+    }
+
     pub(crate) fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
         match tool {
             "read_file" => self.read_file(args),
             "write_file" => self.write_file(args),
             "list_dir" => self.list_dir(args),
+            "shell_list_allowed" => Ok(self.shell_list_allowed()),
+            "shell_exec" => self.shell_exec(args),
+            "shell_request_allowed" => self.shell_request_allowed(args),
             _ => Err(format!("unknown tool '{tool}'")),
         }
     }
@@ -228,6 +255,166 @@ impl ToolExecutor {
             "entries": entries
         }))
     }
+
+    fn is_shell_command_allowed(&self, command: &str) -> bool {
+        self.allow_shell_commands
+            .binary_search_by(|allowed| allowed.as_str().cmp(command))
+            .is_ok()
+    }
+
+    fn shell_list_allowed(&self) -> Value {
+        let mut tools = vec!["read_file", "list_dir", "shell_list_allowed"];
+        if self.allow_write {
+            tools.push("write_file");
+        }
+        tools.push("shell_exec");
+        tools.push("shell_request_allowed");
+        json!({
+            "ok": true,
+            "tool": "shell_list_allowed",
+            "allowed_tools": tools,
+            "write_file_enabled": self.allow_write,
+            "shell_allowed_commands": self.allow_shell_commands.clone()
+        })
+    }
+
+    fn shell_exec(&self, args: &Value) -> Result<Value, String> {
+        let args: RunShellArgs = serde_json::from_value(args.clone())
+            .map_err(|e| format!("invalid shell_exec args: {e}"))?;
+        let command = normalize_shell_command(&args.command)
+            .map_err(|e| format!("invalid shell_exec command: {e}"))?;
+        if !self.is_shell_command_allowed(&command) {
+            let allowed = if self.allow_shell_commands.is_empty() {
+                "<none>".to_string()
+            } else {
+                self.allow_shell_commands.join(", ")
+            };
+            return Err(format!(
+                "command '{}' is not allowed. allowed commands: {}",
+                command, allowed
+            ));
+        }
+
+        let argv = args.args.unwrap_or_default();
+        if argv.len() > MAX_SHELL_ARGS {
+            return Err(format!(
+                "too many shell_exec args: {} > {}",
+                argv.len(),
+                MAX_SHELL_ARGS
+            ));
+        }
+        for (idx, arg) in argv.iter().enumerate() {
+            if arg.as_bytes().contains(&0) {
+                return Err(format!("shell_exec arg {} contains NUL byte", idx));
+            }
+            if arg.len() > MAX_SHELL_ARG_BYTES {
+                return Err(format!(
+                    "shell_exec arg {} too large: {} bytes > {} bytes limit",
+                    idx,
+                    arg.len(),
+                    MAX_SHELL_ARG_BYTES
+                ));
+            }
+        }
+
+        let cwd = if let Some(raw_cwd) = args.cwd {
+            let dir = self.resolve_existing_path(&raw_cwd)?;
+            if !dir.is_dir() {
+                return Err(format!(
+                    "shell_exec cwd is not a directory: {}",
+                    dir.display()
+                ));
+            }
+            dir
+        } else {
+            self.root.clone()
+        };
+        let output_limit = args
+            .max_output_bytes
+            .unwrap_or(MAX_SHELL_OUTPUT_BYTES)
+            .min(MAX_SHELL_OUTPUT_BYTES);
+
+        let output = Command::new(&command)
+            .args(&argv)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("shell_exec failed for '{}': {e}", command))?;
+
+        let (stdout, stdout_truncated) = truncate_output(&output.stdout, output_limit);
+        let (stderr, stderr_truncated) = truncate_output(&output.stderr, output_limit);
+        Ok(json!({
+            "ok": output.status.success(),
+            "tool": "shell_exec",
+            "command": command,
+            "args": argv,
+            "cwd": cwd.display().to_string(),
+            "exit_code": output.status.code(),
+            "stdout_bytes": output.stdout.len(),
+            "stderr_bytes": output.stderr.len(),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "stdout": stdout,
+            "stderr": stderr
+        }))
+    }
+
+    fn shell_request_allowed(&self, args: &Value) -> Result<Value, String> {
+        let args: RequestShellAllowedArgs = serde_json::from_value(args.clone())
+            .map_err(|e| format!("invalid shell_request_allowed args: {e}"))?;
+        let command = normalize_shell_command(&args.command)
+            .map_err(|e| format!("invalid command request: {e}"))?;
+        let already_allowed = self.is_shell_command_allowed(&command);
+        let status = if already_allowed {
+            "already_allowed"
+        } else {
+            "needs_user_approval"
+        };
+        let hint = if already_allowed {
+            "Command is already allowed. Use shell_exec to execute it.".to_string()
+        } else {
+            format!(
+                "Ask the operator to add --allow-shell-command {} (or GGUF_ALLOW_SHELL_COMMANDS).",
+                command
+            )
+        };
+        Ok(json!({
+            "ok": true,
+            "tool": "shell_request_allowed",
+            "command": command,
+            "reason": args.reason,
+            "already_allowed": already_allowed,
+            "status": status,
+            "hint": hint
+        }))
+    }
+}
+
+fn normalize_shell_command(raw: &str) -> Result<String, String> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err("command cannot be empty".to_string());
+    }
+    if command.as_bytes().contains(&0) {
+        return Err("command contains NUL byte".to_string());
+    }
+    if command
+        .chars()
+        .any(|c| c.is_ascii_whitespace() || c == '/' || c == '\\')
+    {
+        return Err(
+            "command must be a bare executable name (no whitespace or path separators)".to_string(),
+        );
+    }
+    Ok(command.to_string())
+}
+
+fn truncate_output(bytes: &[u8], limit: usize) -> (String, bool) {
+    let truncated = bytes.len() > limit;
+    let slice = if truncated { &bytes[..limit] } else { bytes };
+    (String::from_utf8_lossy(slice).to_string(), truncated)
 }
 
 #[derive(Deserialize)]
@@ -247,4 +434,18 @@ struct WriteFileArgs {
 struct ListDirArgs {
     path: Option<String>,
     max_entries: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RunShellArgs {
+    command: String,
+    args: Option<Vec<String>>,
+    cwd: Option<String>,
+    max_output_bytes: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RequestShellAllowedArgs {
+    command: String,
+    reason: Option<String>,
 }

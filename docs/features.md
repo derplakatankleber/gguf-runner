@@ -60,11 +60,19 @@ Agent config file (optional):
 
 Shell allowed-commands config schema:
 ```toml
-[shell]
+[tools]
+read_file = true
+list_dir = true
+write_file = true
+shell_list_allowed = true
+shell_exec = true
+shell_request_allowed = true
+
 [shell.cmd]
 rg = "Fast recursive text search."
 ls = "List directory entries."
 cat = "Read file content."
+cwd = "Show current working directory (shell_exec built-in helper)."
 ```
 
 Exposed env var:

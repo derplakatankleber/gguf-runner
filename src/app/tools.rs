@@ -1,3 +1,4 @@
+use crate::cli::AgentToolEnablement;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -16,6 +17,7 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 128 * 1024;
 pub(crate) struct ToolExecutor {
     root: PathBuf,
     allow_write: bool,
+    tool_enablement: AgentToolEnablement,
     allow_shell_commands: Vec<String>,
 }
 
@@ -23,6 +25,7 @@ impl ToolExecutor {
     pub(crate) fn new(
         tool_root: Option<&str>,
         allow_write: bool,
+        tool_enablement: AgentToolEnablement,
         allow_shell_commands: &[String],
     ) -> Result<Self, String> {
         let root = match tool_root {
@@ -45,6 +48,7 @@ impl ToolExecutor {
         Ok(Self {
             root,
             allow_write,
+            tool_enablement,
             allow_shell_commands: uniq.into_iter().collect(),
         })
     }
@@ -53,8 +57,47 @@ impl ToolExecutor {
         &self.root
     }
 
-    pub(crate) fn allow_write(&self) -> bool {
-        self.allow_write
+    pub(crate) fn write_file_enabled(&self) -> bool {
+        self.tool_enablement.write_file && self.allow_write
+    }
+
+    pub(crate) fn shell_exec_enabled(&self) -> bool {
+        self.tool_enablement.shell_exec
+    }
+
+    pub(crate) fn shell_list_allowed_enabled(&self) -> bool {
+        self.tool_enablement.shell_list_allowed
+    }
+
+    pub(crate) fn shell_request_allowed_enabled(&self) -> bool {
+        self.tool_enablement.shell_request_allowed
+    }
+
+    pub(crate) fn has_any_filesystem_tool(&self) -> bool {
+        self.tool_enablement.read_file || self.tool_enablement.list_dir || self.write_file_enabled()
+    }
+
+    pub(crate) fn enabled_tool_names(&self) -> Vec<&'static str> {
+        let mut tools = Vec::new();
+        if self.tool_enablement.read_file {
+            tools.push("read_file");
+        }
+        if self.tool_enablement.write_file && self.allow_write {
+            tools.push("write_file");
+        }
+        if self.tool_enablement.list_dir {
+            tools.push("list_dir");
+        }
+        if self.tool_enablement.shell_list_allowed {
+            tools.push("shell_list_allowed");
+        }
+        if self.tool_enablement.shell_exec {
+            tools.push("shell_exec");
+        }
+        if self.tool_enablement.shell_request_allowed {
+            tools.push("shell_request_allowed");
+        }
+        tools
     }
 
     pub(crate) fn shell_allowed_commands(&self) -> &[String] {
@@ -63,12 +106,62 @@ impl ToolExecutor {
 
     pub(crate) fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
         match tool {
-            "read_file" => self.read_file(args),
-            "write_file" => self.write_file(args),
-            "list_dir" => self.list_dir(args),
-            "shell_list_allowed" => Ok(self.shell_list_allowed()),
-            "shell_exec" => self.shell_exec(args),
-            "shell_request_allowed" => self.shell_request_allowed(args),
+            "read_file" => {
+                if !self.tool_enablement.read_file {
+                    return Err(
+                        "tool 'read_file' is disabled by config ([tools].read_file=false)"
+                            .to_string(),
+                    );
+                }
+                self.read_file(args)
+            }
+            "write_file" => {
+                if !self.tool_enablement.write_file {
+                    return Err(
+                        "tool 'write_file' is disabled by config ([tools].write_file=false)"
+                            .to_string(),
+                    );
+                }
+                if !self.allow_write {
+                    return Err(
+                        "write_file is disabled (enable with --allow-write-tools)".to_string()
+                    );
+                }
+                self.write_file(args)
+            }
+            "list_dir" => {
+                if !self.tool_enablement.list_dir {
+                    return Err(
+                        "tool 'list_dir' is disabled by config ([tools].list_dir=false)"
+                            .to_string(),
+                    );
+                }
+                self.list_dir(args)
+            }
+            "shell_list_allowed" => {
+                if !self.tool_enablement.shell_list_allowed {
+                    return Err(
+                        "tool 'shell_list_allowed' is disabled by config ([tools].shell_list_allowed=false)"
+                            .to_string(),
+                    );
+                }
+                Ok(self.shell_list_allowed())
+            }
+            "shell_exec" => {
+                if !self.tool_enablement.shell_exec {
+                    return Err(
+                        "tool 'shell_exec' is disabled by config ([tools].shell_exec=false)"
+                            .to_string(),
+                    );
+                }
+                self.shell_exec(args)
+            }
+            "shell_request_allowed" => {
+                if !self.tool_enablement.shell_request_allowed {
+                    return Err("tool 'shell_request_allowed' is disabled by config ([tools].shell_request_allowed=false)".to_string());
+                }
+                self.shell_request_allowed(args)
+            }
             _ => Err(format!("unknown tool '{tool}'")),
         }
     }
@@ -170,9 +263,6 @@ impl ToolExecutor {
     }
 
     fn write_file(&self, args: &Value) -> Result<Value, String> {
-        if !self.allow_write {
-            return Err("write_file is disabled (enable with --allow-write-tools)".to_string());
-        }
         let args: WriteFileArgs = serde_json::from_value(args.clone())
             .map_err(|e| format!("invalid write_file args: {e}"))?;
         let path = self.resolve_write_path(&args.path)?;
@@ -263,18 +353,18 @@ impl ToolExecutor {
     }
 
     fn shell_list_allowed(&self) -> Value {
-        let mut tools = vec!["read_file", "list_dir", "shell_list_allowed"];
-        if self.allow_write {
-            tools.push("write_file");
-        }
-        tools.push("shell_exec");
-        tools.push("shell_request_allowed");
         json!({
             "ok": true,
             "tool": "shell_list_allowed",
-            "allowed_tools": tools,
-            "write_file_enabled": self.allow_write,
-            "shell_allowed_commands": self.allow_shell_commands.clone()
+            "shell_allowed_commands": self.allow_shell_commands.clone(),
+            "internal_tool_status": {
+                "read_file": self.tool_enablement.read_file,
+                "list_dir": self.tool_enablement.list_dir,
+                "write_file": self.write_file_enabled(),
+                "shell_list_allowed": self.tool_enablement.shell_list_allowed,
+                "shell_exec": self.tool_enablement.shell_exec,
+                "shell_request_allowed": self.tool_enablement.shell_request_allowed
+            }
         })
     }
 
@@ -333,6 +423,28 @@ impl ToolExecutor {
             .max_output_bytes
             .unwrap_or(MAX_SHELL_OUTPUT_BYTES)
             .min(MAX_SHELL_OUTPUT_BYTES);
+
+        if command == "cwd" {
+            if !argv.is_empty() {
+                return Err("shell_exec command 'cwd' does not accept args".to_string());
+            }
+            let stdout_raw = format!("{}\n", cwd.display()).into_bytes();
+            let (stdout, stdout_truncated) = truncate_output(&stdout_raw, output_limit);
+            return Ok(json!({
+                "ok": true,
+                "tool": "shell_exec",
+                "command": command,
+                "args": argv,
+                "cwd": cwd.display().to_string(),
+                "exit_code": 0,
+                "stdout_bytes": stdout_raw.len(),
+                "stderr_bytes": 0,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": false,
+                "stdout": stdout,
+                "stderr": ""
+            }));
+        }
 
         let output = Command::new(&command)
             .args(&argv)

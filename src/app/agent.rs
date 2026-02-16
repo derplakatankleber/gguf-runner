@@ -3,7 +3,7 @@ use crate::app::tools::ToolExecutor;
 use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct AgentMessage {
     role: &'static str,
@@ -21,6 +21,7 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
     let tool_exec = ToolExecutor::new(
         cli.tool_root.as_deref(),
         cli.allow_write_tools,
+        cli.tool_enablement.clone(),
         &cli.allow_shell_commands,
     )?;
     let system_prompt = build_agent_system_prompt(
@@ -37,7 +38,8 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
     let mut protocol_failures = 0usize;
     let max_protocol_failures = 3usize;
     let max_turns = cli.max_tool_calls.saturating_mul(3).saturating_add(8);
-    let require_tool_before_final = prompt_requires_filesystem(&cli.prompt);
+    let require_tool_before_final =
+        prompt_requires_filesystem(&cli.prompt) && tool_exec.has_any_filesystem_tool();
 
     for _turn in 0..max_turns {
         let prompt = build_turn_prompt(&transcript);
@@ -159,17 +161,24 @@ fn build_agent_system_prompt(
     tool_prompt_specs: &[ToolPromptSpec],
     shell_command_description_specs: &[ShellCommandDescriptionSpec],
 ) -> String {
-    let write_state = if tool_exec.allow_write() {
+    let write_state = if tool_exec.write_file_enabled() {
         "enabled"
     } else {
         "disabled"
+    };
+    let enabled_tools = tool_exec.enabled_tool_names();
+    let allowed_tool_names = if enabled_tools.is_empty() {
+        "<none>".to_string()
+    } else {
+        enabled_tools.join("|")
     };
     let shell_allowed_commands = if tool_exec.shell_allowed_commands().is_empty() {
         "<none>".to_string()
     } else {
         tool_exec.shell_allowed_commands().join(", ")
     };
-    let tool_catalog = render_tool_catalog(tool_prompt_specs);
+    let tool_rules = render_tool_rules(tool_exec);
+    let tool_catalog = render_tool_catalog(tool_prompt_specs, &enabled_tools);
     let shell_command_catalog = render_shell_command_catalog(
         tool_exec.shell_allowed_commands(),
         shell_command_description_specs,
@@ -180,18 +189,11 @@ You are running with host tools. \
 Always respond with exactly one JSON object and no surrounding markdown.\n\
 Allowed response schemas:\n\
 1) Tool call:\n\
-{{\"type\":\"tool_call\",\"tool\":\"read_file|write_file|list_dir|shell_list_allowed|shell_exec|shell_request_allowed\",\"args\":{{...}}}}\n\
+{{\"type\":\"tool_call\",\"tool\":\"{}\",\"args\":{{...}}}}\n\
 2) Final answer:\n\
 {{\"type\":\"final\",\"content\":\"...\"}}\n\
 Rules:\n\
-- Use tools when you need filesystem state.\n\
-- If the user asks about files, code, directories, or repository contents, call a filesystem tool before answering.\n\
-- `shell_exec` can only execute commands already in the shell allowed list.\n\
-- Use `shell_list_allowed` when you need to inspect currently enabled tools or allowed shell commands.\n\
-- If a needed command is missing from the shell allowed list, call `shell_request_allowed` with command + reason.\n\
-- Keep tool arguments minimal and valid JSON.\n\
-- If a tool fails, adjust and retry.\n\
-- Return `type=final` when done.\n\
+{}\n\
 Tool constraints:\n\
 - tool_root: {}\n\
 - write_file: {}\n\
@@ -201,6 +203,8 @@ Tool catalog (description, when_to_use):\n\
 {}\n\
 Allowed shell commands (with optional description):\n\
 {}\n",
+        allowed_tool_names,
+        tool_rules,
         tool_exec.root().display(),
         write_state,
         shell_allowed_commands,
@@ -209,9 +213,41 @@ Allowed shell commands (with optional description):\n\
     )
 }
 
-fn render_tool_catalog(tool_prompt_specs: &[ToolPromptSpec]) -> String {
+fn render_tool_rules(tool_exec: &ToolExecutor) -> String {
+    let mut rules = vec![
+        "- Use tools when you need filesystem state.".to_string(),
+        "- If the user asks about files, code, directories, or repository contents, call a filesystem tool before answering when such tools are enabled.".to_string(),
+        "- Keep tool arguments minimal and valid JSON.".to_string(),
+        "- If a tool fails, adjust and retry.".to_string(),
+        "- Return `type=final` when done.".to_string(),
+    ];
+    if tool_exec.shell_exec_enabled() {
+        rules.push(
+            "- `shell_exec` can only execute commands already in the shell allowed list."
+                .to_string(),
+        );
+    }
+    if tool_exec.shell_list_allowed_enabled() {
+        rules.push(
+            "- Use `shell_list_allowed` when you need to inspect shell allowed commands or internal tool status.".to_string(),
+        );
+    }
+    if tool_exec.shell_request_allowed_enabled() {
+        rules.push("- If a needed command is missing from the shell allowed list, call `shell_request_allowed` with command + reason.".to_string());
+    }
+    rules.join("\n")
+}
+
+fn render_tool_catalog(tool_prompt_specs: &[ToolPromptSpec], enabled_tools: &[&str]) -> String {
+    if enabled_tools.is_empty() {
+        return "- <none>\n".to_string();
+    }
+    let enabled_set = enabled_tools.iter().copied().collect::<BTreeSet<_>>();
     let mut out = String::new();
     for spec in tool_prompt_specs {
+        if !enabled_set.contains(spec.name.as_str()) {
+            continue;
+        }
         out.push_str("- ");
         out.push_str(&spec.name);
         out.push('\n');

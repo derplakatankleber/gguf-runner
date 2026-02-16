@@ -91,9 +91,33 @@ pub(crate) struct ShellCommandDescriptionSpec {
     pub(crate) description: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AgentToolEnablement {
+    pub(crate) read_file: bool,
+    pub(crate) list_dir: bool,
+    pub(crate) write_file: bool,
+    pub(crate) shell_list_allowed: bool,
+    pub(crate) shell_exec: bool,
+    pub(crate) shell_request_allowed: bool,
+}
+
+impl Default for AgentToolEnablement {
+    fn default() -> Self {
+        Self {
+            read_file: true,
+            list_dir: true,
+            write_file: true,
+            shell_list_allowed: true,
+            shell_exec: true,
+            shell_request_allowed: true,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RunnerConfig {
     shell: Option<RunnerShellConfig>,
+    tools: Option<RunnerToolsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -102,6 +126,16 @@ struct RunnerShellConfig {
     cmd: Option<BTreeMap<String, String>>,
     allowed_commands: Option<Vec<RunnerAllowedCommandEntry>>,
     allowed_command_descriptions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunnerToolsConfig {
+    read_file: Option<bool>,
+    list_dir: Option<bool>,
+    write_file: Option<bool>,
+    shell_list_allowed: Option<bool>,
+    shell_exec: Option<bool>,
+    shell_request_allowed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,8 +189,9 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
         },
         ToolPromptSpec {
             name: "shell_exec".to_string(),
-            description: "Run an allowed external command with explicit argv (no shell expression)."
-                .to_string(),
+            description:
+                "Run an allowed external command with explicit argv (no shell expression). Supports built-in helper command `cwd` to print resolved working directory."
+                    .to_string(),
             when_to_use:
                 "Use when command output is needed and the command exists in allowed shell commands."
                     .to_string(),
@@ -235,6 +270,40 @@ fn load_shell_config_from_config() -> Result<LoadedShellConfig, String> {
         allowed_commands,
         description_specs,
     })
+}
+
+fn load_tool_enablement_from_config() -> Result<AgentToolEnablement, String> {
+    let mut tool_enablement = AgentToolEnablement::default();
+    for path in config_paths()? {
+        let content = match fs::read_to_string(&path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot read config '{}': {e}", path.display())),
+        };
+        let parsed: RunnerConfig = toml::from_str(&content)
+            .map_err(|e| format!("invalid config TOML '{}': {e}", path.display()))?;
+        if let Some(tools) = parsed.tools {
+            if let Some(v) = tools.read_file {
+                tool_enablement.read_file = v;
+            }
+            if let Some(v) = tools.list_dir {
+                tool_enablement.list_dir = v;
+            }
+            if let Some(v) = tools.write_file {
+                tool_enablement.write_file = v;
+            }
+            if let Some(v) = tools.shell_list_allowed {
+                tool_enablement.shell_list_allowed = v;
+            }
+            if let Some(v) = tools.shell_exec {
+                tool_enablement.shell_exec = v;
+            }
+            if let Some(v) = tools.shell_request_allowed {
+                tool_enablement.shell_request_allowed = v;
+            }
+        }
+    }
+    Ok(tool_enablement)
 }
 
 fn parse_shell_cmd_entries(
@@ -533,6 +602,7 @@ pub(crate) struct CliOptions {
     pub(crate) agent: bool,
     pub(crate) tool_root: Option<String>,
     pub(crate) allow_write_tools: bool,
+    pub(crate) tool_enablement: AgentToolEnablement,
     pub(crate) allow_shell_commands: Vec<String>,
     pub(crate) shell_command_description_specs: Vec<ShellCommandDescriptionSpec>,
     pub(crate) tool_prompt_specs: Vec<ToolPromptSpec>,
@@ -573,6 +643,11 @@ impl CliOptions {
         } else {
             LoadedShellConfig::default()
         };
+        let tool_enablement = if cli.agent {
+            load_tool_enablement_from_config()?
+        } else {
+            AgentToolEnablement::default()
+        };
         let LoadedShellConfig {
             allowed_commands: mut allow_shell_commands,
             description_specs: shell_command_description_specs,
@@ -596,6 +671,7 @@ impl CliOptions {
             agent: cli.agent,
             tool_root: cli.tool_root,
             allow_write_tools: cli.allow_write_tools,
+            tool_enablement,
             allow_shell_commands,
             shell_command_description_specs,
             tool_prompt_specs,

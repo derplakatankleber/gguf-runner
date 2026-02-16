@@ -9,6 +9,16 @@
 
 [shell]
 
+# Optional internal tool toggles (default: true for all).
+# Set to false to disable a specific tool.
+[tools]
+read_file = true
+list_dir = true
+write_file = true
+shell_list_allowed = true
+shell_exec = true
+shell_request_allowed = true
+
 # Single source of truth for shell_exec:
 # - key: allowed command name
 # - value: description shown to the model in agent mode
@@ -17,11 +27,5 @@ ls = "List files/directories in the current working directory."
 cat = "Read and print UTF-8 text file content."
 grep = "Search text patterns inside files."
 cargo = "Run Rust workflows such as check/build/test/run."
-cd = "Change directory. Often a shell builtin, so prefer using shell_exec cwd instead."
-
-# Note on `cd`:
-# - `cd` is a shell builtin, not a standalone executable.
-# - `shell_exec` runs executables with argv (no shell expression), so `cd`
-#   cannot be directly allowlisted here.
-# - Prefer setting `cwd` in `shell_exec` args when a command must run in a
-#   specific directory.
+cwd = "Show current working directory resolved by shell_exec (built-in helper command)."
+pwd = "Print current working directory. Use shell_exec 'cwd' args to run commands from specific directories."

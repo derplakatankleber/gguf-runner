@@ -104,6 +104,7 @@ src/
   - `~/.gguf-runner/config.toml`
   - `./.gguf-runner/config.toml` (overrides home config)
 - Supports single-source command metadata in `[shell.cmd]` (key=command, value=description); `[shell.md]` and older formats remain accepted for compatibility.
+- Supports optional internal tool toggles in `[tools]` (all default enabled).
 - Includes agent-related switches:
   - `--agent`
   - `--tool-root`

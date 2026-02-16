@@ -77,6 +77,7 @@ src/
 
 - Tool-agent orchestration loop for multi-step runs.
 - Builds turn prompt transcript, requests one model response per turn, and parses JSON outputs.
+- Builds system prompt with tool catalog metadata (description / when-to-use) and optional allowed-shell-command descriptions supplied by `cli`.
 - Executes tool calls through `app::tools::ToolExecutor` and appends tool results back into transcript.
 - Terminates on `final` response or configured tool-call limit.
 
@@ -99,6 +100,10 @@ src/
 - Public parser result type: `CliOptions`.
 - Parses user-facing flags plus hidden tuning/debug options.
 - Env var integration is here (via clap `env = ...`), currently `GGUF_*` variables.
+- Loads optional layered TOML config for agent shell allowed commands:
+  - `~/.gguf-runner/config.toml`
+  - `./.gguf-runner/config.toml` (overrides home config)
+- Supports single-source command metadata in `[shell.cmd]` (key=command, value=description); `[shell.md]` and older formats remain accepted for compatibility.
 - Includes agent-related switches:
   - `--agent`
   - `--tool-root`

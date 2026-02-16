@@ -1,8 +1,9 @@
 use crate::app::generation::ModelRuntime;
 use crate::app::tools::ToolExecutor;
-use crate::cli::CliOptions;
+use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 struct AgentMessage {
     role: &'static str,
@@ -22,7 +23,12 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
         cli.allow_write_tools,
         &cli.allow_shell_commands,
     )?;
-    let system_prompt = build_agent_system_prompt(&cli.system_prompt, &tool_exec);
+    let system_prompt = build_agent_system_prompt(
+        &cli.system_prompt,
+        &tool_exec,
+        &cli.tool_prompt_specs,
+        &cli.shell_command_description_specs,
+    );
     let mut transcript = vec![AgentMessage {
         role: "user",
         content: cli.prompt.clone(),
@@ -147,7 +153,12 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
     Err("agent loop reached maximum turns without final response".to_string())
 }
 
-fn build_agent_system_prompt(base_system_prompt: &str, tool_exec: &ToolExecutor) -> String {
+fn build_agent_system_prompt(
+    base_system_prompt: &str,
+    tool_exec: &ToolExecutor,
+    tool_prompt_specs: &[ToolPromptSpec],
+    shell_command_description_specs: &[ShellCommandDescriptionSpec],
+) -> String {
     let write_state = if tool_exec.allow_write() {
         "enabled"
     } else {
@@ -158,6 +169,11 @@ fn build_agent_system_prompt(base_system_prompt: &str, tool_exec: &ToolExecutor)
     } else {
         tool_exec.shell_allowed_commands().join(", ")
     };
+    let tool_catalog = render_tool_catalog(tool_prompt_specs);
+    let shell_command_catalog = render_shell_command_catalog(
+        tool_exec.shell_allowed_commands(),
+        shell_command_description_specs,
+    );
     format!(
         "{base_system_prompt}\n\n\
 You are running with host tools. \
@@ -180,11 +196,57 @@ Tool constraints:\n\
 - tool_root: {}\n\
 - write_file: {}\n\
 - shell allowed commands: {}\n\
-- max read/write payload per call: 262144 bytes\n",
+- max read/write payload per call: 262144 bytes\n\
+Tool catalog (description, when_to_use):\n\
+{}\n\
+Allowed shell commands (with optional description):\n\
+{}\n",
         tool_exec.root().display(),
         write_state,
-        shell_allowed_commands
+        shell_allowed_commands,
+        tool_catalog,
+        shell_command_catalog
     )
+}
+
+fn render_tool_catalog(tool_prompt_specs: &[ToolPromptSpec]) -> String {
+    let mut out = String::new();
+    for spec in tool_prompt_specs {
+        out.push_str("- ");
+        out.push_str(&spec.name);
+        out.push('\n');
+        out.push_str("  description: ");
+        out.push_str(spec.description.trim());
+        out.push('\n');
+        out.push_str("  when_to_use: ");
+        out.push_str(spec.when_to_use.trim());
+        out.push('\n');
+    }
+    out
+}
+
+fn render_shell_command_catalog(
+    allowed_commands: &[String],
+    shell_command_description_specs: &[ShellCommandDescriptionSpec],
+) -> String {
+    if allowed_commands.is_empty() {
+        return "- <none>\n".to_string();
+    }
+    let mut description_by_command = BTreeMap::new();
+    for spec in shell_command_description_specs {
+        description_by_command.insert(spec.command.as_str(), spec.description.as_str());
+    }
+    let mut out = String::new();
+    for command in allowed_commands {
+        out.push_str("- ");
+        out.push_str(command);
+        if let Some(description) = description_by_command.get(command.as_str()) {
+            out.push_str(": ");
+            out.push_str(description);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn build_turn_prompt(transcript: &[AgentMessage]) -> String {

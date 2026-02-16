@@ -54,6 +54,19 @@ Supported tensor data paths include:
 
 User-facing CLI options are defined in `src/cli.rs`.
 
+Agent config file (optional):
+- `~/.gguf-runner/config.toml`
+- `./.gguf-runner/config.toml` (loaded after home config and overrides it)
+
+Shell allowed-commands config schema:
+```toml
+[shell]
+[shell.cmd]
+rg = "Fast recursive text search."
+ls = "List directory entries."
+cat = "Read file content."
+```
+
 Exposed env var:
 - `GGUF_RAYON_THREADS` (same as `--threads`)
 - `GGUF_ALLOW_SHELL_COMMANDS` (comma-separated allowed commands for `shell_exec`)

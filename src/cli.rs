@@ -1,4 +1,8 @@
 use clap::Parser;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::PathBuf;
 
 fn parse_top_p(raw: &str) -> Result<f32, String> {
     let v = raw
@@ -72,6 +76,239 @@ pub(crate) enum CliKvCacheMode {
     Auto,
     Q8,
     Q4,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolPromptSpec {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) when_to_use: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ShellCommandDescriptionSpec {
+    pub(crate) command: String,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunnerConfig {
+    shell: Option<RunnerShellConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunnerShellConfig {
+    #[serde(alias = "md")]
+    cmd: Option<BTreeMap<String, String>>,
+    allowed_commands: Option<Vec<RunnerAllowedCommandEntry>>,
+    allowed_command_descriptions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RunnerAllowedCommandEntry {
+    Name(String),
+    Spec(RunnerAllowedCommandSpec),
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerAllowedCommandSpec {
+    name: String,
+    description: Option<String>,
+}
+
+#[derive(Default)]
+struct LoadedShellConfig {
+    allowed_commands: Vec<String>,
+    description_specs: Vec<ShellCommandDescriptionSpec>,
+}
+
+fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
+    vec![
+        ToolPromptSpec {
+            name: "read_file".to_string(),
+            description: "Read UTF-8 file content under tool_root with a bounded byte limit."
+                .to_string(),
+            when_to_use: "Use when you need the contents of a specific file before reasoning or editing."
+                .to_string(),
+        },
+        ToolPromptSpec {
+            name: "list_dir".to_string(),
+            description: "List directory entries under tool_root.".to_string(),
+            when_to_use: "Use when you need to discover paths before reading or writing files."
+                .to_string(),
+        },
+        ToolPromptSpec {
+            name: "write_file".to_string(),
+            description:
+                "Write or append UTF-8 file content under tool_root (enabled only with --allow-write-tools)."
+                    .to_string(),
+            when_to_use: "Use only when the user explicitly requests file creation/modification."
+                .to_string(),
+        },
+        ToolPromptSpec {
+            name: "shell_list_allowed".to_string(),
+            description: "Return currently enabled tools and allowed shell commands.".to_string(),
+            when_to_use:
+                "Use first when you are unsure which tool operations/commands are currently allowed."
+                    .to_string(),
+        },
+        ToolPromptSpec {
+            name: "shell_exec".to_string(),
+            description: "Run an allowed external command with explicit argv (no shell expression)."
+                .to_string(),
+            when_to_use:
+                "Use when command output is needed and the command exists in allowed shell commands."
+                    .to_string(),
+        },
+        ToolPromptSpec {
+            name: "shell_request_allowed".to_string(),
+            description:
+                "Request operator approval for a command that is not currently in allowed shell commands."
+                    .to_string(),
+            when_to_use:
+                "Use when shell_exec cannot run because a needed command is not currently allowed."
+                    .to_string(),
+        },
+    ]
+}
+
+fn config_paths() -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(home).join(".gguf-runner").join("config.toml");
+        paths.push(p);
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read current directory: {e}"))?;
+    paths.push(cwd.join(".gguf-runner").join("config.toml"));
+    Ok(paths)
+}
+
+fn load_shell_config_from_config() -> Result<LoadedShellConfig, String> {
+    let mut allowed_commands = Vec::new();
+    let mut descriptions = BTreeMap::new();
+    for path in config_paths()? {
+        let content = match fs::read_to_string(&path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot read config '{}': {e}", path.display())),
+        };
+        let parsed: RunnerConfig = toml::from_str(&content)
+            .map_err(|e| format!("invalid config TOML '{}': {e}", path.display()))?;
+        if let Some(shell) = parsed.shell {
+            if let Some(cmd_entries) = shell.cmd {
+                let (new_allowed_commands, new_descriptions) = parse_shell_cmd_entries(cmd_entries);
+                allowed_commands = new_allowed_commands;
+                descriptions = new_descriptions;
+                continue;
+            }
+            if let Some(commands) = shell.allowed_commands {
+                let (new_allowed_commands, legacy_descriptions) =
+                    parse_allowed_command_entries(commands);
+                allowed_commands = new_allowed_commands;
+                descriptions = legacy_descriptions;
+            }
+            if let Some(extra_descriptions) = shell.allowed_command_descriptions {
+                for (raw_command, raw_description) in extra_descriptions {
+                    let Some(description) = normalize_description_text(raw_description) else {
+                        continue;
+                    };
+                    for command in split_shell_command_names(&raw_command) {
+                        descriptions.insert(command, description.clone());
+                    }
+                }
+            }
+        }
+    }
+    let description_specs = allowed_commands
+        .iter()
+        .filter_map(|command| {
+            descriptions
+                .get(command)
+                .map(|description| ShellCommandDescriptionSpec {
+                    command: command.clone(),
+                    description: description.clone(),
+                })
+        })
+        .collect();
+    Ok(LoadedShellConfig {
+        allowed_commands,
+        description_specs,
+    })
+}
+
+fn parse_shell_cmd_entries(
+    cmd_entries: BTreeMap<String, String>,
+) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut raw_names = Vec::new();
+    let mut descriptions = BTreeMap::new();
+    for (raw_command, raw_description) in cmd_entries {
+        let names = split_shell_command_names(&raw_command);
+        raw_names.extend(names.iter().cloned());
+        if let Some(description) = normalize_description_text(raw_description) {
+            for name in names {
+                descriptions.insert(name, description.clone());
+            }
+        }
+    }
+    let allowed_commands = normalize_shell_command_values(raw_names);
+    (allowed_commands, descriptions)
+}
+
+fn normalize_shell_command_values<I>(values: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut uniq = BTreeSet::new();
+    for raw in values {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                uniq.insert(trimmed.to_string());
+            }
+        }
+    }
+    uniq.into_iter().collect()
+}
+
+fn parse_allowed_command_entries(
+    entries: Vec<RunnerAllowedCommandEntry>,
+) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut raw_names = Vec::new();
+    let mut descriptions = BTreeMap::new();
+    for entry in entries {
+        match entry {
+            RunnerAllowedCommandEntry::Name(name) => raw_names.push(name),
+            RunnerAllowedCommandEntry::Spec(spec) => {
+                let names = split_shell_command_names(&spec.name);
+                raw_names.extend(names.iter().cloned());
+                if let Some(description) = spec.description.and_then(normalize_description_text) {
+                    for name in names {
+                        descriptions.insert(name, description.clone());
+                    }
+                }
+            }
+        }
+    }
+    let allowed_commands = normalize_shell_command_values(raw_names);
+    (allowed_commands, descriptions)
+}
+
+fn split_shell_command_names(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_description_text(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -149,7 +386,7 @@ struct Cli {
     #[arg(
         long = "max-tool-calls",
         value_parser = parse_positive_usize,
-        default_value_t = 8
+        default_value_t = 256
     )]
     max_tool_calls: usize,
 
@@ -297,6 +534,8 @@ pub(crate) struct CliOptions {
     pub(crate) tool_root: Option<String>,
     pub(crate) allow_write_tools: bool,
     pub(crate) allow_shell_commands: Vec<String>,
+    pub(crate) shell_command_description_specs: Vec<ShellCommandDescriptionSpec>,
+    pub(crate) tool_prompt_specs: Vec<ToolPromptSpec>,
     pub(crate) max_tool_calls: usize,
     pub(crate) profiling: bool,
     pub(crate) show_tokens: bool,
@@ -328,14 +567,18 @@ pub(crate) struct CliOptions {
 impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
-        let allow_shell_commands = cli
-            .allow_shell_commands
-            .iter()
-            .flat_map(|raw| raw.split(','))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
+        let tool_prompt_specs = default_tool_prompt_specs();
+        let loaded_shell = if cli.agent {
+            load_shell_config_from_config()?
+        } else {
+            LoadedShellConfig::default()
+        };
+        let LoadedShellConfig {
+            allowed_commands: mut allow_shell_commands,
+            description_specs: shell_command_description_specs,
+        } = loaded_shell;
+        allow_shell_commands.extend(cli.allow_shell_commands);
+        let allow_shell_commands = normalize_shell_command_values(allow_shell_commands);
 
         Ok(Self {
             model: cli.model,
@@ -354,6 +597,8 @@ impl CliOptions {
             tool_root: cli.tool_root,
             allow_write_tools: cli.allow_write_tools,
             allow_shell_commands,
+            shell_command_description_specs,
+            tool_prompt_specs,
             max_tool_calls: cli.max_tool_calls,
             profiling: cli.profiling,
             show_tokens: cli.show_tokens,

@@ -188,7 +188,7 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
         ToolPromptSpec {
             name: "shell_exec".to_string(),
             description:
-                "Run an allowed external command with explicit argv (no shell expression). Supports built-in helper command `cwd` to print resolved working directory."
+                "Run an allowed external command with explicit argv (no shell expression). Args schema: {\"command\":\"<allowed>\",\"args\":[...],\"cwd\":\"optional\",\"max_output_bytes\":131072}. Supports built-in helper command `cwd`."
                     .to_string(),
             when_to_use:
                 "Use when command output is needed and the command exists in allowed shell commands."

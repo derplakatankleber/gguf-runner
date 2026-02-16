@@ -362,9 +362,12 @@ impl ToolExecutor {
 
     fn shell_exec(&self, args: &Value) -> Result<Value, String> {
         let args: RunShellArgs = serde_json::from_value(args.clone())
-            .map_err(|e| format!("invalid shell_exec args: {e}"))?;
-        let command = normalize_shell_command(&args.command)
-            .map_err(|e| format!("invalid shell_exec command: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "invalid shell_exec args: {e}. expected object like {{\"command\":\"<allowed>\",\"args\":[...],\"cwd\":\".\",\"max_output_bytes\":131072}} (aliases accepted: cmd, argv, workdir)"
+                )
+            })?;
+        let (command, argv) = normalize_shell_exec_invocation(&args.command, args.args)?;
         if !self.is_shell_command_allowed(&command) {
             let allowed = if self.allow_shell_commands.is_empty() {
                 "<none>".to_string()
@@ -377,7 +380,6 @@ impl ToolExecutor {
             ));
         }
 
-        let argv = args.args.unwrap_or_default();
         if argv.len() > MAX_SHELL_ARGS {
             return Err(format!(
                 "too many shell_exec args: {} > {}",
@@ -515,6 +517,27 @@ fn normalize_shell_command(raw: &str) -> Result<String, String> {
     Ok(command.to_string())
 }
 
+fn normalize_shell_exec_invocation(
+    command_raw: &str,
+    args: Option<Vec<String>>,
+) -> Result<(String, Vec<String>), String> {
+    let command_trimmed = command_raw.trim();
+    let mut argv = args.unwrap_or_default();
+    if argv.is_empty() && command_trimmed.chars().any(|c| c.is_ascii_whitespace()) {
+        let mut parts = command_trimmed.split_whitespace();
+        let head = parts
+            .next()
+            .ok_or_else(|| "invalid shell_exec command: command cannot be empty".to_string())?;
+        let command = normalize_shell_command(head)
+            .map_err(|e| format!("invalid shell_exec command: {e}"))?;
+        argv.extend(parts.map(ToOwned::to_owned));
+        return Ok((command, argv));
+    }
+    let command = normalize_shell_command(command_trimmed)
+        .map_err(|e| format!("invalid shell_exec command: {e}"))?;
+    Ok((command, argv))
+}
+
 fn truncate_output(bytes: &[u8], limit: usize) -> (String, bool) {
     let truncated = bytes.len() > limit;
     let slice = if truncated { &bytes[..limit] } else { bytes };
@@ -542,9 +565,18 @@ struct ListDirArgs {
 
 #[derive(Deserialize)]
 struct RunShellArgs {
+    #[serde(alias = "cmd", alias = "program", alias = "name")]
     command: String,
+    #[serde(default, alias = "argv", alias = "arguments")]
     args: Option<Vec<String>>,
+    #[serde(default, alias = "workdir", alias = "working_dir", alias = "dir")]
     cwd: Option<String>,
+    #[serde(
+        default,
+        alias = "max_output",
+        alias = "max_bytes",
+        alias = "output_limit"
+    )]
     max_output_bytes: Option<usize>,
 }
 
@@ -552,4 +584,32 @@ struct RunShellArgs {
 struct RequestShellAllowedArgs {
     command: String,
     reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_shell_exec_invocation, RunShellArgs};
+
+    #[test]
+    fn run_shell_args_accepts_cmd_and_argv_aliases() {
+        let raw = serde_json::json!({
+            "cmd": "ls",
+            "argv": ["-la"],
+            "workdir": ".",
+            "max_output": 1024
+        });
+        let parsed: RunShellArgs = serde_json::from_value(raw).expect("valid alias payload");
+        assert_eq!(parsed.command, "ls");
+        assert_eq!(parsed.args, Some(vec!["-la".to_string()]));
+        assert_eq!(parsed.cwd, Some(".".to_string()));
+        assert_eq!(parsed.max_output_bytes, Some(1024));
+    }
+
+    #[test]
+    fn normalize_shell_exec_invocation_splits_command_line_when_args_missing() {
+        let (command, args) =
+            normalize_shell_exec_invocation("cargo check --release", None).expect("valid split");
+        assert_eq!(command, "cargo");
+        assert_eq!(args, vec!["check".to_string(), "--release".to_string()]);
+    }
 }

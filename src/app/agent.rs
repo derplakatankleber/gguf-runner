@@ -225,6 +225,10 @@ fn render_tool_rules(tool_exec: &ToolExecutor) -> String {
             "- `shell_exec` can only execute commands already in the shell allowed list."
                 .to_string(),
         );
+        rules.push(
+            "- `shell_exec` args must include a command key (or alias cmd). Example: {\"type\":\"tool_call\",\"tool\":\"shell_exec\",\"args\":{\"command\":\"ls\",\"args\":[\"-la\"]}}."
+                .to_string(),
+        );
     }
     if tool_exec.shell_list_allowed_enabled() {
         rules.push(

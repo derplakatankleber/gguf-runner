@@ -71,7 +71,11 @@ impl ToolExecutor {
     }
 
     pub(crate) fn has_any_filesystem_tool(&self) -> bool {
-        self.tool_enablement.read_file || self.tool_enablement.list_dir || self.write_file_enabled()
+        self.tool_enablement.read_file
+            || self.tool_enablement.list_dir
+            || self.write_file_enabled()
+            || self.tool_enablement.mkdir
+            || self.tool_enablement.rmdir
     }
 
     pub(crate) fn enabled_tool_names(&self) -> Vec<&'static str> {
@@ -81,6 +85,12 @@ impl ToolExecutor {
         }
         if self.tool_enablement.write_file {
             tools.push("write_file");
+        }
+        if self.tool_enablement.mkdir {
+            tools.push("mkdir");
+        }
+        if self.tool_enablement.rmdir {
+            tools.push("rmdir");
         }
         if self.tool_enablement.list_dir {
             tools.push("list_dir");
@@ -130,6 +140,22 @@ impl ToolExecutor {
                 }
                 self.list_dir(args)
             }
+            "mkdir" => {
+                if !self.tool_enablement.mkdir {
+                    return Err(
+                        "tool 'mkdir' is disabled by config ([tools].mkdir=false)".to_string()
+                    );
+                }
+                self.mkdir(args)
+            }
+            "rmdir" => {
+                if !self.tool_enablement.rmdir {
+                    return Err(
+                        "tool 'rmdir' is disabled by config ([tools].rmdir=false)".to_string()
+                    );
+                }
+                self.rmdir(args)
+            }
             "shell_list_allowed" => {
                 if !self.tool_enablement.shell_list_allowed {
                     return Err(
@@ -159,15 +185,7 @@ impl ToolExecutor {
     }
 
     fn resolve_existing_path(&self, raw_path: &str) -> Result<PathBuf, String> {
-        if raw_path.is_empty() {
-            return Err("path cannot be empty".to_string());
-        }
-        let path = Path::new(raw_path);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
-        };
+        let joined = self.join_tool_path(raw_path)?;
         let canonical = joined
             .canonicalize()
             .map_err(|e| format!("cannot resolve path '{}': {e}", joined.display()))?;
@@ -182,15 +200,7 @@ impl ToolExecutor {
     }
 
     fn resolve_write_path(&self, raw_path: &str) -> Result<PathBuf, String> {
-        if raw_path.is_empty() {
-            return Err("path cannot be empty".to_string());
-        }
-        let path = Path::new(raw_path);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
-        };
+        let joined = self.join_tool_path(raw_path)?;
         let parent = joined
             .parent()
             .ok_or_else(|| format!("cannot determine parent for '{}'", joined.display()))?;
@@ -222,6 +232,61 @@ impl ToolExecutor {
             }
         }
         Ok(final_path)
+    }
+
+    fn resolve_dir_create_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        let joined = self.join_tool_path(raw_path)?;
+        let mut nearest_existing = joined.clone();
+        while !nearest_existing.exists() {
+            nearest_existing = nearest_existing
+                .parent()
+                .ok_or_else(|| format!("cannot resolve parent for '{}'", joined.display()))?
+                .to_path_buf();
+        }
+        let canonical_existing = nearest_existing.canonicalize().map_err(|e| {
+            format!(
+                "cannot resolve parent directory '{}': {e}",
+                nearest_existing.display()
+            )
+        })?;
+        if !canonical_existing.starts_with(&self.root) {
+            return Err(format!(
+                "path '{}' escapes tool root '{}'",
+                joined.display(),
+                self.root.display()
+            ));
+        }
+        let suffix = joined
+            .strip_prefix(&nearest_existing)
+            .map_err(|e| format!("cannot normalize path '{}': {e}", joined.display()))?;
+        let final_path = if suffix.as_os_str().is_empty() {
+            canonical_existing
+        } else {
+            canonical_existing.join(suffix)
+        };
+        if final_path.exists() {
+            let md = fs::symlink_metadata(&final_path)
+                .map_err(|e| format!("cannot stat '{}': {e}", final_path.display()))?;
+            if md.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to create through symlink '{}'",
+                    final_path.display()
+                ));
+            }
+        }
+        Ok(final_path)
+    }
+
+    fn join_tool_path(&self, raw_path: &str) -> Result<PathBuf, String> {
+        if raw_path.is_empty() {
+            return Err("path cannot be empty".to_string());
+        }
+        let path = Path::new(raw_path);
+        Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        })
     }
 
     fn read_file(&self, args: &Value) -> Result<Value, String> {
@@ -338,6 +403,57 @@ impl ToolExecutor {
         }))
     }
 
+    fn mkdir(&self, args: &Value) -> Result<Value, String> {
+        let args: MkdirArgs =
+            serde_json::from_value(args.clone()).map_err(|e| format!("invalid mkdir args: {e}"))?;
+        let path = self.resolve_dir_create_path(&args.path)?;
+        let existed = path.exists();
+        if existed {
+            if !path.is_dir() {
+                return Err(format!(
+                    "cannot create directory because path exists and is not a directory: {}",
+                    path.display()
+                ));
+            }
+        } else {
+            fs::create_dir_all(&path)
+                .map_err(|e| format!("cannot create directory '{}': {e}", path.display()))?;
+        }
+        Ok(json!({
+            "ok": true,
+            "tool": "mkdir",
+            "path": path.display().to_string(),
+            "recursive": true,
+            "created": !existed
+        }))
+    }
+
+    fn rmdir(&self, args: &Value) -> Result<Value, String> {
+        let args: RmdirArgs =
+            serde_json::from_value(args.clone()).map_err(|e| format!("invalid rmdir args: {e}"))?;
+        let path = self.resolve_existing_path(&args.path)?;
+        if path == self.root {
+            return Err("refusing to remove tool root".to_string());
+        }
+        if !path.is_dir() {
+            return Err(format!("not a directory: {}", path.display()));
+        }
+        let joined = self.join_tool_path(&args.path)?;
+        let joined_md = fs::symlink_metadata(&joined)
+            .map_err(|e| format!("cannot stat '{}': {e}", joined.display()))?;
+        if joined_md.file_type().is_symlink() {
+            return Err(format!("refusing to remove symlink '{}'", joined.display()));
+        }
+        fs::remove_dir_all(&path)
+            .map_err(|e| format!("cannot remove directory '{}': {e}", path.display()))?;
+        Ok(json!({
+            "ok": true,
+            "tool": "rmdir",
+            "path": path.display().to_string(),
+            "recursive": true
+        }))
+    }
+
     fn is_shell_command_allowed(&self, command: &str) -> bool {
         self.allow_shell_commands
             .binary_search_by(|allowed| allowed.as_str().cmp(command))
@@ -353,6 +469,8 @@ impl ToolExecutor {
                 "read_file": self.tool_enablement.read_file,
                 "list_dir": self.tool_enablement.list_dir,
                 "write_file": self.write_file_enabled(),
+                "mkdir": self.tool_enablement.mkdir,
+                "rmdir": self.tool_enablement.rmdir,
                 "shell_list_allowed": self.tool_enablement.shell_list_allowed,
                 "shell_exec": self.tool_enablement.shell_exec,
                 "shell_request_allowed": self.tool_enablement.shell_request_allowed
@@ -564,6 +682,16 @@ struct ListDirArgs {
 }
 
 #[derive(Deserialize)]
+struct MkdirArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct RmdirArgs {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct RunShellArgs {
     #[serde(alias = "cmd", alias = "program", alias = "name")]
     command: String,
@@ -588,7 +716,26 @@ struct RequestShellAllowedArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_shell_exec_invocation, RunShellArgs};
+    use super::{normalize_shell_exec_invocation, RunShellArgs, ToolExecutor};
+    use crate::cli::AgentToolEnablement;
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_tool_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gguf_runner_tools_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&path).expect("create temporary test root");
+        path
+    }
 
     #[test]
     fn run_shell_args_accepts_cmd_and_argv_aliases() {
@@ -611,5 +758,42 @@ mod tests {
             normalize_shell_exec_invocation("cargo check --release", None).expect("valid split");
         assert_eq!(command, "cargo");
         assert_eq!(args, vec!["check".to_string(), "--release".to_string()]);
+    }
+
+    #[test]
+    fn mkdir_and_rmdir_work_recursively() {
+        let root = make_temp_tool_root();
+        let root_s = root.to_string_lossy().to_string();
+        let tool_exec = ToolExecutor::new(Some(&root_s), AgentToolEnablement::default(), &[])
+            .expect("tool executor");
+
+        let mkdir_result = tool_exec
+            .execute("mkdir", &json!({"path":"a/b/c"}))
+            .expect("mkdir success");
+        assert_eq!(mkdir_result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert!(root.join("a/b/c").is_dir());
+
+        let rmdir_result = tool_exec
+            .execute("rmdir", &json!({"path":"a"}))
+            .expect("rmdir success");
+        assert_eq!(rmdir_result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert!(!root.join("a").exists());
+
+        fs::remove_dir_all(&root).expect("cleanup test root");
+    }
+
+    #[test]
+    fn rmdir_refuses_tool_root() {
+        let root = make_temp_tool_root();
+        let root_s = root.to_string_lossy().to_string();
+        let tool_exec = ToolExecutor::new(Some(&root_s), AgentToolEnablement::default(), &[])
+            .expect("tool executor");
+
+        let err = tool_exec
+            .execute("rmdir", &json!({"path":"."}))
+            .expect_err("rmdir root should fail");
+        assert!(err.contains("refusing to remove tool root"));
+
+        fs::remove_dir_all(&root).expect("cleanup test root");
     }
 }

@@ -88,6 +88,8 @@ src/
   - `read_file`
   - `write_file`
   - `list_dir`
+  - `mkdir` (recursive create)
+  - `rmdir` (recursive delete; never removes `tool_root`)
   - `shell_list_allowed`
 - Provides restricted external command tools:
   - `shell_exec` (only for allowed command names)

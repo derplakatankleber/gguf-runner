@@ -96,6 +96,8 @@ pub(crate) struct AgentToolEnablement {
     pub(crate) read_file: bool,
     pub(crate) list_dir: bool,
     pub(crate) write_file: bool,
+    pub(crate) mkdir: bool,
+    pub(crate) rmdir: bool,
     pub(crate) shell_list_allowed: bool,
     pub(crate) shell_exec: bool,
     pub(crate) shell_request_allowed: bool,
@@ -107,6 +109,8 @@ impl Default for AgentToolEnablement {
             read_file: true,
             list_dir: true,
             write_file: true,
+            mkdir: true,
+            rmdir: true,
             shell_list_allowed: true,
             shell_exec: true,
             shell_request_allowed: true,
@@ -133,6 +137,8 @@ struct RunnerToolsConfig {
     read_file: Option<bool>,
     list_dir: Option<bool>,
     write_file: Option<bool>,
+    mkdir: Option<bool>,
+    rmdir: Option<bool>,
     shell_list_allowed: Option<bool>,
     shell_exec: Option<bool>,
     shell_request_allowed: Option<bool>,
@@ -177,6 +183,23 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
             description: "Write or append UTF-8 file content under tool_root.".to_string(),
             when_to_use: "Use only when the user explicitly requests file creation/modification."
                 .to_string(),
+        },
+        ToolPromptSpec {
+            name: "mkdir".to_string(),
+            description: "Create a directory under tool_root recursively (mkdir -p behavior)."
+                .to_string(),
+            when_to_use:
+                "Use when a directory path is needed before creating files in nested locations."
+                    .to_string(),
+        },
+        ToolPromptSpec {
+            name: "rmdir".to_string(),
+            description:
+                "Remove a directory under tool_root recursively (including all children)."
+                    .to_string(),
+            when_to_use:
+                "Use only when the user explicitly asks to delete directories and their contents."
+                    .to_string(),
         },
         ToolPromptSpec {
             name: "shell_list_allowed".to_string(),
@@ -289,6 +312,12 @@ fn load_tool_enablement_from_config() -> Result<AgentToolEnablement, String> {
             }
             if let Some(v) = tools.write_file {
                 tool_enablement.write_file = v;
+            }
+            if let Some(v) = tools.mkdir {
+                tool_enablement.mkdir = v;
+            }
+            if let Some(v) = tools.rmdir {
+                tool_enablement.rmdir = v;
             }
             if let Some(v) = tools.shell_list_allowed {
                 tool_enablement.shell_list_allowed = v;

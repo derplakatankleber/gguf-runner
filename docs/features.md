@@ -36,6 +36,8 @@ Supported tensor data paths include:
   - `read_file`
   - `list_dir`
   - `write_file`
+  - `mkdir` (recursive directory creation)
+  - `rmdir` (recursive directory removal)
   - `shell_list_allowed` (reports currently enabled tools + allowed shell commands)
   - `shell_exec` (restricted to operator-defined allowed commands)
   - `shell_request_allowed` (asks operator to allow a specific shell command)
@@ -64,6 +66,8 @@ Shell allowed-commands config schema:
 read_file = true
 list_dir = true
 write_file = true
+mkdir = true
+rmdir = true
 shell_list_allowed = true
 shell_exec = true
 shell_request_allowed = true

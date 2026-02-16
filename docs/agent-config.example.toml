@@ -15,6 +15,8 @@
 read_file = true
 list_dir = true
 write_file = true
+mkdir = true
+rmdir = true
 shell_list_allowed = true
 shell_exec = true
 shell_request_allowed = true

@@ -67,6 +67,16 @@ For historical benchmark snapshots and performance notes, see:
 For current module/layout reference, see:
 - `docs/module-structure.md`
 
+## GGUF Dump Example
+
+Use the example binary to inspect GGUF metadata without running inference:
+
+```bash
+cargo run --example gguf_dump -- --model ./model.gguf --dump-kv --dump-tensors
+```
+
+If you omit `--dump-kv` and `--dump-tensors`, both are dumped by default.
+
 ## Project Scope
 
 - CPU inference only

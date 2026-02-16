@@ -13,6 +13,9 @@ Supported families:
 - Qwen3 MoE (`qwen3moe`)
 - Qwen3 Next (`qwen3next`, including SSM-related tensors)
 
+Currently unsupported:
+- DeepSeek architectures (`deepseek*` GGUF metadata)
+
 ## Quantization / Tensor Type Support
 
 Supported tensor data paths include:

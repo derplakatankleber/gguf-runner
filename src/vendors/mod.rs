@@ -99,6 +99,12 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
 }
 
 pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Result<Config, String> {
+    let arch = get_gguf_string_from_map(&gguf.kv, "general.architecture").unwrap_or("llama");
+    if arch.starts_with("deepseek") {
+        return Err(format!(
+            "unsupported GGUF architecture '{arch}': DeepSeek models are not implemented yet in this runtime (supported: llama, gemma, qwen2, qwen3moe, qwen3next)"
+        ));
+    }
     let identity = detect_model_identity(gguf, debug_mode);
     let key_prefix = identity.key_prefix;
 

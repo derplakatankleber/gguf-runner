@@ -86,7 +86,7 @@ src/
 - Host-side tool execution for agent mode.
 - Provides safe file tools:
   - `read_file`
-  - `write_file` (gated by CLI switch)
+  - `write_file`
   - `list_dir`
   - `shell_list_allowed`
 - Provides restricted external command tools:
@@ -104,11 +104,11 @@ src/
   - `~/.gguf-runner/config.toml`
   - `./.gguf-runner/config.toml` (overrides home config)
 - Supports single-source command metadata in `[shell.cmd]` (key=command, value=description); `[shell.md]` and older formats remain accepted for compatibility.
-- Supports optional internal tool toggles in `[tools]` (all default enabled).
+- Supports optional tool config in `[tools]`:
+  - internal tool toggles (all default enabled)
 - Includes agent-related switches:
   - `--agent`
   - `--tool-root`
-  - `--allow-write-tools`
   - `--allow-shell-command`
   - `--max-tool-calls`
 

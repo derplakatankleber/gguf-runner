@@ -174,9 +174,7 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
         },
         ToolPromptSpec {
             name: "write_file".to_string(),
-            description:
-                "Write or append UTF-8 file content under tool_root (enabled only with --allow-write-tools)."
-                    .to_string(),
+            description: "Write or append UTF-8 file content under tool_root.".to_string(),
             when_to_use: "Use only when the user explicitly requests file creation/modification."
                 .to_string(),
         },
@@ -441,9 +439,6 @@ struct Cli {
     #[arg(long = "tool-root", value_name = "path")]
     tool_root: Option<String>,
 
-    #[arg(long = "allow-write-tools")]
-    allow_write_tools: bool,
-
     #[arg(
         long = "allow-shell-command",
         value_name = "command",
@@ -601,7 +596,6 @@ pub(crate) struct CliOptions {
     pub(crate) system_prompt: String,
     pub(crate) agent: bool,
     pub(crate) tool_root: Option<String>,
-    pub(crate) allow_write_tools: bool,
     pub(crate) tool_enablement: AgentToolEnablement,
     pub(crate) allow_shell_commands: Vec<String>,
     pub(crate) shell_command_description_specs: Vec<ShellCommandDescriptionSpec>,
@@ -670,7 +664,6 @@ impl CliOptions {
             system_prompt: cli.system_prompt,
             agent: cli.agent,
             tool_root: cli.tool_root,
-            allow_write_tools: cli.allow_write_tools,
             tool_enablement,
             allow_shell_commands,
             shell_command_description_specs,

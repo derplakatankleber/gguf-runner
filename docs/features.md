@@ -35,7 +35,7 @@ Supported tensor data paths include:
 - optional tool-agent loop (`--agent`) with host-side file tools:
   - `read_file`
   - `list_dir`
-  - `write_file` (requires `--allow-write-tools`)
+  - `write_file`
   - `shell_list_allowed` (reports currently enabled tools + allowed shell commands)
   - `shell_exec` (restricted to operator-defined allowed commands)
   - `shell_request_allowed` (asks operator to allow a specific shell command)

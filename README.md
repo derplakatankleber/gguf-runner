@@ -39,7 +39,6 @@ Common optional flags:
 - `--system-prompt <text>`
 - `--agent` (enable tool-agent loop)
 - `--tool-root <path>` (filesystem root for tools; defaults to current directory)
-- `--allow-write-tools` (enable `write_file` tool)
 - `--max-tool-calls <int>` (agent loop budget)
 - `--temperature <float>`
 - `--top-k <int>`

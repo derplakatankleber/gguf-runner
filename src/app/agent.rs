@@ -20,7 +20,6 @@ enum AgentResponse {
 pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Result<(), String> {
     let tool_exec = ToolExecutor::new(
         cli.tool_root.as_deref(),
-        cli.allow_write_tools,
         cli.tool_enablement.clone(),
         &cli.allow_shell_commands,
     )?;

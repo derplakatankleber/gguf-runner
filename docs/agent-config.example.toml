@@ -9,8 +9,8 @@
 
 [shell]
 
-# Optional internal tool toggles (default: true for all).
-# Set to false to disable a specific tool.
+# Optional tool config.
+# - individual tool toggles default to true
 [tools]
 read_file = true
 list_dir = true

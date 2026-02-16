@@ -16,7 +16,6 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 128 * 1024;
 
 pub(crate) struct ToolExecutor {
     root: PathBuf,
-    allow_write: bool,
     tool_enablement: AgentToolEnablement,
     allow_shell_commands: Vec<String>,
 }
@@ -24,7 +23,6 @@ pub(crate) struct ToolExecutor {
 impl ToolExecutor {
     pub(crate) fn new(
         tool_root: Option<&str>,
-        allow_write: bool,
         tool_enablement: AgentToolEnablement,
         allow_shell_commands: &[String],
     ) -> Result<Self, String> {
@@ -47,7 +45,6 @@ impl ToolExecutor {
         }
         Ok(Self {
             root,
-            allow_write,
             tool_enablement,
             allow_shell_commands: uniq.into_iter().collect(),
         })
@@ -58,7 +55,7 @@ impl ToolExecutor {
     }
 
     pub(crate) fn write_file_enabled(&self) -> bool {
-        self.tool_enablement.write_file && self.allow_write
+        self.tool_enablement.write_file
     }
 
     pub(crate) fn shell_exec_enabled(&self) -> bool {
@@ -82,7 +79,7 @@ impl ToolExecutor {
         if self.tool_enablement.read_file {
             tools.push("read_file");
         }
-        if self.tool_enablement.write_file && self.allow_write {
+        if self.tool_enablement.write_file {
             tools.push("write_file");
         }
         if self.tool_enablement.list_dir {
@@ -120,11 +117,6 @@ impl ToolExecutor {
                     return Err(
                         "tool 'write_file' is disabled by config ([tools].write_file=false)"
                             .to_string(),
-                    );
-                }
-                if !self.allow_write {
-                    return Err(
-                        "write_file is disabled (enable with --allow-write-tools)".to_string()
                     );
                 }
                 self.write_file(args)

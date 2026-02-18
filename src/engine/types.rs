@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -106,6 +110,8 @@ impl Default for GgmlType {
 pub(crate) struct MappedFile {
     pub(crate) ptr: *mut u8,
     pub(crate) len: usize,
+    #[cfg(not(unix))]
+    backing: Box<[u8]>,
 }
 
 impl MappedFile {
@@ -138,6 +144,25 @@ impl MappedFile {
             ptr: ptr as *mut u8,
             len,
         })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn map(file: &File) -> io::Result<Self> {
+        let mut reader = file.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot map empty file",
+            ));
+        }
+
+        let mut backing = bytes.into_boxed_slice();
+        let ptr = backing.as_mut_ptr();
+        let len = backing.len();
+        Ok(Self { ptr, len, backing })
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {

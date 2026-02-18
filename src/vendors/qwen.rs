@@ -43,13 +43,19 @@ pub(super) fn validate_qwen3next(config: &mut Config) -> Result<(), String> {
         );
     }
 
-    if config.ssm_inner_size % config.ssm_time_step_rank != 0 {
+    if !config
+        .ssm_inner_size
+        .is_multiple_of(config.ssm_time_step_rank)
+    {
         return Err(format!(
             "qwen3next invalid SSM metadata: inner_size {} not divisible by time_step_rank {}",
             config.ssm_inner_size, config.ssm_time_step_rank
         ));
     }
-    if config.ssm_time_step_rank % config.ssm_group_count != 0 {
+    if !config
+        .ssm_time_step_rank
+        .is_multiple_of(config.ssm_group_count)
+    {
         return Err(format!(
             "qwen3next invalid SSM metadata: time_step_rank {} not divisible by group_count {}",
             config.ssm_time_step_rank, config.ssm_group_count

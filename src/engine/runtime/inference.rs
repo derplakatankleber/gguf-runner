@@ -119,8 +119,8 @@ fn dequant_q4_at(src: &[u8], elem_idx: usize) -> i8 {
 #[inline]
 fn dot_q8_row(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
     let mut acc = 0.0f32;
-    for i in 0..q.len() {
-        acc += q[i] * (cache[row_offset + i] as f32 * scale);
+    for (i, &qv) in q.iter().enumerate() {
+        acc += qv * (cache[row_offset + i] as f32 * scale);
     }
     acc
 }
@@ -128,17 +128,17 @@ fn dot_q8_row(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
 #[inline]
 fn axpy_q8_row(dst: &mut [f32], a: f32, cache: &[i8], row_offset: usize, scale: f32) {
     let scaled = a * scale;
-    for i in 0..dst.len() {
-        dst[i] += scaled * cache[row_offset + i] as f32;
+    for (i, d) in dst.iter_mut().enumerate() {
+        *d += scaled * cache[row_offset + i] as f32;
     }
 }
 
 #[inline]
 fn dot_q4_row(q: &[f32], cache: &[u8], row_offset: usize, scale: f32) -> f32 {
     let mut acc = 0.0f32;
-    for i in 0..q.len() {
+    for (i, &qv) in q.iter().enumerate() {
         let v = dequant_q4_at(cache, row_offset + i) as f32 * scale;
-        acc += q[i] * v;
+        acc += qv * v;
     }
     acc
 }
@@ -146,9 +146,9 @@ fn dot_q4_row(q: &[f32], cache: &[u8], row_offset: usize, scale: f32) -> f32 {
 #[inline]
 fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scale: f32) {
     let scaled = a * scale;
-    for i in 0..dst.len() {
+    for (i, d) in dst.iter_mut().enumerate() {
         let v = dequant_q4_at(cache, row_offset + i) as f32;
-        dst[i] += scaled * v;
+        *d += scaled * v;
     }
 }
 
@@ -441,12 +441,16 @@ pub(crate) fn transformer(
                 let qb = &w.attn_q_bias[l * q_dim..(l + 1) * q_dim];
                 let kb = &w.attn_k_bias[l * kv_dim..(l + 1) * kv_dim];
                 let vb = &w.attn_v_bias[l * kv_dim..(l + 1) * kv_dim];
-                for i in 0..q_dim {
-                    s.q[i] += qb[i];
+                for (q, &b) in s.q[..q_dim].iter_mut().zip(qb.iter()) {
+                    *q += b;
                 }
-                for i in 0..kv_dim {
-                    s.k[i] += kb[i];
-                    s.v[i] += vb[i];
+                for ((k, v), (&kbv, &vbv)) in s.k[..kv_dim]
+                    .iter_mut()
+                    .zip(s.v[..kv_dim].iter_mut())
+                    .zip(kb.iter().zip(vb.iter()))
+                {
+                    *k += kbv;
+                    *v += vbv;
                 }
             }
 
@@ -482,10 +486,16 @@ pub(crate) fn transformer(
             let rope_half = s.rope_cos.len();
             let current_is_swa = if is_swa_layer { 1 } else { 0 };
             if s.rope_cache_pos != pos as isize || s.rope_cache_is_swa != current_is_swa {
-                for i in 0..rope_half {
-                    let val = pos as f32 * rope_freqs[i];
-                    s.rope_cos[i] = val.cos();
-                    s.rope_sin[i] = val.sin();
+                for ((cos, sin), &freq) in s
+                    .rope_cos
+                    .iter_mut()
+                    .zip(s.rope_sin.iter_mut())
+                    .zip(rope_freqs.iter())
+                    .take(rope_half)
+                {
+                    let val = pos as f32 * freq;
+                    *cos = val.cos();
+                    *sin = val.sin();
                 }
                 s.rope_cache_pos = pos as isize;
                 s.rope_cache_is_swa = current_is_swa;
@@ -882,11 +892,7 @@ pub(crate) fn transformer(
         }
     }
 
-    if p.is_gemma3 {
-        rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
-    } else {
-        rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
-    }
+    rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
     for v in &mut s.x[..dim] {
         *v = finite_or_zero(*v);
     }

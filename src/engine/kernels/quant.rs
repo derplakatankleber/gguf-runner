@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, read_u32_le};
 use crate::engine::profiling::{prof_end, prof_start, PROF_MATMUL_NS};
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
@@ -268,7 +270,7 @@ pub(crate) fn q3_scales(scales12: &[u8]) -> [i8; 16] {
     let tmp = aux[2];
     aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
     aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
 
     let mut out = [0i8; 16];
@@ -390,7 +392,7 @@ pub(crate) fn dequantize_row_q6_k(src: &[u8], dst: &mut [f32], k: usize) {
             let sc = &src[sc_off..sc_off + 8];
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = (((ql[l] & 0x0f) | (((qh[l] >> 0) & 0x03) << 4)) as i8) - 32;
+                let q1 = (((ql[l] & 0x0f) | ((qh[l] & 0x03) << 4)) as i8) - 32;
                 let q2 = (((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 0x03) << 4)) as i8) - 32;
                 let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i8) - 32;
                 let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i8) - 32;
@@ -1597,7 +1599,7 @@ pub(crate) fn vec_dot_q6_k(x: &[f32], w: &[u8], n: usize) -> f32 {
             let sc = &w[sc_off..sc_off + 8];
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = (((ql[l] & 0x0f) | (((qh[l] >> 0) & 0x03) << 4)) as i8) - 32;
+                let q1 = (((ql[l] & 0x0f) | ((qh[l] & 0x03) << 4)) as i8) - 32;
                 let q2 = (((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 0x03) << 4)) as i8) - 32;
                 let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i8) - 32;
                 let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i8) - 32;
@@ -1838,7 +1840,7 @@ pub(crate) fn vec_dot_q6_k_4rows(
                     let ql0 = ql[r][l];
                     let ql1 = ql[r][l + 32];
                     let qh0 = qh[r][l];
-                    let q1 = (((ql0 & 0x0f) | (((qh0 >> 0) & 0x03) << 4)) as i8) - 32;
+                    let q1 = (((ql0 & 0x0f) | ((qh0 & 0x03) << 4)) as i8) - 32;
                     let q2 = (((ql1 & 0x0f) | (((qh0 >> 2) & 0x03) << 4)) as i8) - 32;
                     let q3 = (((ql0 >> 4) | (((qh0 >> 4) & 0x03) << 4)) as i8) - 32;
                     let q4 = (((ql1 >> 4) | (((qh0 >> 6) & 0x03) << 4)) as i8) - 32;
@@ -1864,6 +1866,7 @@ pub(crate) fn vec_dot_q6_k_4rows(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_qk_mr4_chunk(
     out: &mut [f32],
     base_row: usize,
@@ -2008,7 +2011,7 @@ pub(crate) fn try_matmul_qk_mr4(
     if !matches!(ttype, GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K) {
         return false;
     }
-    if n < QK_K || n % QK_K != 0 {
+    if n < QK_K || !n.is_multiple_of(QK_K) {
         return false;
     }
 
@@ -2489,6 +2492,7 @@ unsafe fn vec_dot_q6_k_4rows_x86_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_qk_mr4_chunk_x86(
     out: &mut [f32],
     base_row: usize,
@@ -3075,6 +3079,7 @@ pub(crate) fn matmul_quantized_rows(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_topk_softmax(
     logits: &[f32],
     k: usize,
@@ -3111,7 +3116,7 @@ pub(crate) fn select_topk_softmax(
         *s *= inv_sum;
     }
 
-    let use_grouped = n_group > 1 && topk_group < n_group && logits.len() % n_group == 0;
+    let use_grouped = n_group > 1 && topk_group < n_group && logits.len().is_multiple_of(n_group);
     let group_size = if use_grouped {
         logits.len() / n_group
     } else {

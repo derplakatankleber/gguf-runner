@@ -37,7 +37,7 @@ fn load_tensor_float(
         ));
     }
 
-    if n_elements % block_size != 0 {
+    if !n_elements.is_multiple_of(block_size) {
         return Err(format!(
             "tensor {name} element count {n_elements} not divisible by block size {block_size}"
         ));
@@ -109,7 +109,7 @@ fn load_layer_tensor_quantized_auto_rows(
     let tensor =
         find_gguf_tensor(gguf, &name).ok_or_else(|| format!("tensor not found: {name}"))?;
     let n_elements = tensor_n_elements(tensor);
-    if cols == 0 || n_elements % cols != 0 {
+    if cols == 0 || !n_elements.is_multiple_of(cols) {
         return Err(format!(
             "tensor {name} element count {n_elements} is not divisible by cols={cols}"
         ));
@@ -442,15 +442,11 @@ pub(crate) fn init_weights_from_gguf(
             }
         }
 
-        if p.is_gemma3 || p.is_qwen3moe {
-            let q_norm = load_layer_tensor_float(gguf, l, "attn_q_norm.weight", head_size)?;
-            let k_norm = load_layer_tensor_float(gguf, l, "attn_k_norm.weight", head_size)?;
-            attn_q_norm[l * head_size..(l + 1) * head_size].copy_from_slice(&q_norm);
-            attn_k_norm[l * head_size..(l + 1) * head_size].copy_from_slice(&k_norm);
-            attn_qk_norm_present[l] = true;
-        } else if (p.is_qwen3next || p.is_qwen2)
-            && find_gguf_tensor(gguf, &format!("blk.{l}.attn_q_norm.weight")).is_some()
-            && find_gguf_tensor(gguf, &format!("blk.{l}.attn_k_norm.weight")).is_some()
+        if p.is_gemma3
+            || p.is_qwen3moe
+            || ((p.is_qwen3next || p.is_qwen2)
+                && find_gguf_tensor(gguf, &format!("blk.{l}.attn_q_norm.weight")).is_some()
+                && find_gguf_tensor(gguf, &format!("blk.{l}.attn_k_norm.weight")).is_some())
         {
             let q_norm = load_layer_tensor_float(gguf, l, "attn_q_norm.weight", head_size)?;
             let k_norm = load_layer_tensor_float(gguf, l, "attn_k_norm.weight", head_size)?;

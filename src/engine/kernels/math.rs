@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use crate::engine::kernels::{
     axpy_inplace, dot_f32_simd, matmul_quantized, matmul_quantized_rows, scale_slice_inplace,
 };
@@ -132,6 +134,7 @@ pub(crate) fn l2_norm(x: &[f32]) -> f32 {
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen3next_state_head_step(
     state_h: &mut [f32],
     out_h: &mut [f32],
@@ -209,7 +212,7 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
     if d_inner == 0 || n_k_heads == 0 || n_v_heads == 0 || head_dim == 0 || conv_kernel == 0 {
         return Err("invalid qwen3next SSM config".to_string());
     }
-    if n_v_heads % n_k_heads != 0 {
+    if !n_v_heads.is_multiple_of(n_k_heads) {
         return Err(format!(
             "unsupported qwen3next SSM shape: n_v_heads {} not divisible by n_k_heads {}",
             n_v_heads, n_k_heads

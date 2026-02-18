@@ -217,6 +217,7 @@ impl LazyModelLoader {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(model_path)
             .map_err(|e| format!("cannot open local cache file {model_path}: {e}"))?;
         file.set_len(file_len as u64)

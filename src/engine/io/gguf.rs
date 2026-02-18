@@ -260,8 +260,8 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
         }
 
         let mut ne = [1u64; 4];
-        for i in 0..n_dims as usize {
-            ne[i] = read_u64(&mut file).map_err(|e| format!("failed reading tensor dims: {e}"))?;
+        for n in ne.iter_mut().take(n_dims as usize) {
+            *n = read_u64(&mut file).map_err(|e| format!("failed reading tensor dims: {e}"))?;
         }
 
         let ttype = GgmlType::from_u32(
@@ -285,7 +285,7 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
         .map_err(|e| format!("failed to query header end: {e}"))?;
 
     let alignment = get_gguf_int_from_map(&kv, "general.alignment", 32) as u64;
-    let tensor_data_offset = ((header_end + alignment - 1) / alignment) * alignment;
+    let tensor_data_offset = header_end.div_ceil(alignment) * alignment;
 
     let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
     let mapped_len = mapped.len;

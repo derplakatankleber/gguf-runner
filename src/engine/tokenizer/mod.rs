@@ -382,8 +382,6 @@ impl Tokenizer {
 
             tokens.extend(work);
         }
-
-        return;
     }
 
     pub(crate) fn decode_token(&self, token_id: i32) -> Option<String> {

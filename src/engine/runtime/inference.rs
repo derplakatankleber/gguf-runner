@@ -1,15 +1,158 @@
 use crate::engine::kernels::{
-    accum, axpy_inplace, dot_f32_simd, finite_or_zero, l2_norm, matmul_f32_embeddings,
-    matmul_quantized, matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm,
-    rmsnorm_gemma, rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, scale_slice_inplace,
-    select_topk_softmax, sigmoidf, softmax,
+    accum, dot_f32_simd, finite_or_zero, l2_norm, matmul_f32_embeddings, matmul_quantized,
+    matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
+    rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, scale_slice_inplace, select_topk_softmax,
+    sigmoidf, softmax,
 };
 use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
-use crate::engine::switches::{layer_debug_enabled, layer_debug_pos, par_attn_min_heads};
-use crate::engine::types::{Config, RunState, TransformerWeights};
+use crate::engine::switches::{
+    kv_cache_mode, layer_debug_enabled, layer_debug_pos, par_attn_min_heads,
+    KvCacheMode as SwitchKvCacheMode,
+};
+use crate::engine::types::{Config, KvCacheFormat, RunState, TransformerWeights};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
-pub(crate) fn malloc_run_state(p: &Config) -> RunState {
+fn alloc_f32(len: usize, label: &str) -> Result<Vec<f32>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        let bytes = len.saturating_mul(std::mem::size_of::<f32>());
+        format!(
+            "unable to allocate {label} ({bytes} bytes). Try reducing --context-size and --max-tokens."
+        )
+    })?;
+    out.resize(len, 0.0);
+    Ok(out)
+}
+
+fn alloc_i8(len: usize, label: &str) -> Result<Vec<i8>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        format!(
+            "unable to allocate {label} ({} bytes). Try reducing --context-size and --max-tokens.",
+            len
+        )
+    })?;
+    out.resize(len, 0);
+    Ok(out)
+}
+
+fn alloc_u8(len: usize, label: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        format!(
+            "unable to allocate {label} ({} bytes). Try reducing --context-size and --max-tokens.",
+            len
+        )
+    })?;
+    out.resize(len, 0);
+    Ok(out)
+}
+
+fn quantize_row_q8(src: &[f32], dst: &mut [i8], scale_out: &mut f32) {
+    let mut max_abs = 0.0f32;
+    for &x in src {
+        max_abs = max_abs.max(x.abs());
+    }
+    if max_abs == 0.0 {
+        *scale_out = 1.0;
+        dst.fill(0);
+        return;
+    }
+    let inv = 127.0 / max_abs;
+    let scale = max_abs / 127.0;
+    *scale_out = scale;
+    for (i, &x) in src.iter().enumerate() {
+        let q = (x * inv).round().clamp(-127.0, 127.0) as i8;
+        dst[i] = q;
+    }
+}
+
+fn quantize_row_q4(src: &[f32], dst: &mut [u8], base_elem: usize, scale_out: &mut f32) {
+    let mut max_abs = 0.0f32;
+    for &x in src {
+        max_abs = max_abs.max(x.abs());
+    }
+    if max_abs == 0.0 {
+        *scale_out = 1.0;
+        for i in 0..src.len() {
+            let elem_idx = base_elem + i;
+            let byte_idx = elem_idx / 2;
+            if (elem_idx & 1) == 0 {
+                dst[byte_idx] &= 0xF0;
+            } else {
+                dst[byte_idx] &= 0x0F;
+            }
+        }
+        return;
+    }
+    let inv = 7.0 / max_abs;
+    let scale = max_abs / 7.0;
+    *scale_out = scale;
+    for (i, &x) in src.iter().enumerate() {
+        let q = (x * inv).round().clamp(-8.0, 7.0) as i8;
+        let nib = (q as i32 & 0x0F) as u8;
+        let elem_idx = base_elem + i;
+        let byte_idx = elem_idx / 2;
+        if (elem_idx & 1) == 0 {
+            dst[byte_idx] = (dst[byte_idx] & 0xF0) | nib;
+        } else {
+            dst[byte_idx] = (dst[byte_idx] & 0x0F) | (nib << 4);
+        }
+    }
+}
+
+#[inline]
+fn dequant_q4_at(src: &[u8], elem_idx: usize) -> i8 {
+    let byte = src[elem_idx / 2];
+    let nib = if (elem_idx & 1) == 0 {
+        byte & 0x0F
+    } else {
+        (byte >> 4) & 0x0F
+    };
+    if nib >= 8 {
+        nib as i8 - 16
+    } else {
+        nib as i8
+    }
+}
+
+#[inline]
+fn dot_q8_row(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        acc += q[i] * (cache[row_offset + i] as f32 * scale);
+    }
+    acc
+}
+
+#[inline]
+fn axpy_q8_row(dst: &mut [f32], a: f32, cache: &[i8], row_offset: usize, scale: f32) {
+    let scaled = a * scale;
+    for i in 0..dst.len() {
+        dst[i] += scaled * cache[row_offset + i] as f32;
+    }
+}
+
+#[inline]
+fn dot_q4_row(q: &[f32], cache: &[u8], row_offset: usize, scale: f32) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..q.len() {
+        let v = dequant_q4_at(cache, row_offset + i) as f32 * scale;
+        acc += q[i] * v;
+    }
+    acc
+}
+
+#[inline]
+fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scale: f32) {
+    let scaled = a * scale;
+    for i in 0..dst.len() {
+        let v = dequant_q4_at(cache, row_offset + i) as f32;
+        dst[i] += scaled * v;
+    }
+}
+
+pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     let head_size = if p.head_dim > 0 {
         p.head_dim
     } else {
@@ -69,7 +212,52 @@ pub(crate) fn malloc_run_state(p: &Config) -> RunState {
         *freq = 1.0 / swa_theta.powf((i * 2) as f32 / rope_dim as f32);
     }
 
-    RunState {
+    let att_len = p
+        .n_heads
+        .checked_mul(p.seq_len)
+        .ok_or_else(|| "overflow while computing attention buffer size".to_string())?;
+    let kv_cache_rows = p
+        .n_layers
+        .checked_mul(p.seq_len)
+        .ok_or_else(|| "overflow while computing kv cache rows".to_string())?;
+    let kv_cache_len = kv_cache_rows
+        .checked_mul(kv_dim)
+        .ok_or_else(|| "overflow while computing kv cache size".to_string())?;
+    let kv_cache_q4_len = kv_cache_len.div_ceil(2);
+
+    let requested_mode = kv_cache_mode();
+    let (kv_cache_format, key_cache_q8, value_cache_q8, key_cache_q4, value_cache_q4) =
+        match requested_mode {
+            SwitchKvCacheMode::Q8 => {
+                let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
+                let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
+                (KvCacheFormat::Q8, key, value, Vec::new(), Vec::new())
+            }
+            SwitchKvCacheMode::Q4 => {
+                let key = alloc_u8(kv_cache_q4_len, "Q4 key cache")?;
+                let value = alloc_u8(kv_cache_q4_len, "Q4 value cache")?;
+                (KvCacheFormat::Q4, Vec::new(), Vec::new(), key, value)
+            }
+            SwitchKvCacheMode::Auto => {
+                let q8_try = (|| -> Result<(Vec<i8>, Vec<i8>), String> {
+                    let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
+                    let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
+                    Ok((key, value))
+                })();
+                match q8_try {
+                    Ok((key, value)) => (KvCacheFormat::Q8, key, value, Vec::new(), Vec::new()),
+                    Err(q8_err) => {
+                        eprintln!("KV cache Q8 allocation failed: {q8_err}");
+                        eprintln!("Falling back to KV cache Q4 format.");
+                        let key = alloc_u8(kv_cache_q4_len, "Q4 key cache")?;
+                        let value = alloc_u8(kv_cache_q4_len, "Q4 value cache")?;
+                        (KvCacheFormat::Q4, Vec::new(), Vec::new(), key, value)
+                    }
+                }
+            }
+        };
+
+    Ok(RunState {
         x: vec![0.0; p.dim],
         xb: vec![0.0; max_dim],
         xb2: vec![0.0; p.dim],
@@ -100,10 +288,15 @@ pub(crate) fn malloc_run_state(p: &Config) -> RunState {
         ssm_delta: vec![0.0; ssm_inner],
         ssm_conv_state: vec![0.0; p.n_layers * ssm_conv_stride],
         ssm_state: vec![0.0; p.n_layers * ssm_state_stride],
-        att: vec![0.0; p.n_heads * p.seq_len],
+        att: alloc_f32(att_len, "attention buffer")?,
         logits: vec![0.0; p.vocab_size],
-        key_cache: vec![0.0; p.n_layers * p.seq_len * kv_dim],
-        value_cache: vec![0.0; p.n_layers * p.seq_len * kv_dim],
+        kv_cache_format,
+        key_cache_q8,
+        value_cache_q8,
+        key_cache_q4,
+        value_cache_q4,
+        key_cache_scale: alloc_f32(kv_cache_rows, "KV key scale buffer")?,
+        value_cache_scale: alloc_f32(kv_cache_rows, "KV value scale buffer")?,
         rope_freqs,
         rope_freqs_swa,
         rope_cos: vec![0.0; rope_size],
@@ -114,10 +307,9 @@ pub(crate) fn malloc_run_state(p: &Config) -> RunState {
         kv_dim,
         q_dim,
         kv_mul: p.n_heads / p.n_kv_heads,
-        kv_cache_layer_size: p.seq_len * kv_dim,
         attn_scale: 1.0 / (head_size as f32).sqrt(),
         embed_scale: (p.dim as f32).sqrt(),
-    }
+    })
 }
 
 pub(crate) fn transformer(
@@ -345,18 +537,49 @@ pub(crate) fn transformer(
                 scale_slice_inplace(&mut s.q[..q_dim], s.attn_scale);
             }
 
-            let loff = l * s.kv_cache_layer_size;
-            let key_cache_row = loff + pos * kv_dim;
-            let value_cache_row = loff + pos * kv_dim;
-            s.key_cache[key_cache_row..key_cache_row + kv_dim].copy_from_slice(&s.k[..kv_dim]);
-            s.value_cache[value_cache_row..value_cache_row + kv_dim]
-                .copy_from_slice(&s.v[..kv_dim]);
+            let layer_row_base = l * p.seq_len;
+            let row_index = layer_row_base + pos;
+            let row_elem_offset = row_index * kv_dim;
+
+            match s.kv_cache_format {
+                KvCacheFormat::Q8 => {
+                    quantize_row_q8(
+                        &s.k[..kv_dim],
+                        &mut s.key_cache_q8[row_elem_offset..row_elem_offset + kv_dim],
+                        &mut s.key_cache_scale[row_index],
+                    );
+                    quantize_row_q8(
+                        &s.v[..kv_dim],
+                        &mut s.value_cache_q8[row_elem_offset..row_elem_offset + kv_dim],
+                        &mut s.value_cache_scale[row_index],
+                    );
+                }
+                KvCacheFormat::Q4 => {
+                    quantize_row_q4(
+                        &s.k[..kv_dim],
+                        &mut s.key_cache_q4,
+                        row_elem_offset,
+                        &mut s.key_cache_scale[row_index],
+                    );
+                    quantize_row_q4(
+                        &s.v[..kv_dim],
+                        &mut s.value_cache_q4,
+                        row_elem_offset,
+                        &mut s.value_cache_scale[row_index],
+                    );
+                }
+            }
 
             let attn_scale_score = s.attn_scale;
             let apply_attn_scale = !p.is_gemma3;
             let q_all = &s.q[..q_dim];
-            let key_cache = &s.key_cache;
-            let value_cache = &s.value_cache;
+            let kv_format = s.kv_cache_format;
+            let key_cache_q8 = &s.key_cache_q8;
+            let value_cache_q8 = &s.value_cache_q8;
+            let key_cache_q4 = &s.key_cache_q4;
+            let value_cache_q4 = &s.value_cache_q4;
+            let key_scales = &s.key_cache_scale;
+            let value_scales = &s.value_cache_scale;
             let (att_all, xb_all) = (&mut s.att[..p.n_heads * p.seq_len], &mut s.xb[..q_dim]);
 
             if p.n_heads >= par_attn_min_heads() {
@@ -372,9 +595,16 @@ pub(crate) fn transformer(
 
                         let att_head = &mut att_head_full[..=pos];
                         for (t, slot) in att_head.iter_mut().enumerate() {
-                            let k_off = loff + t * kv_dim + kv_head_offset;
-                            let k_head = &key_cache[k_off..k_off + head_size];
-                            let mut score = dot_f32_simd(q_head, k_head);
+                            let t_row = layer_row_base + t;
+                            let row_offset = t_row * kv_dim + kv_head_offset;
+                            let mut score = match kv_format {
+                                KvCacheFormat::Q8 => {
+                                    dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
+                                }
+                                KvCacheFormat::Q4 => {
+                                    dot_q4_row(q_head, key_cache_q4, row_offset, key_scales[t_row])
+                                }
+                            };
                             if apply_attn_scale {
                                 score *= attn_scale_score;
                             }
@@ -385,9 +615,24 @@ pub(crate) fn transformer(
 
                         xb_head.fill(0.0);
                         for (t, &a) in att_head.iter().enumerate() {
-                            let v_off = loff + t * kv_dim + kv_head_offset;
-                            let v_head = &value_cache[v_off..v_off + head_size];
-                            axpy_inplace(xb_head, a, v_head);
+                            let t_row = layer_row_base + t;
+                            let row_offset = t_row * kv_dim + kv_head_offset;
+                            match kv_format {
+                                KvCacheFormat::Q8 => axpy_q8_row(
+                                    xb_head,
+                                    a,
+                                    value_cache_q8,
+                                    row_offset,
+                                    value_scales[t_row],
+                                ),
+                                KvCacheFormat::Q4 => axpy_q4_row(
+                                    xb_head,
+                                    a,
+                                    value_cache_q4,
+                                    row_offset,
+                                    value_scales[t_row],
+                                ),
+                            }
                         }
                     });
             } else {
@@ -400,9 +645,16 @@ pub(crate) fn transformer(
                     let att_head = &mut att_head_full[..=pos];
 
                     for (t, slot) in att_head.iter_mut().enumerate() {
-                        let k_off = loff + t * kv_dim + kv_head_offset;
-                        let k_head = &key_cache[k_off..k_off + head_size];
-                        let mut score = dot_f32_simd(q_head, k_head);
+                        let t_row = layer_row_base + t;
+                        let row_offset = t_row * kv_dim + kv_head_offset;
+                        let mut score = match kv_format {
+                            KvCacheFormat::Q8 => {
+                                dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
+                            }
+                            KvCacheFormat::Q4 => {
+                                dot_q4_row(q_head, key_cache_q4, row_offset, key_scales[t_row])
+                            }
+                        };
                         if apply_attn_scale {
                             score *= attn_scale_score;
                         }
@@ -414,9 +666,24 @@ pub(crate) fn transformer(
                     let xb_head = &mut xb_all[hs..hs + head_size];
                     xb_head.fill(0.0);
                     for (t, &a) in att_head.iter().enumerate() {
-                        let v_off = loff + t * kv_dim + kv_head_offset;
-                        let v_head = &value_cache[v_off..v_off + head_size];
-                        axpy_inplace(xb_head, a, v_head);
+                        let t_row = layer_row_base + t;
+                        let row_offset = t_row * kv_dim + kv_head_offset;
+                        match kv_format {
+                            KvCacheFormat::Q8 => axpy_q8_row(
+                                xb_head,
+                                a,
+                                value_cache_q8,
+                                row_offset,
+                                value_scales[t_row],
+                            ),
+                            KvCacheFormat::Q4 => axpy_q4_row(
+                                xb_head,
+                                a,
+                                value_cache_q4,
+                                row_offset,
+                                value_scales[t_row],
+                            ),
+                        }
                     }
                 }
             }

@@ -14,6 +14,9 @@ src/
   main.rs
   app/
     mod.rs
+    generation.rs
+    agent.rs
+    tools.rs
   cli.rs
   engine/
     mod.rs
@@ -56,9 +59,42 @@ src/
   - parse CLI options
   - map CLI tuning flags into `engine::switches::RuntimeSwitchConfig`
   - initialize runtime switches via `engine::switches::init_runtime_config(...)`
-  - load GGUF + vendor config + tokenizer + weights
-  - execute generation loop
+  - initialize profiling
+  - load runtime/model context via `app::generation`
+  - route to standard generation mode or tool-agent mode
   - print profiling/timing summaries
+
+### `src/app/generation.rs`
+
+- Model/runtime bootstrap for inference:
+  - GGUF parse/load
+  - vendor config + tokenizer + weights initialization
+  - context/thread overrides
+- Token generation loop implementation.
+- Exposes a reusable `generate_text(...)` API used by both normal and agent flows.
+
+### `src/app/agent.rs`
+
+- Tool-agent orchestration loop for multi-step runs.
+- Builds turn prompt transcript, requests one model response per turn, and parses JSON outputs.
+- Builds system prompt with tool catalog metadata (description / when-to-use) and optional allowed-shell-command descriptions supplied by `cli`.
+- Executes tool calls through `app::tools::ToolExecutor` and appends tool results back into transcript.
+- Terminates on `final` response or configured tool-call limit.
+
+### `src/app/tools.rs`
+
+- Host-side tool execution for agent mode.
+- Provides safe file tools:
+  - `read_file`
+  - `write_file`
+  - `list_dir`
+  - `mkdir` (recursive create)
+  - `rmdir` (recursive delete; never removes `tool_root`)
+  - `shell_list_allowed`
+- Provides restricted external command tools:
+  - `shell_exec` (only for allowed command names)
+  - `shell_request_allowed` (structured request to operator)
+- Enforces tool root path constraints and per-call payload limits.
 
 ### `src/cli.rs`
 
@@ -66,6 +102,17 @@ src/
 - Public parser result type: `CliOptions`.
 - Parses user-facing flags plus hidden tuning/debug options.
 - Env var integration is here (via clap `env = ...`), currently `GGUF_*` variables.
+- Loads optional layered TOML config for agent shell allowed commands:
+  - `~/.gguf-runner/config.toml`
+  - `./.gguf-runner/config.toml` (overrides home config)
+- Supports single-source command metadata in `[shell.cmd]` (key=command, value=description); `[shell.md]` and older formats remain accepted for compatibility.
+- Supports optional tool config in `[tools]`:
+  - internal tool toggles (all default enabled)
+- Includes agent-related switches:
+  - `--agent`
+  - `--tool-root`
+  - `--allow-shell-command`
+  - `--max-tool-calls`
 
 ### `src/engine/mod.rs`
 
@@ -118,6 +165,9 @@ src/
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
   - `transformer(...)`
+  - quantized KV cache storage for attention state:
+    - default Q8 cache
+    - automatic Q4 fallback when Q8 allocation fails
 - `runtime/parallel.rs`:
   - `configure_rayon_threads(...)`
 - `runtime/mod.rs`:
@@ -131,6 +181,7 @@ src/
 - Includes:
   - `RuntimeSwitchConfig` (engine-owned overrides struct)
   - Parallel thresholds (`par_matmul_min_rows`, `par_matmul_chunk_rows`, `par_attn_min_heads`, `par_qwen3next_min_heads`)
+  - KV cache selection switch (`kv_cache_mode`: `auto` / `q8` / `q4`)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
   - Layer debug toggles
   - MR4 status atomics
@@ -147,6 +198,7 @@ src/
 - Vendor/model-family specific config parsing and prompt templating.
 - `vendors/mod.rs`:
   - Detects model family from GGUF metadata.
+  - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
   - Builds `Config` from family-specific key conventions.
   - Routes chat prompt encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
@@ -162,8 +214,13 @@ src/
 6. Tokenizer initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
 7. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`).
 8. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
-9. Run state allocated (`engine::runtime::malloc_run_state(...)`).
-10. Token loop executes forward passes (`engine::runtime::transformer(...)`) and sampling (`engine::kernels`).
+9. Standard mode:
+  - prompt encoded once and token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`).
+10. Agent mode:
+  - tool transcript prompt encoded per turn
+  - model emits JSON `tool_call` / `final`
+  - host executes tool call (`app::tools`) and loops until final response or limit.
+  - `shell_exec` calls are restricted to CLI/env-provided allowed commands; model can request missing commands with `shell_request_allowed`.
 11. Profiling/timings printed from `engine::profiling` + `app::run()`.
 
 ## Placement Rules For Future Changes

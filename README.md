@@ -37,6 +37,9 @@ Required flags:
 
 Common optional flags:
 - `--system-prompt <text>`
+- `--agent` (enable tool-agent loop)
+- `--tool-root <path>` (filesystem root for tools; defaults to current directory)
+- `--max-tool-calls <int>` (agent loop budget)
 - `--temperature <float>`
 - `--top-k <int>`
 - `--top-p <float>`
@@ -53,6 +56,19 @@ Common optional flags:
 
 ## What Is Supported
 
+| Model file | Family | Quantization | Benchmarked in `docs/performance.md` |
+|---|---|---|---|
+| `Meta-Llama-3-8B-Instruct-Q4_K_M.gguf` | Llama 3 (8B Instruct) | `Q4_K_M` | Yes |
+| `gemma-3-4b-it-Q4_K_M.gguf` | Gemma 3 (4B IT) | `Q4_K_M` | Yes |
+| `Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf` | Qwen2.5 Coder (14B Instruct) | `Q4_K_M` | Yes |
+| `Qwen3-0.6B-Q4_K_M.gguf` | Qwen3 (0.6B) | `Q4_K_M` | Yes |
+| `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | Qwen3 (4B Instruct) | `Q4_K_M` | Yes |
+| `Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf` | Qwen3 (30B A3B Instruct) | `Q4_K_S` | Yes |
+| `Qwen3-Coder-Next-Q4_K_M.gguf` | Qwen3 Coder Next | `Q4_K_M` | Yes |
+| `Qwen3-235B-A22B-Instruct-2507-Q4_K_M.gguf` | Qwen3 (235B A22B Instruct) | `Q4_K_M` | No |
+
+The table above reflects model files present in this repository root and historical benchmark entries.
+
 This runtime currently supports multiple model families (Llama, Gemma, Qwen variants), common GGUF quantization types, and platform-specific CPU optimizations.
 
 For detailed feature coverage and platform notes, see:
@@ -63,6 +79,16 @@ For historical benchmark snapshots and performance notes, see:
 
 For current module/layout reference, see:
 - `docs/module-structure.md`
+
+## GGUF Dump Example
+
+Use the example binary to inspect GGUF metadata without running inference:
+
+```bash
+cargo run --example gguf_dump -- --model ./model.gguf --dump-kv --dump-tensors
+```
+
+If you omit `--dump-kv` and `--dump-tensors`, both are dumped by default.
 
 ## Project Scope
 

@@ -1,0 +1,33 @@
+# Example agent config for gguf-runner.
+#
+# Load order in agent mode:
+# 1) ~/.gguf-runner/config.toml
+# 2) ./.gguf-runner/config.toml  (overrides home config)
+#
+# This file controls which external commands the model may run through
+# shell_exec.
+
+[shell]
+
+# Optional tool config.
+# - individual tool toggles default to true
+[tools]
+read_file = true
+list_dir = true
+write_file = true
+mkdir = true
+rmdir = true
+shell_list_allowed = true
+shell_exec = true
+shell_request_allowed = true
+
+# Single source of truth for shell_exec:
+# - key: allowed command name
+# - value: description shown to the model in agent mode
+[shell.cmd]
+ls = "List files/directories in the current working directory."
+cat = "Read and print UTF-8 text file content."
+grep = "Search text patterns inside files."
+cargo = "Run Rust workflows such as check/build/test/run."
+cwd = "Show current working directory resolved by shell_exec (built-in helper command)."
+pwd = "Print current working directory. Use shell_exec 'cwd' args to run commands from specific directories."

@@ -614,8 +614,13 @@ pub(crate) struct RunState {
     pub(crate) ssm_state: Vec<f32>,
     pub(crate) att: Vec<f32>,
     pub(crate) logits: Vec<f32>,
-    pub(crate) key_cache: Vec<f32>,
-    pub(crate) value_cache: Vec<f32>,
+    pub(crate) kv_cache_format: KvCacheFormat,
+    pub(crate) key_cache_q8: Vec<i8>,
+    pub(crate) value_cache_q8: Vec<i8>,
+    pub(crate) key_cache_q4: Vec<u8>,
+    pub(crate) value_cache_q4: Vec<u8>,
+    pub(crate) key_cache_scale: Vec<f32>,
+    pub(crate) value_cache_scale: Vec<f32>,
     pub(crate) rope_freqs: Vec<f32>,
     pub(crate) rope_freqs_swa: Vec<f32>,
     pub(crate) rope_cos: Vec<f32>,
@@ -626,9 +631,14 @@ pub(crate) struct RunState {
     pub(crate) kv_dim: usize,
     pub(crate) q_dim: usize,
     pub(crate) kv_mul: usize,
-    pub(crate) kv_cache_layer_size: usize,
     pub(crate) attn_scale: f32,
     pub(crate) embed_scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KvCacheFormat {
+    Q8,
+    Q4,
 }
 
 #[derive(Default)]

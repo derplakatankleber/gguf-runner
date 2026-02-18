@@ -22,10 +22,9 @@ fn load_tensor_float(
 
     if let Some(expected) = expected_elements {
         if expected != n_elements {
-            eprintln!(
-                "Warning: tensor {} has {} elements, expected {}",
-                name, n_elements, expected
-            );
+            return Err(format!(
+                "tensor {name} has {n_elements} elements, expected {expected}"
+            ));
         }
     }
 

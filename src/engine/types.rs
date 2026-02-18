@@ -220,7 +220,11 @@ impl LazyModelLoader {
 
     fn probe_remote_len(url: &str) -> Result<usize, String> {
         if let Ok(resp) = ureq::head(url).call() {
-            if let Some(v) = resp.header("Content-Length") {
+            if let Some(v) = resp
+                .headers()
+                .get("Content-Length")
+                .and_then(|v| v.to_str().ok())
+            {
                 if let Ok(n) = v.parse::<u64>() {
                     if n > 0 {
                         return Ok(n as usize);
@@ -230,13 +234,21 @@ impl LazyModelLoader {
         }
 
         let resp = ureq::get(url)
-            .set("Range", "bytes=0-0")
+            .header("Range", "bytes=0-0")
             .call()
             .map_err(|e| format!("cannot query remote size from {url}: {e}"))?;
-        if let Some(cr) = resp.header("Content-Range") {
+        if let Some(cr) = resp
+            .headers()
+            .get("Content-Range")
+            .and_then(|v| v.to_str().ok())
+        {
             return Self::parse_content_range_total(cr);
         }
-        if let Some(v) = resp.header("Content-Length") {
+        if let Some(v) = resp
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Ok(n) = v.parse::<u64>() {
                 if n > 0 {
                     return Ok(n as usize);
@@ -282,7 +294,7 @@ impl LazyModelLoader {
     fn fetch_chunk_once(&self, start: usize, end: usize) -> Result<(), String> {
         let range = format!("bytes={start}-{}", end - 1);
         let resp = ureq::get(&self.url)
-            .set("Range", &range)
+            .header("Range", &range)
             .call()
             .map_err(|e| format!("range request failed ({range}): {e}"))?;
 
@@ -295,7 +307,8 @@ impl LazyModelLoader {
         }
 
         let mut body = Vec::with_capacity(end - start);
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut body)
             .map_err(|e| format!("failed reading HTTP body for range {range}: {e}"))?;
         if body.len() != end - start {

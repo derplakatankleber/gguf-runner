@@ -10,6 +10,8 @@ Supported families:
 - Llama-style architectures
 - Gemma (`gemma`, `gemma2`, `gemma3`)
 - Qwen / Qwen2
+- Qwen3.5 (`qwen35`, loaded through the Qwen3Next-style recurrent/full-attention path with dense FFN)
+- Qwen3-VL (`qwen3vl`)
 - Qwen3 MoE (`qwen3moe`)
 - Qwen3 Next (`qwen3next`, including SSM-related tensors)
 
@@ -31,6 +33,34 @@ Supported tensor data paths include:
 - lazy model bootstrap/download flow with `--url`
 - tokenizer initialization from GGUF vocab/metadata
 - model-family-specific chat prompt rendering
+- multimodal request/model capability scaffolding for Qwen3-VL and Qwen3.5:
+  - startup capability probe for native image/video/audio support (token + tensor checks)
+  - llama-style local `mmproj*.gguf` sidecar auto-discovery/probe (no extra CLI flag)
+  - strict native-only multimodal execution (no metadata fallback path)
+  - multimodal tensor-group probe during runtime load:
+    - vision encoder tensor groups
+    - multimodal projector tensor groups
+    - audio tensor groups
+    - explicit missing-group errors when backend is marked native-capable
+- multimodal request scaffolding:
+  - repeatable `--video <path>` input parsing/validation (`mp4`)
+  - repeatable `--audio <path>` input parsing/validation (extension-agnostic)
+  - structured prompt encoding for multimodal requests with placeholder span mapping (image/video/audio)
+  - runtime prompt/media alignment validation before preprocessing
+  - generation loop prefill hook for external embeddings (`transformer_with_embedding`) is wired for future native media injection
+  - clearer media capability diagnostics when GGUF is missing native multimodal tensor groups
+    - includes sidecar search results and effective support status
+  - native preprocessing foundation:
+    - image:
+      - PNG/JPEG/WebP decode
+      - deterministic resize + center crop
+      - RGB -> CHW tensor conversion
+      - normalization profiles (`UnitRange` and `MeanStd`)
+    - video:
+      - currently unavailable in no-external-dependency mode
+    - audio:
+      - currently unavailable in no-external-dependency mode
+  - current runtime returns explicit "not implemented yet" errors for native image/video/audio embedding execution paths
 - autoregressive generation loop
 - quantized KV cache for attention state:
   - default `Q8` KV cache
@@ -118,3 +148,4 @@ Notes:
 - CPU-only runtime (no GPU backend)
 - GGUF-only model format
 - model compatibility depends on expected tensor layout and metadata presence
+- native video/audio decode paths are currently unavailable in no-external-dependency mode

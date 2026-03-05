@@ -58,6 +58,15 @@ fn parse_boolish(raw: &str) -> Result<bool, String> {
     ))
 }
 
+fn parse_think_mode(raw: &str) -> Result<crate::engine::types::ThinkMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" | "1" => Ok(crate::engine::types::ThinkMode::Yes),
+        "no" | "off" | "false" | "0" => Ok(crate::engine::types::ThinkMode::No),
+        "hidden" => Ok(crate::engine::types::ThinkMode::Hidden),
+        _ => Err(format!("invalid value '{raw}': expected yes/no/hidden")),
+    }
+}
+
 fn parse_kv_cache_mode(raw: &str) -> Result<CliKvCacheMode, String> {
     let v = raw.trim();
     if v.eq_ignore_ascii_case("auto") {
@@ -420,6 +429,15 @@ struct Cli {
     #[arg(long, required = true)]
     prompt: String,
 
+    #[arg(long = "image", value_name = "path")]
+    images: Vec<String>,
+
+    #[arg(long = "video", value_name = "path")]
+    videos: Vec<String>,
+
+    #[arg(long = "audio", value_name = "path")]
+    audios: Vec<String>,
+
     #[arg(long)]
     url: Option<String>,
 
@@ -491,6 +509,14 @@ struct Cli {
 
     #[arg(long = "show-timings")]
     show_timings: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_think_mode,
+        default_value = "yes",
+        help = "Control thinking output for reasoning models: yes (show), no (disable), hidden (suppress)"
+    )]
+    think: crate::engine::types::ThinkMode,
 
     #[arg(long)]
     debug: bool,
@@ -613,6 +639,9 @@ struct Cli {
 pub(crate) struct CliOptions {
     pub(crate) model: String,
     pub(crate) prompt: String,
+    pub(crate) images: Vec<String>,
+    pub(crate) videos: Vec<String>,
+    pub(crate) audios: Vec<String>,
     pub(crate) url: Option<String>,
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -633,6 +662,7 @@ pub(crate) struct CliOptions {
     pub(crate) profiling: bool,
     pub(crate) show_tokens: bool,
     pub(crate) show_timings: bool,
+    pub(crate) think_mode: crate::engine::types::ThinkMode,
     pub(crate) debug: bool,
     pub(crate) kv_cache_mode: Option<CliKvCacheMode>,
     pub(crate) par_matmul_min_rows: Option<usize>,
@@ -681,6 +711,9 @@ impl CliOptions {
         Ok(Self {
             model: cli.model,
             prompt: cli.prompt,
+            images: cli.images,
+            videos: cli.videos,
+            audios: cli.audios,
             url: cli.url,
             temperature: cli.temperature,
             top_k: cli.top_k,
@@ -701,6 +734,7 @@ impl CliOptions {
             profiling: cli.profiling,
             show_tokens: cli.show_tokens,
             show_timings: cli.show_timings,
+            think_mode: cli.think,
             debug: cli.debug,
             kv_cache_mode: cli.kv_cache_mode,
             par_matmul_min_rows: cli.par_matmul_min_rows,

@@ -24,6 +24,13 @@ src/
     io/
       mod.rs
       gguf.rs
+    multimodal/
+      mod.rs
+      injection.rs
+      qwen3vl.rs
+    vision/
+      mod.rs
+      preprocess.rs
     tokenizer/
       mod.rs
     weights.rs
@@ -61,6 +68,10 @@ src/
   - initialize runtime switches via `engine::switches::init_runtime_config(...)`
   - initialize profiling
   - load runtime/model context via `app::generation`
+  - validate non-empty media file paths for standard generation mode:
+    - `--image` (`png/jpg/jpeg/webp`)
+    - `--video` (`mp4`)
+    - `--audio` (extension-agnostic validation in current scaffold)
   - route to standard generation mode or tool-agent mode
   - print profiling/timing summaries
 
@@ -68,10 +79,30 @@ src/
 
 - Model/runtime bootstrap for inference:
   - GGUF parse/load
+  - llama-style local `mmproj*.gguf` sidecar discovery/probe for multimodal models (no extra CLI switch)
+  - sidecar probe enforces checkpoint variant token matching (for example `2b`, `35b`, `a3b`) to prevent silent cross-size pairing
   - vendor config + tokenizer + weights initialization
+  - multimodal weight-group probe/initialization for multimodal backends
   - context/thread overrides
 - Token generation loop implementation.
-- Exposes a reusable `generate_text(...)` API used by both normal and agent flows.
+- Exposes reusable generation APIs:
+  - `generate_text(...)` for text-only prompts
+  - `generate_text_with_images(...)` (image path routes through structured request execution)
+    - qwen35 image route appends a non-hallucination guard instruction for unreadable text regions
+  - `generate_request(...)` for structured multimodal requests (`GenerationRequest`) with:
+    - structured prompt encoding via `vendors::encode_generation_request(...)`
+    - placeholder-span/media alignment checks for image/video/audio inputs
+    - fail-fast native capability checks when required multimodal tensors/components are missing
+      - capability-probe details (`image/video/audio`) are included in diagnostics, including sidecar search/probe status
+    - native image/video/audio preprocessing execution prior to embedding path
+      - images: decode + resize/crop + normalize + CHW tensor conversion
+      - for external mmproj vision backends, image resize target is taken from encoder metadata (for example `clip.vision.image_size`) instead of a fixed 224x224 fallback
+      - qwen35 backend uses fit-within preprocessing (aspect-ratio preserving, patch-aligned) at a balanced intermediate scale to retain full-frame text regions while limiting visual-token overload
+      - videos: currently unavailable in no-external-dependency mode
+      - audio: currently unavailable in no-external-dependency mode
+    - native image embedding execution via in-engine multimodal backend (`qwen3vl`/`qwen35` mmproj sidecar path)
+    - explicit current-state errors for unimplemented native video/audio embedding execution
+  - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
 
 ### `src/app/agent.rs`
 
@@ -113,11 +144,15 @@ src/
   - `--tool-root`
   - `--allow-shell-command`
   - `--max-tool-calls`
+- Includes multimodal switch:
+  - repeatable `--image <path>` for image inputs (standard generation mode)
+  - repeatable `--video <path>` for video inputs (standard generation mode)
+  - repeatable `--audio <path>` for audio inputs (standard generation mode)
 
 ### `src/engine/mod.rs`
 
 - Aggregates engine submodules:
-  - `io`, `kernels`, `profiling`, `runtime`, `switches`, `tokenizer`, `types`, `weights`.
+  - `io`, `kernels`, `profiling`, `runtime`, `switches`, `tokenizer`, `types`, `vision`, `weights`.
 
 ### `src/engine/types.rs`
 
@@ -125,11 +160,27 @@ src/
 - Defines:
   - GGUF constants and ggml quantization constants
   - Core structs like `Config`, `GGUFFile`, `TransformerWeights`, `RunState`, `Tokenizer`, `QuantizedTensor`
+  - Qwen3-VL input embedding shaping metadata on `Config`:
+    - `input_embedding_dim` (language dim plus optional deepstack lanes)
+    - `n_deepstack_layers`
+  - Multimodal request domain types used by app/runtime boundary:
+    - `GenerationRequest`
+    - `ContentPart`
+    - `MediaRef`
+    - `EncodedPrompt`
+    - `PlaceholderSpan`
+  - Model multimodal capability metadata:
+    - `MultimodalBackend`
+    - `ModelCapabilities`
+  - Extended model identity flags:
+    - `Config::is_qwen35`
+    - `Config::rope_sections` for Qwen3.5 M-RoPE section metadata
   - Lazy loader implementation (`LazyModelLoader`)
   - Unix mmap wrapper (`MappedFile`) including Linux memory advice hints for model mappings
   - Global lazy loader state:
     - `LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>>`
   - `ensure_model_range(...)` helper used by quantized matmul paths.
+  - GGUF metadata value variants include integer arrays (`I64Array`) for keys such as `*.rope.dimension_sections`.
 
 ### `src/engine/io/*`
 
@@ -138,7 +189,40 @@ src/
   - Parses GGUF metadata/tensors.
   - Maps model file.
   - Provides metadata access helpers:
-    - `get_gguf_int_from_map`, `get_gguf_float_from_map`, `get_gguf_string_from_map`, `find_gguf_tensor`.
+    - `get_gguf_int_from_map`, `get_gguf_float_from_map`, `get_gguf_i64_array_from_map`, `get_gguf_string_from_map`, `find_gguf_tensor`.
+
+### `src/engine/vision/*`
+
+- Shared multimodal preprocessing utilities.
+- `vision/preprocess.rs` currently provides deterministic preprocessing:
+  - images:
+    - decode (`png`/`jpeg`/`webp` via `image` crate)
+    - resize + center crop to profile target size
+    - CHW float tensor conversion
+    - configurable normalization profile (`UnitRange` / `MeanStd`)
+  - videos:
+    - currently unavailable in no-external-dependency mode (native decode path removed)
+  - audio:
+    - currently unavailable in no-external-dependency mode (native decode path removed)
+
+### `src/engine/multimodal/*`
+
+- Native multimodal embedding and prompt-injection subsystem.
+- `multimodal/injection.rs`:
+  - expands image placeholder spans into token-aligned embedding injection maps
+  - builds expanded prefill token stream for variable-length image embedding sequences
+- `multimodal/qwen3vl.rs`:
+  - Qwen3-VL CLIP/mmproj image encoder path (`qwen3vl_merger`)
+  - loads mmproj tensors, runs patch embedding + vision transformer + projector in Rust
+  - reads `clip.vision.image_mean/std` normalization metadata from mmproj GGUF when available
+  - loads and applies optional `v.deepstack.*` layer branches, fused into projected media embeddings
+  - uses SIMD dot products + rayon head-parallel attention for the vision self-attention hot path
+  - emits language-space image token embeddings for prompt injection
+- `multimodal/mod.rs`:
+  - backend construction (`build_vision_encoder_from_mmproj`)
+  - validates sidecar compatibility (`validate_mmproj_for_backend`) and enables external `mmproj` construction for `qwen3vl` and `qwen35` backends
+  - enforces strict family checks to prevent cross-pairing (`qwen3vl` sidecar on `qwen35` text model and vice versa)
+  - encoder abstraction (`VisionEncoder`)
 
 ### `src/engine/tokenizer/mod.rs`
 
@@ -150,6 +234,8 @@ src/
 
 - Loads and validates model tensors from GGUF into `TransformerWeights`.
 - Handles per-family tensor layout differences and optional tensors.
+- Handles Qwen3.5 split-SMM gate tensor compatibility (`ssm_alpha.weight` / `ssm_beta.weight`) alongside fused `ssm_ba.weight`.
+- Provides multimodal tensor-group initialization/probe (`init_multimodal_weights_from_gguf`) with explicit missing-group diagnostics for native multimodal backends.
 - Exposes `init_weights_from_gguf(...)`.
 
 ### `src/engine/kernels/*`
@@ -165,6 +251,10 @@ src/
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
   - `transformer(...)`
+  - `transformer_with_embedding(...)` (prefill hook for external embedding vectors)
+  - accepts multimodal prefill vectors at either `dim` or `input_embedding_dim`
+  - applies per-layer deepstack residual injection for Qwen3-VL-style expanded embeddings
+  - applies llama-style Qwen3.5 M-RoPE cache reconstruction for text decode (`[t,h,w,e]=[pos,pos,pos,0]`)
   - quantized KV cache storage for attention state:
     - default Q8 cache
     - automatic Q4 fallback when Q8 allocation fails
@@ -200,9 +290,11 @@ src/
   - Detects model family from GGUF metadata.
   - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
   - Builds `Config` from family-specific key conventions.
-  - Routes chat prompt encoding to family-specific implementation.
+  - Detects `qwen35` explicitly and maps it onto the Qwen3Next-style runtime path.
+  - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `qwen3vl` and `qwen35`.
+  - Routes both simple chat prompt encoding and structured `GenerationRequest` encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
-  - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling).
+  - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling and Qwen image/video/audio placeholder-span mapping).
 
 ## Runtime Data Flow
 
@@ -215,7 +307,11 @@ src/
 7. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`).
 8. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
 9. Standard mode:
-  - prompt encoded once and token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`).
+  - CLI media inputs are normalized into `engine::types::GenerationRequest` with `ContentPart` items.
+  - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths.
+  - runtime validates prompt/media alignment before starting preprocessing.
+  - if native multimodal tensors are unavailable, runtime fails with a qualified native-capability error that includes architecture/token/tensor probe details.
+  - token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`); native media embedding injection remains in progress.
 10. Agent mode:
   - tool transcript prompt encoded per turn
   - model emits JSON `tool_call` / `final`

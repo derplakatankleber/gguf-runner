@@ -37,6 +37,9 @@ Required flags:
 
 Common optional flags:
 - `--system-prompt <text>`
+- `--image <path>` (repeatable; native multimodal capability-gated path for Qwen3-VL / Qwen3.5)
+- `--video <path>` (repeatable; MP4 input validation + native capability gating)
+- `--audio <path>` (repeatable; input validation + native capability gating)
 - `--agent` (enable tool-agent loop)
 - `--tool-root <path>` (filesystem root for tools; defaults to current directory)
 - `--max-tool-calls <int>` (agent loop budget)
@@ -70,6 +73,28 @@ Common optional flags:
 The table above reflects model files present in this repository root and historical benchmark entries.
 
 This runtime currently supports multiple model families (Llama, Gemma, Qwen variants), common GGUF quantization types, and platform-specific CPU optimizations.
+
+Example Qwen3-VL invocation:
+
+```bash
+cargo run --release -- \
+  --model ./Qwen3-VL-2B-Instruct-Q4_K_M.gguf \
+  --image ./docs/IMG_0192.png \
+  --prompt "Describe the image."
+```
+
+Current multimodal status:
+- the runner now performs strict native capability checks for image/video/audio inputs on `qwen3vl` and `qwen35`
+- when native multimodal tensors/components are missing, the runner fails fast with a qualified error message (no metadata fallback path)
+- native preprocessing is implemented:
+  - image: decode + resize/crop + normalization + CHW tensor prep
+  - video: native video decode path is currently unavailable in no-external-dependency mode
+  - audio: native audio decode path is currently unavailable in no-external-dependency mode
+- multimodal tensor-group probing is implemented during load for multimodal backends (vision/projector/audio groups with explicit diagnostics)
+- multimodal prompt encoding now maps image/video/audio placeholder spans and validates prompt/media alignment before preprocessing
+- runtime includes a prefill embedding hook (`transformer_with_embedding`) for upcoming native media embedding injection
+- native image/video/audio embedding injection into model context is still in progress
+- no external runtime binaries are required for the current preprocessing path
 
 For detailed feature coverage and platform notes, see:
 - `docs/features.md`

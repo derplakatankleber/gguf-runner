@@ -152,6 +152,72 @@ fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scale: 
     }
 }
 
+#[inline]
+fn qwen35_uses_mrope(p: &Config) -> bool {
+    p.is_qwen35 && p.rope_sections.iter().sum::<usize>() > 0
+}
+
+fn rebuild_rope_cache(p: &Config, s: &mut RunState, pos: usize, is_swa_layer: bool) {
+    let current_is_swa = if is_swa_layer { 1 } else { 0 };
+    if s.rope_cache_pos == pos as isize && s.rope_cache_is_swa == current_is_swa {
+        return;
+    }
+
+    let rope_freqs = if p.is_gemma3 && is_swa_layer {
+        &s.rope_freqs_swa
+    } else {
+        &s.rope_freqs
+    };
+    let rope_half = s.rope_cos.len();
+
+    if qwen35_uses_mrope(p) {
+        // llama.cpp M-RoPE text path expands scalar position into [t,h,w,e] = [pos,pos,pos,0].
+        let pos_streams = [pos as f32, pos as f32, pos as f32, 0.0f32];
+        let section_total = p.rope_sections.iter().sum::<usize>();
+        let section_h = p.rope_sections[0];
+        let section_w = section_h + p.rope_sections[1];
+        let section_e = section_w + p.rope_sections[2];
+
+        for (i, ((cos, sin), &freq)) in s
+            .rope_cos
+            .iter_mut()
+            .zip(s.rope_sin.iter_mut())
+            .zip(rope_freqs.iter())
+            .take(rope_half)
+            .enumerate()
+        {
+            let sector = i % section_total;
+            let pos_value = if sector < section_h {
+                pos_streams[0]
+            } else if sector < section_w {
+                pos_streams[1]
+            } else if sector < section_e {
+                pos_streams[2]
+            } else {
+                pos_streams[3]
+            };
+            let val = pos_value * freq;
+            *cos = val.cos();
+            *sin = val.sin();
+        }
+    } else {
+        for ((cos, sin), &freq) in s
+            .rope_cos
+            .iter_mut()
+            .zip(s.rope_sin.iter_mut())
+            .zip(rope_freqs.iter())
+            .take(rope_half)
+        {
+            let val = pos as f32 * freq;
+            *cos = val.cos();
+            *sin = val.sin();
+        }
+    }
+
+    s.rope_cache_pos = pos as isize;
+    s.rope_cache_is_swa = current_is_swa;
+}
+
 pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     let head_size = if p.head_dim > 0 {
         p.head_dim
@@ -320,6 +386,29 @@ pub(crate) fn transformer(
     w: &TransformerWeights,
     mapped: &[u8],
 ) -> Result<(), String> {
+    transformer_inner(Some(token), None, pos, p, s, w, mapped)
+}
+
+pub(crate) fn transformer_with_embedding(
+    embedding: &[f32],
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+) -> Result<(), String> {
+    transformer_inner(None, Some(embedding), pos, p, s, w, mapped)
+}
+
+fn transformer_inner(
+    token: Option<usize>,
+    embedding: Option<&[f32]>,
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+) -> Result<(), String> {
     let dim = p.dim;
     let hidden_dim = p.hidden_dim;
     let head_size = s.head_size;
@@ -333,12 +422,30 @@ pub(crate) fn transformer(
     };
     let do_layer_debug =
         layer_debug_enabled() && layer_debug_pos().map_or(pos == 0, |p0| pos == p0);
+    let mut deepstack_embedding: Option<&[f32]> = None;
 
-    let emb_row = &w.token_embedding_table[token * dim..(token + 1) * dim];
-    s.x[..dim].copy_from_slice(emb_row);
+    if let Some(input_embedding) = embedding {
+        if input_embedding.len() == dim {
+            s.x[..dim].copy_from_slice(input_embedding);
+        } else if p.n_deepstack_layers > 0 && input_embedding.len() == p.input_embedding_dim {
+            s.x[..dim].copy_from_slice(&input_embedding[..dim]);
+            deepstack_embedding = Some(&input_embedding[dim..]);
+        } else {
+            return Err(format!(
+                "embedding input length mismatch: got {}, expected {} or {}",
+                input_embedding.len(),
+                dim,
+                p.input_embedding_dim
+            ));
+        }
+    } else {
+        let token = token.ok_or_else(|| "missing token input for transformer step".to_string())?;
+        let emb_row = &w.token_embedding_table[token * dim..(token + 1) * dim];
+        s.x[..dim].copy_from_slice(emb_row);
 
-    if p.is_gemma3 {
-        scale_slice_inplace(&mut s.x[..dim], s.embed_scale);
+        if p.is_gemma3 {
+            scale_slice_inplace(&mut s.x[..dim], s.embed_scale);
+        }
     }
 
     for l in 0..p.n_layers {
@@ -478,30 +585,10 @@ pub(crate) fn transformer(
             }
 
             let is_swa_layer = p.swa_pattern > 0 && (l % p.swa_pattern < p.swa_pattern - 1);
-            let rope_freqs = if p.is_gemma3 && is_swa_layer {
-                &s.rope_freqs_swa
-            } else {
-                &s.rope_freqs
-            };
             let rope_half = s.rope_cos.len();
-            let current_is_swa = if is_swa_layer { 1 } else { 0 };
-            if s.rope_cache_pos != pos as isize || s.rope_cache_is_swa != current_is_swa {
-                for ((cos, sin), &freq) in s
-                    .rope_cos
-                    .iter_mut()
-                    .zip(s.rope_sin.iter_mut())
-                    .zip(rope_freqs.iter())
-                    .take(rope_half)
-                {
-                    let val = pos as f32 * freq;
-                    *cos = val.cos();
-                    *sin = val.sin();
-                }
-                s.rope_cache_pos = pos as isize;
-                s.rope_cache_is_swa = current_is_swa;
-            }
+            rebuild_rope_cache(p, s, pos, is_swa_layer);
 
-            if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
+            if p.is_gemma3 || p.is_qwen2 || p.is_qwen3vl || p.is_qwen3moe || p.is_qwen3next {
                 let pair_offset = rope_half;
                 for h in 0..p.n_heads {
                     let hs = h * head_size;
@@ -752,7 +839,7 @@ pub(crate) fn transformer(
             );
         }
 
-        if p.is_qwen3moe || p.is_qwen3next {
+        if p.is_qwen3moe || (p.is_qwen3next && p.n_experts > 0) {
             let moe_prof = prof_start();
             let expert_hidden = p.expert_hidden_dim;
             s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
@@ -889,6 +976,21 @@ pub(crate) fn transformer(
                 l2_norm(&s.xb[..dim]),
                 l2_norm(&s.x[..dim]),
             );
+        }
+
+        if let Some(ds) = deepstack_embedding {
+            if l < p.n_deepstack_layers {
+                let ds_off = l * dim;
+                let ds_end = ds_off + dim;
+                if ds_end > ds.len() {
+                    return Err(format!(
+                        "deepstack embedding length mismatch at layer {l}: need {} values, have {}",
+                        ds_end,
+                        ds.len()
+                    ));
+                }
+                accum(&mut s.x[..dim], &ds[ds_off..ds_end], dim);
+            }
         }
     }
 

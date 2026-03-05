@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 const X86_MATMUL_PREFETCH_ROWS: usize = 6;
 pub(crate) fn get_block_size(ttype: GgmlType) -> usize {
     match ttype.0 {
-        GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_BF16 | 30 => 1,
+        GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_BF16 => 1,
         GGML_TYPE_Q4_0 => QK4_0,
         GGML_TYPE_Q4_1 => QK4_1,
         GGML_TYPE_Q5_0 => QK5_0,
@@ -46,7 +46,7 @@ pub(crate) fn get_block_size(ttype: GgmlType) -> usize {
 pub(crate) fn get_type_size(ttype: GgmlType) -> usize {
     match ttype.0 {
         GGML_TYPE_F32 => 4,
-        GGML_TYPE_F16 | GGML_TYPE_BF16 | 30 => 2,
+        GGML_TYPE_F16 | GGML_TYPE_BF16 => 2,
         GGML_TYPE_Q4_0 => 2 + QK4_0 / 2,
         GGML_TYPE_Q4_1 => 2 + 2 + QK4_1 / 2,
         GGML_TYPE_Q5_0 => 2 + 4 + QK5_0 / 2,
@@ -459,7 +459,7 @@ pub(crate) fn dequantize_tensor(
         GGML_TYPE_Q5_K => dequantize_row_q5_k(src, &mut dst, n_elements),
         GGML_TYPE_Q6_K => dequantize_row_q6_k(src, &mut dst, n_elements),
         GGML_TYPE_IQ4_NL => dequantize_row_iq4_nl(src, &mut dst, n_elements),
-        GGML_TYPE_BF16 | 30 => dequantize_row_bf16(src, &mut dst, n_elements),
+        GGML_TYPE_BF16 => dequantize_row_bf16(src, &mut dst, n_elements),
         _ => return Err(format!("unsupported quantization type: {}", ttype.0)),
     }
     Ok(dst)
@@ -2876,7 +2876,7 @@ pub(crate) fn matmul_quantized(
         }
         GGML_TYPE_IQ4_NL => run_rows!(vec_dot_iq4_nl),
         GGML_TYPE_F16 => run_rows!(vec_dot_f16),
-        GGML_TYPE_BF16 | 30 => run_rows!(vec_dot_bf16),
+        GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
         GGML_TYPE_F32 => run_rows!(vec_dot_f32),
         _ => {
             return Err(format!(
@@ -3065,7 +3065,7 @@ pub(crate) fn matmul_quantized_rows(
         }
         GGML_TYPE_IQ4_NL => run_rows!(vec_dot_iq4_nl),
         GGML_TYPE_F16 => run_rows!(vec_dot_f16),
-        GGML_TYPE_BF16 | 30 => run_rows!(vec_dot_bf16),
+        GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
         GGML_TYPE_F32 => run_rows!(vec_dot_f32),
         _ => {
             return Err(format!(

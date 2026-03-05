@@ -226,15 +226,26 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
         ));
     }
     if w.ssm_conv1d.is_empty()
-        || w.ssm_ba.is_empty()
         || w.ssm_a.is_empty()
         || w.ssm_dt_bias.is_empty()
         || w.ssm_norm.is_empty()
     {
         return Err("missing qwen3next SSM tensors".to_string());
     }
-    if l >= w.ssm_conv1d.len() || l >= w.ssm_ba.len() {
+    if l >= w.ssm_conv1d.len() {
         return Err("qwen3next SSM layer index out of range".to_string());
+    }
+    let has_fused_ba = !w.ssm_ba.is_empty() && l < w.ssm_ba.len() && w.ssm_ba[l].rows > 0;
+    let has_split_ba = !w.ssm_alpha.is_empty()
+        && !w.ssm_beta.is_empty()
+        && l < w.ssm_alpha.len()
+        && l < w.ssm_beta.len()
+        && w.ssm_alpha[l].rows > 0
+        && w.ssm_beta[l].rows > 0;
+    if !has_fused_ba && !has_split_ba {
+        return Err(format!(
+            "blk.{l} is missing qwen3next SSM gate tensors (need ssm_ba.weight or ssm_alpha.weight + ssm_beta.weight)"
+        ));
     }
     if w.attn_qkv[l].rows < conv_dim {
         return Err(format!(
@@ -248,11 +259,17 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
             w.wo[l].rows, d_inner
         ));
     }
-    if w.ssm_ba[l].rows < 2 * n_v_heads {
+    if has_fused_ba && w.ssm_ba[l].rows < 2 * n_v_heads {
         return Err(format!(
             "blk.{l}.ssm_ba.weight has {} rows, expected at least {}",
             w.ssm_ba[l].rows,
             2 * n_v_heads
+        ));
+    }
+    if has_split_ba && (w.ssm_alpha[l].rows < n_v_heads || w.ssm_beta[l].rows < n_v_heads) {
+        return Err(format!(
+            "blk.{l}.ssm_alpha/ssm_beta rows are ({}, {}), expected at least ({}, {})",
+            w.ssm_alpha[l].rows, w.ssm_beta[l].rows, n_v_heads, n_v_heads
         ));
     }
 
@@ -272,14 +289,33 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
         d_inner,
         mapped,
     )?;
-    matmul_quantized_rows(
-        &mut s.ssm_ba[..2 * n_v_heads],
-        &s.xb[..p.dim],
-        &w.ssm_ba[l],
-        0,
-        2 * n_v_heads,
-        mapped,
-    )?;
+    if has_fused_ba {
+        matmul_quantized_rows(
+            &mut s.ssm_ba[..2 * n_v_heads],
+            &s.xb[..p.dim],
+            &w.ssm_ba[l],
+            0,
+            2 * n_v_heads,
+            mapped,
+        )?;
+    } else {
+        matmul_quantized_rows(
+            &mut s.ssm_gate_exp[..n_v_heads],
+            &s.xb[..p.dim],
+            &w.ssm_alpha[l],
+            0,
+            n_v_heads,
+            mapped,
+        )?;
+        matmul_quantized_rows(
+            &mut s.ssm_beta[..n_v_heads],
+            &s.xb[..p.dim],
+            &w.ssm_beta[l],
+            0,
+            n_v_heads,
+            mapped,
+        )?;
+    }
 
     let conv_w = &w.ssm_conv1d[l];
     if conv_w.len() < conv_kernel * conv_dim {
@@ -351,11 +387,20 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
     let dt_base = l * n_v_heads;
     let a_base = l * n_v_heads;
     for h in 0..n_v_heads {
-        let group = h / heads_per_group;
-        let idx = h % heads_per_group;
-        let base = group * (2 * heads_per_group);
-        let beta = sigmoidf(s.ssm_ba[base + idx]);
-        let alpha = s.ssm_ba[base + heads_per_group + idx] + w.ssm_dt_bias[dt_base + h];
+        let (beta, alpha) = if has_fused_ba {
+            let group = h / heads_per_group;
+            let idx = h % heads_per_group;
+            let base = group * (2 * heads_per_group);
+            (
+                sigmoidf(s.ssm_ba[base + idx]),
+                s.ssm_ba[base + heads_per_group + idx] + w.ssm_dt_bias[dt_base + h],
+            )
+        } else {
+            (
+                sigmoidf(s.ssm_beta[h]),
+                s.ssm_gate_exp[h] + w.ssm_dt_bias[dt_base + h],
+            )
+        };
         let mut gate = softplusf(alpha) * w.ssm_a[a_base + h];
         if !gate.is_finite() {
             gate = 0.0;

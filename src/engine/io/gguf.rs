@@ -177,6 +177,23 @@ fn read_gguf_scalar(r: &mut File, value_type: u32) -> io::Result<GgufValue> {
     }
 }
 
+fn read_gguf_integer_array_value(r: &mut File, value_type: u32) -> io::Result<i64> {
+    match value_type {
+        GGUF_TYPE_UINT8 => Ok(read_u8(r)? as i64),
+        GGUF_TYPE_INT8 => Ok(read_i8(r)? as i64),
+        GGUF_TYPE_UINT16 => Ok(read_u16(r)? as i64),
+        GGUF_TYPE_INT16 => Ok(read_i16(r)? as i64),
+        GGUF_TYPE_UINT32 => Ok(read_u32(r)? as i64),
+        GGUF_TYPE_INT32 => Ok(read_i32(r)? as i64),
+        GGUF_TYPE_UINT64 => Ok(read_u64(r)?.min(i64::MAX as u64) as i64),
+        GGUF_TYPE_INT64 => Ok(read_i64(r)?),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported integer gguf array type: {value_type}"),
+        )),
+    }
+}
+
 fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
     let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
 
@@ -236,6 +253,44 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
                         .map_err(|e| format!("failed to read merge: {e}"))?;
                     vocab_merges.push(merge);
                 }
+            } else if arr_type == GGUF_TYPE_FLOAT32 {
+                let mut values = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    let value = read_f32(&mut file).map_err(|e| {
+                        format!("failed to read float32 array value for key {key}: {e}")
+                    })?;
+                    values.push(value);
+                }
+                kv.insert(key, GgufValue::F32Array(values));
+            } else if arr_type == GGUF_TYPE_FLOAT64 {
+                let mut values = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    let value = read_f64(&mut file).map_err(|e| {
+                        format!("failed to read float64 array value for key {key}: {e}")
+                    })?;
+                    values.push(value as f32);
+                }
+                kv.insert(key, GgufValue::F32Array(values));
+            } else if matches!(
+                arr_type,
+                GGUF_TYPE_UINT8
+                    | GGUF_TYPE_INT8
+                    | GGUF_TYPE_UINT16
+                    | GGUF_TYPE_INT16
+                    | GGUF_TYPE_UINT32
+                    | GGUF_TYPE_INT32
+                    | GGUF_TYPE_UINT64
+                    | GGUF_TYPE_INT64
+            ) {
+                let mut values = Vec::with_capacity(arr_len as usize);
+                for _ in 0..arr_len {
+                    let value =
+                        read_gguf_integer_array_value(&mut file, arr_type).map_err(|e| {
+                            format!("failed to read integer array value for key {key}: {e}")
+                        })?;
+                    values.push(value);
+                }
+                kv.insert(key, GgufValue::I64Array(values));
             } else {
                 for _ in 0..arr_len {
                     skip_gguf_value(&mut file, arr_type)
@@ -440,8 +495,43 @@ pub(crate) fn get_gguf_string_from_map<'a>(
     }
 }
 
+pub(crate) fn get_gguf_f32_array_from_map<'a>(
+    kv: &'a HashMap<String, GgufValue>,
+    key: &str,
+) -> Option<&'a [f32]> {
+    match kv.get(key) {
+        Some(GgufValue::F32Array(values)) => Some(values.as_slice()),
+        _ => None,
+    }
+}
+
+pub(crate) fn get_gguf_i64_array_from_map<'a>(
+    kv: &'a HashMap<String, GgufValue>,
+    key: &str,
+) -> Option<&'a [i64]> {
+    match kv.get(key) {
+        Some(GgufValue::I64Array(values)) => Some(values.as_slice()),
+        _ => None,
+    }
+}
+
 pub(crate) fn find_gguf_tensor<'a>(gguf: &'a GGUFFile, name: &str) -> Option<&'a Gguftensor> {
     gguf.tensor_lookup
         .get(name)
         .and_then(|idx| gguf.tensors.get(*idx))
+}
+
+pub(crate) fn find_gguf_tensor_names_with_any_prefix(
+    gguf: &GGUFFile,
+    prefixes: &[&str],
+) -> Vec<String> {
+    gguf.tensors
+        .iter()
+        .filter(|tensor| {
+            prefixes
+                .iter()
+                .any(|prefix| tensor.name.starts_with(prefix))
+        })
+        .map(|tensor| tensor.name.clone())
+        .collect()
 }

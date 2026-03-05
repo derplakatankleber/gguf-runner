@@ -419,7 +419,20 @@ pub(crate) fn init_tokenizer_from_gguf(
     ) as i32;
     tokenizer.start_header_token = LLAMA3_START_HEADER;
     tokenizer.end_header_token = LLAMA3_END_HEADER;
-    tokenizer.eot_token = LLAMA3_EOT;
+    // Look up the actual end-of-turn token from the vocabulary. For Qwen models this is
+    // <|im_end|>; for Llama3 models <|eot_id|> maps to the LLAMA3_EOT constant (128009).
+    tokenizer.eot_token = gguf
+        .vocab_tokens
+        .iter()
+        .position(|s| s == "<|im_end|>")
+        .map(|i| i as i32)
+        .or_else(|| {
+            gguf.vocab_tokens
+                .iter()
+                .position(|s| s == "<|eot_id|>")
+                .map(|i| i as i32)
+        })
+        .unwrap_or(LLAMA3_EOT);
 
     tokenizer.vocab = gguf.vocab_tokens.clone();
     tokenizer.vocab_size = tokenizer.vocab.len();
@@ -437,7 +450,7 @@ pub(crate) fn init_tokenizer_from_gguf(
     };
     tokenizer.merges = gguf.vocab_merges.clone();
     if tokenizer.bos_token < 0 {
-        if config.is_qwen2 || config.is_qwen3moe || config.is_qwen3next {
+        if config.is_qwen2 || config.is_qwen3vl || config.is_qwen3moe || config.is_qwen3next {
             tokenizer.bos_token = -1;
         } else {
             tokenizer.bos_token = tokenizer

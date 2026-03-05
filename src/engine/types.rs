@@ -49,7 +49,7 @@ pub(crate) const GGML_TYPE_Q4_K: i32 = 12;
 pub(crate) const GGML_TYPE_Q5_K: i32 = 13;
 pub(crate) const GGML_TYPE_Q6_K: i32 = 14;
 pub(crate) const GGML_TYPE_IQ4_NL: i32 = 20;
-pub(crate) const GGML_TYPE_BF16: i32 = 29;
+pub(crate) const GGML_TYPE_BF16: i32 = 30;
 
 pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -64,6 +64,112 @@ pub(crate) const LLAMA3_EOT: i32 = 128009;
 pub(crate) const GEMMA3_BOS_TOKEN: i32 = 2;
 pub(crate) const GEMMA3_START_TURN: i32 = 106;
 pub(crate) const GEMMA3_END_TURN: i32 = 107;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ThinkMode {
+    #[default]
+    Yes,
+    No,
+    Hidden,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MediaRef {
+    pub(crate) path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContentPart {
+    Text(String),
+    Image(MediaRef),
+    Video(MediaRef),
+    Audio(MediaRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GenerationRequest {
+    pub(crate) system_prompt: String,
+    pub(crate) parts: Vec<ContentPart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlaceholderSpan {
+    pub(crate) token_start: usize,
+    pub(crate) token_len: usize,
+    pub(crate) media_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EncodedPrompt {
+    pub(crate) token_ids: Vec<i32>,
+    pub(crate) image_spans: Vec<PlaceholderSpan>,
+    pub(crate) video_spans: Vec<PlaceholderSpan>,
+    pub(crate) audio_spans: Vec<PlaceholderSpan>,
+}
+
+impl EncodedPrompt {
+    pub(crate) fn from_token_ids(token_ids: Vec<i32>) -> Self {
+        Self {
+            token_ids,
+            image_spans: Vec::new(),
+            video_spans: Vec::new(),
+            audio_spans: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MultimodalBackend {
+    None,
+    Qwen3Vl,
+    Qwen35,
+}
+
+impl MultimodalBackend {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MultimodalBackend::None => "none",
+            MultimodalBackend::Qwen3Vl => "qwen3vl",
+            MultimodalBackend::Qwen35 => "qwen35",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelCapabilities {
+    pub(crate) multimodal_backend: MultimodalBackend,
+    pub(crate) supports_native_image: bool,
+    pub(crate) supports_native_video: bool,
+    pub(crate) supports_native_audio: bool,
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self {
+            multimodal_backend: MultimodalBackend::None,
+            supports_native_image: false,
+            supports_native_video: false,
+            supports_native_audio: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MultimodalWeights {
+    pub(crate) backend: MultimodalBackend,
+    pub(crate) vision_tensor_names: Vec<String>,
+    pub(crate) projector_tensor_names: Vec<String>,
+    pub(crate) audio_tensor_names: Vec<String>,
+}
+
+impl MultimodalWeights {
+    #[inline]
+    pub(crate) fn total_tensor_count(&self) -> usize {
+        self.vision_tensor_names.len()
+            + self.projector_tensor_names.len()
+            + self.audio_tensor_names.len()
+    }
+}
 
 #[cfg(unix)]
 pub(crate) const PROT_READ: i32 = 0x1;
@@ -503,6 +609,8 @@ pub(crate) enum GgufValue {
     Int(i64),
     F32(f32),
     F64(f64),
+    F32Array(Vec<f32>),
+    I64Array(Vec<i64>),
     Bool(()),
     Str(String),
 }
@@ -545,6 +653,8 @@ impl GGUFFile {
 #[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) dim: usize,
+    pub(crate) input_embedding_dim: usize,
+    pub(crate) n_deepstack_layers: usize,
     pub(crate) hidden_dim: usize,
     pub(crate) expert_hidden_dim: usize,
     pub(crate) shared_expert_hidden_dim: usize,
@@ -562,10 +672,14 @@ pub(crate) struct Config {
     pub(crate) rope_theta: f32,
     pub(crate) head_dim: usize,
     pub(crate) rope_dim: usize,
+    pub(crate) rope_sections: [usize; 4],
     pub(crate) is_gemma3: bool,
     pub(crate) is_qwen2: bool,
+    pub(crate) is_qwen35: bool,
+    pub(crate) is_qwen3vl: bool,
     pub(crate) is_qwen3moe: bool,
     pub(crate) is_qwen3next: bool,
+    pub(crate) capabilities: ModelCapabilities,
     pub(crate) final_logit_softcapping: f32,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta_swa: f32,
@@ -598,6 +712,8 @@ pub(crate) struct TransformerWeights {
     pub(crate) w3: Vec<QuantizedTensor>,
     pub(crate) attn_qkv: Vec<QuantizedTensor>,
     pub(crate) ssm_ba: Vec<QuantizedTensor>,
+    pub(crate) ssm_alpha: Vec<QuantizedTensor>,
+    pub(crate) ssm_beta: Vec<QuantizedTensor>,
     pub(crate) ssm_conv1d: Vec<Vec<f32>>,
     pub(crate) ssm_a: Vec<f32>,
     pub(crate) ssm_dt_bias: Vec<f32>,

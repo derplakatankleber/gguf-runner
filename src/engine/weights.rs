@@ -1,8 +1,10 @@
-use crate::engine::io::find_gguf_tensor;
+use crate::engine::io::{find_gguf_tensor, find_gguf_tensor_names_with_any_prefix};
 use crate::engine::kernels::{dequantize_tensor, get_block_size, get_type_size};
 use crate::engine::types::{
-    Config, GGUFFile, GgmlType, Gguftensor, QuantizedTensor, TransformerWeights, GGML_TYPE_F32,
+    Config, GGUFFile, GgmlType, Gguftensor, MultimodalBackend, MultimodalWeights, QuantizedTensor,
+    TransformerWeights, GGML_TYPE_F32,
 };
+use std::collections::BTreeMap;
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n_elements = 1usize;
@@ -118,6 +120,117 @@ fn load_layer_tensor_quantized_auto_rows(
     load_tensor_quantized(gguf, &name, rows, cols)
 }
 
+const VISION_ENCODER_PREFIXES: &[&str] = &[
+    "vision.",
+    "visual.",
+    "vision_tower.",
+    "model.vision.",
+    "model.visual.",
+    "v.",
+];
+const VISION_PROJECTOR_PREFIXES: &[&str] = &[
+    "mm.",
+    "mmproj.",
+    "multi_modal_projector.",
+    "projector.",
+    "model.mmproj.",
+    "model.projector.",
+];
+const AUDIO_PREFIXES: &[&str] = &["audio.", "aud.", "speech.", "whisper.", "model.audio."];
+
+fn summarize_tensor_prefixes(gguf: &GGUFFile, max_items: usize) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for tensor in &gguf.tensors {
+        let key = tensor
+            .name
+            .split('.')
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let mut entries: Vec<(String, usize)> = counts.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries
+        .into_iter()
+        .take(max_items)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn init_multimodal_weights_from_gguf(
+    gguf: &GGUFFile,
+    p: &Config,
+    debug_mode: bool,
+) -> Result<Option<MultimodalWeights>, String> {
+    if p.capabilities.multimodal_backend == MultimodalBackend::None {
+        return Ok(None);
+    }
+
+    let vision_tensor_names = find_gguf_tensor_names_with_any_prefix(gguf, VISION_ENCODER_PREFIXES);
+    let projector_tensor_names =
+        find_gguf_tensor_names_with_any_prefix(gguf, VISION_PROJECTOR_PREFIXES);
+    let audio_tensor_names = find_gguf_tensor_names_with_any_prefix(gguf, AUDIO_PREFIXES);
+
+    let needs_vision = p.capabilities.supports_native_image || p.capabilities.supports_native_video;
+    if needs_vision {
+        let mut missing: Vec<&str> = Vec::new();
+        if vision_tensor_names.is_empty() {
+            missing.push("vision encoder tensor group");
+        }
+        if projector_tensor_names.is_empty() {
+            missing.push("multimodal projector tensor group");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "native multimodal backend '{}' is enabled but required tensors are missing: {}. observed GGUF tensor prefixes: [{}]",
+                p.capabilities.multimodal_backend.as_str(),
+                missing.join(", "),
+                summarize_tensor_prefixes(gguf, 8),
+            ));
+        }
+    }
+
+    if p.capabilities.supports_native_audio && audio_tensor_names.is_empty() {
+        return Err(format!(
+            "native multimodal backend '{}' reports audio support but GGUF contains no audio tensor group. observed GGUF tensor prefixes: [{}]",
+            p.capabilities.multimodal_backend.as_str(),
+            summarize_tensor_prefixes(gguf, 8)
+        ));
+    }
+
+    if debug_mode {
+        let preview = |names: &[String]| -> String {
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            }
+        };
+        eprintln!(
+            "Multimodal weights probe: backend={}, vision={}, projector={}, audio={}",
+            p.capabilities.multimodal_backend.as_str(),
+            vision_tensor_names.len(),
+            projector_tensor_names.len(),
+            audio_tensor_names.len()
+        );
+        eprintln!(
+            "Multimodal weights sample tensors: vision=[{}] projector=[{}] audio=[{}]",
+            preview(&vision_tensor_names),
+            preview(&projector_tensor_names),
+            preview(&audio_tensor_names)
+        );
+    }
+
+    Ok(Some(MultimodalWeights {
+        backend: p.capabilities.multimodal_backend,
+        vision_tensor_names,
+        projector_tensor_names,
+        audio_tensor_names,
+    }))
+}
+
 pub(crate) fn init_weights_from_gguf(
     gguf: &GGUFFile,
     p: &Config,
@@ -156,6 +269,16 @@ pub(crate) fn init_weights_from_gguf(
         Vec::new()
     };
     let mut ssm_ba = if p.is_qwen3next {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut ssm_alpha = if p.is_qwen3next {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut ssm_beta = if p.is_qwen3next {
         vec![QuantizedTensor::default(); n_layers]
     } else {
         Vec::new()
@@ -222,21 +345,24 @@ pub(crate) fn init_weights_from_gguf(
         Vec::new()
     };
 
-    let mut attn_q_norm = if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
-        vec![0.0f32; n_layers * head_size]
-    } else {
-        Vec::new()
-    };
-    let mut attn_k_norm = if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
-        vec![0.0f32; n_layers * head_size]
-    } else {
-        Vec::new()
-    };
-    let mut attn_qk_norm_present = if p.is_gemma3 || p.is_qwen2 || p.is_qwen3moe || p.is_qwen3next {
-        vec![false; n_layers]
-    } else {
-        Vec::new()
-    };
+    let mut attn_q_norm =
+        if p.is_gemma3 || p.is_qwen2 || p.is_qwen3vl || p.is_qwen3moe || p.is_qwen3next {
+            vec![0.0f32; n_layers * head_size]
+        } else {
+            Vec::new()
+        };
+    let mut attn_k_norm =
+        if p.is_gemma3 || p.is_qwen2 || p.is_qwen3vl || p.is_qwen3moe || p.is_qwen3next {
+            vec![0.0f32; n_layers * head_size]
+        } else {
+            Vec::new()
+        };
+    let mut attn_qk_norm_present =
+        if p.is_gemma3 || p.is_qwen2 || p.is_qwen3vl || p.is_qwen3moe || p.is_qwen3next {
+            vec![false; n_layers]
+        } else {
+            Vec::new()
+        };
     let mut attn_post_norm = if p.is_gemma3 {
         vec![0.0f32; n_layers * p.dim]
     } else {
@@ -271,8 +397,38 @@ pub(crate) fn init_weights_from_gguf(
                 }
                 wo[l] = load_layer_tensor_quantized(gguf, l, "attn_gate.weight", ssm_inner, p.dim)?;
                 wv[l] = load_layer_tensor_quantized(gguf, l, "ssm_out.weight", p.dim, ssm_inner)?;
-                ssm_ba[l] =
-                    load_layer_tensor_quantized(gguf, l, "ssm_ba.weight", 2 * ssm_v_heads, p.dim)?;
+                if find_gguf_tensor(gguf, &format!("blk.{l}.ssm_ba.weight")).is_some() {
+                    ssm_ba[l] = load_layer_tensor_quantized(
+                        gguf,
+                        l,
+                        "ssm_ba.weight",
+                        2 * ssm_v_heads,
+                        p.dim,
+                    )?;
+                } else if find_gguf_tensor(gguf, &format!("blk.{l}.ssm_alpha.weight")).is_some()
+                    && find_gguf_tensor(gguf, &format!("blk.{l}.ssm_beta.weight")).is_some()
+                {
+                    ssm_alpha[l] =
+                        load_layer_tensor_quantized_auto_rows(gguf, l, "ssm_alpha.weight", p.dim)?;
+                    ssm_beta[l] =
+                        load_layer_tensor_quantized_auto_rows(gguf, l, "ssm_beta.weight", p.dim)?;
+                    if ssm_alpha[l].rows < ssm_v_heads {
+                        return Err(format!(
+                            "blk.{l}.ssm_alpha.weight has {} rows, expected at least {}",
+                            ssm_alpha[l].rows, ssm_v_heads
+                        ));
+                    }
+                    if ssm_beta[l].rows < ssm_v_heads {
+                        return Err(format!(
+                            "blk.{l}.ssm_beta.weight has {} rows, expected at least {}",
+                            ssm_beta[l].rows, ssm_v_heads
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "blk.{l} is missing SSM gate tensors: expected either ssm_ba.weight or both ssm_alpha.weight and ssm_beta.weight"
+                    ));
+                }
                 ssm_conv1d[l] = load_tensor_float(
                     gguf,
                     &format!("blk.{l}.ssm_conv1d.weight"),
@@ -294,6 +450,17 @@ pub(crate) fn init_weights_from_gguf(
                         wv[l].rows,
                         wv[l].ttype.0
                     );
+                    if ssm_ba[l].rows > 0 {
+                        eprintln!(
+                            "qwen3next layer {l}: using fused ssm_ba.weight rows={} (t={})",
+                            ssm_ba[l].rows, ssm_ba[l].ttype.0
+                        );
+                    } else if ssm_alpha[l].rows > 0 && ssm_beta[l].rows > 0 {
+                        eprintln!(
+                            "qwen3next layer {l}: using split ssm_alpha/ssm_beta rows=({},{})",
+                            ssm_alpha[l].rows, ssm_beta[l].rows
+                        );
+                    }
                     if l == 0 {
                         let (mut amin, mut amax) = (f32::INFINITY, f32::NEG_INFINITY);
                         let (mut dtmin, mut dtmax) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -347,53 +514,72 @@ pub(crate) fn init_weights_from_gguf(
                     );
                 }
             }
-            moe_gate_inp[l] =
-                load_layer_tensor_quantized(gguf, l, "ffn_gate_inp.weight", p.n_experts, p.dim)?;
-            moe_gate_exps[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_gate_exps.weight",
-                p.n_experts * p.expert_hidden_dim,
-                p.dim,
-            )?;
-            moe_up_exps[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_up_exps.weight",
-                p.n_experts * p.expert_hidden_dim,
-                p.dim,
-            )?;
-            moe_down_exps[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_down_exps.weight",
-                p.n_experts * p.dim,
-                p.expert_hidden_dim,
-            )?;
+            if p.n_experts > 0 {
+                moe_gate_inp[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_inp.weight",
+                    p.n_experts,
+                    p.dim,
+                )?;
+                moe_gate_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_exps.weight",
+                    p.n_experts * p.expert_hidden_dim,
+                    p.dim,
+                )?;
+                moe_up_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_up_exps.weight",
+                    p.n_experts * p.expert_hidden_dim,
+                    p.dim,
+                )?;
+                moe_down_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_down_exps.weight",
+                    p.n_experts * p.dim,
+                    p.expert_hidden_dim,
+                )?;
 
-            let shared_hidden = if p.shared_expert_hidden_dim > 0 {
-                p.shared_expert_hidden_dim
+                let shared_hidden = if p.shared_expert_hidden_dim > 0 {
+                    p.shared_expert_hidden_dim
+                } else {
+                    p.expert_hidden_dim
+                };
+                w1[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_shexp.weight",
+                    shared_hidden,
+                    p.dim,
+                )?;
+                w2[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_down_shexp.weight",
+                    p.dim,
+                    shared_hidden,
+                )?;
+                w3[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_up_shexp.weight",
+                    shared_hidden,
+                    p.dim,
+                )?;
+                let shexp_gate =
+                    load_layer_tensor_float(gguf, l, "ffn_gate_inp_shexp.weight", p.dim)?;
+                moe_shared_gate_inp[l * p.dim..(l + 1) * p.dim].copy_from_slice(&shexp_gate);
             } else {
-                p.expert_hidden_dim
-            };
-            w1[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_gate_shexp.weight",
-                shared_hidden,
-                p.dim,
-            )?;
-            w2[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_down_shexp.weight",
-                p.dim,
-                shared_hidden,
-            )?;
-            w3[l] =
-                load_layer_tensor_quantized(gguf, l, "ffn_up_shexp.weight", shared_hidden, p.dim)?;
-            let shexp_gate = load_layer_tensor_float(gguf, l, "ffn_gate_inp_shexp.weight", p.dim)?;
-            moe_shared_gate_inp[l * p.dim..(l + 1) * p.dim].copy_from_slice(&shexp_gate);
+                w1[l] =
+                    load_layer_tensor_quantized(gguf, l, "ffn_gate.weight", p.hidden_dim, p.dim)?;
+                w2[l] =
+                    load_layer_tensor_quantized(gguf, l, "ffn_down.weight", p.dim, p.hidden_dim)?;
+                w3[l] = load_layer_tensor_quantized(gguf, l, "ffn_up.weight", p.hidden_dim, p.dim)?;
+            }
         } else {
             wq[l] = load_layer_tensor_quantized(gguf, l, "attn_q.weight", q_dim, p.dim)?;
             wk[l] = load_layer_tensor_quantized(gguf, l, "attn_k.weight", kv_dim, p.dim)?;
@@ -444,7 +630,7 @@ pub(crate) fn init_weights_from_gguf(
 
         if p.is_gemma3
             || p.is_qwen3moe
-            || ((p.is_qwen3next || p.is_qwen2)
+            || ((p.is_qwen3next || p.is_qwen2 || p.is_qwen3vl)
                 && find_gguf_tensor(gguf, &format!("blk.{l}.attn_q_norm.weight")).is_some()
                 && find_gguf_tensor(gguf, &format!("blk.{l}.attn_k_norm.weight")).is_some())
         {
@@ -495,6 +681,8 @@ pub(crate) fn init_weights_from_gguf(
         w3,
         attn_qkv,
         ssm_ba,
+        ssm_alpha,
+        ssm_beta,
         ssm_conv1d,
         ssm_a,
         ssm_dt_bias,

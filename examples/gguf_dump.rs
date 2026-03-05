@@ -149,6 +149,8 @@ fn format_gguf_value(v: &GgufValue) -> String {
         GgufValue::Int(x) => x.to_string(),
         GgufValue::F32(x) => x.to_string(),
         GgufValue::F64(x) => x.to_string(),
+        GgufValue::F32Array(xs) => format!("{xs:?}"),
+        GgufValue::I64Array(xs) => format!("{xs:?}"),
         GgufValue::Bool(()) => "<bool>".to_string(),
         GgufValue::Str(s) => format!("{s:?}"),
     }

@@ -71,6 +71,8 @@ static PAR_QWEN3NEXT_MIN_HEADS_CFG: OnceLock<usize> = OnceLock::new();
 static AARCH64_DOTPROD_Q8_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "aarch64")]
 static AARCH64_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+static AARCH64_I8MM_Q8_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_AVX2_FMA_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
@@ -87,6 +89,8 @@ pub(crate) static AARCH64_Q4K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 pub(crate) static AARCH64_Q5K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_arch = "aarch64")]
 pub(crate) static AARCH64_Q6K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
+#[cfg(target_arch = "aarch64")]
+pub(crate) static AARCH64_Q8_0_MR2_STATUS: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_arch = "x86_64")]
 pub(crate) static X86_Q4K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_arch = "x86_64")]
@@ -113,6 +117,8 @@ pub(crate) struct RuntimeSwitchConfig {
     pub(crate) aarch64_dotprod_q8: Option<bool>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) aarch64_qk_mr4: Option<bool>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_i8mm: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_avx2: Option<bool>,
     #[cfg(target_arch = "x86_64")]
@@ -173,6 +179,12 @@ pub(crate) fn use_aarch64_dotprod_q8() -> bool {
 #[inline]
 pub(crate) fn use_aarch64_qk_mr4() -> bool {
     *AARCH64_QK_MR4_CFG.get_or_init(|| true)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn use_aarch64_i8mm_q8() -> bool {
+    *AARCH64_I8MM_Q8_CFG.get_or_init(|| std::arch::is_aarch64_feature_detected!("i8mm"))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -245,6 +257,10 @@ pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
         }
         if let Some(v) = config.aarch64_qk_mr4 {
             let _ = AARCH64_QK_MR4_CFG.set(v);
+        }
+        if let Some(v) = config.aarch64_i8mm {
+            let enabled = v && std::arch::is_aarch64_feature_detected!("i8mm");
+            let _ = AARCH64_I8MM_Q8_CFG.set(enabled);
         }
     }
 

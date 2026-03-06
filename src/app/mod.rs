@@ -32,8 +32,74 @@ fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCache
     })
 }
 
+fn print_cpu_features() {
+    fn yn(v: bool) -> &'static str { if v { "yes" } else { "no " } }
+
+    println!("Architecture: {}", std::env::consts::ARCH);
+    println!();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let features: &[(&str, &str, bool, bool)] = &[
+            ("neon",     "ARMv8-A (baseline)", cfg!(target_feature = "neon"),    std::arch::is_aarch64_feature_detected!("neon")),
+            ("dotprod",  "ARMv8.2-A",          cfg!(target_feature = "dotprod"), std::arch::is_aarch64_feature_detected!("dotprod")),
+            ("fp16",     "ARMv8.2-A",          cfg!(target_feature = "fp16"),    std::arch::is_aarch64_feature_detected!("fp16")),
+            ("i8mm",     "ARMv8.6-A",          cfg!(target_feature = "i8mm"),    std::arch::is_aarch64_feature_detected!("i8mm")),
+            ("sve",      "ARMv8.4-A (opt-in)", cfg!(target_feature = "sve"),     std::arch::is_aarch64_feature_detected!("sve")),
+            ("sve2",     "ARMv9-A",            cfg!(target_feature = "sve2"),    std::arch::is_aarch64_feature_detected!("sve2")),
+        ];
+        println!("{:<10}  {:<20}  {:>8}  {:>8}", "feature", "ISA", "compiled", "runtime");
+        println!("{}", "-".repeat(54));
+        for (name, isa, compiled, runtime) in features {
+            println!("{:<10}  {:<20}  {:>8}  {:>8}", name, isa, yn(*compiled), yn(*runtime));
+        }
+        println!();
+        println!("gguf-runner kernels (aarch64):");
+        println!("  NEON matmul Q4/Q5/Q6-K MR4:  always enabled");
+        println!("  FCVTL fp16 loads:             always enabled (base AArch64)");
+        println!("  VSHLL bf16 loads:             always enabled (base AArch64)");
+        println!("  dotprod Q8_0:                 runtime={}", yn(std::arch::is_aarch64_feature_detected!("dotprod")));
+        println!("  i8mm Q8_0 MR2 (SMMLA):       runtime={}", yn(std::arch::is_aarch64_feature_detected!("i8mm")));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let features: &[(&str, &str, bool, bool)] = &[
+            ("sse4.1",    "Intel Penryn 2007",    cfg!(target_feature = "sse4.1"),    std::arch::is_x86_feature_detected!("sse4.1")),
+            ("avx",       "Intel Sandy Br. 2011", cfg!(target_feature = "avx"),       std::arch::is_x86_feature_detected!("avx")),
+            ("avx2",      "Intel Haswell 2013",   cfg!(target_feature = "avx2"),      std::arch::is_x86_feature_detected!("avx2")),
+            ("fma",       "Intel Haswell 2013",   cfg!(target_feature = "fma"),       std::arch::is_x86_feature_detected!("fma")),
+            ("f16c",      "Intel Ivy Br. 2012",   cfg!(target_feature = "f16c"),      std::arch::is_x86_feature_detected!("f16c")),
+            ("avxvnni",   "Intel Alder Lk. 2021", cfg!(target_feature = "avxvnni"),   std::arch::is_x86_feature_detected!("avxvnni")),
+            ("avx512f",   "Intel Skylake-X 2017", cfg!(target_feature = "avx512f"),   std::arch::is_x86_feature_detected!("avx512f")),
+            ("avx512vnni","Intel Cascade Lk. 2019",cfg!(target_feature = "avx512vnni"),std::arch::is_x86_feature_detected!("avx512vnni")),
+            ("avx512vl",  "Intel Skylake-X 2017", cfg!(target_feature = "avx512vl"),  std::arch::is_x86_feature_detected!("avx512vl")),
+        ];
+        println!("{:<12}  {:<24}  {:>8}  {:>8}", "feature", "ISA", "compiled", "runtime");
+        println!("{}", "-".repeat(60));
+        for (name, isa, compiled, runtime) in features {
+            println!("{:<12}  {:<24}  {:>8}  {:>8}", name, isa, yn(*compiled), yn(*runtime));
+        }
+        println!();
+        println!("gguf-runner kernels (x86_64):");
+        println!("  AVX2+FMA matmul Q4/Q5/Q6-K:  runtime={}", yn(std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")));
+        println!("  F16C fp16 loads:              runtime={}", yn(std::arch::is_x86_feature_detected!("avx") && std::arch::is_x86_feature_detected!("f16c")));
+        println!("  AVX-VNNI Q8_0:                runtime={}", yn(std::arch::is_x86_feature_detected!("avxvnni")));
+        println!("  AVX-512VNNI Q8_0:             runtime={}", yn(std::arch::is_x86_feature_detected!("avx512vnni") && std::arch::is_x86_feature_detected!("avx512vl")));
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    println!("No architecture-specific features detected for this target.");
+}
+
 pub(crate) fn run() -> Result<(), String> {
     let cli = CliOptions::parse()?;
+
+    if cli.show_features {
+        print_cpu_features();
+        return Ok(());
+    }
+
     let runtime_switch_config = RuntimeSwitchConfig {
         par_matmul_min_rows: cli.par_matmul_min_rows,
         par_matmul_chunk_rows: cli.par_matmul_chunk_rows,
@@ -43,6 +109,8 @@ pub(crate) fn run() -> Result<(), String> {
         aarch64_dotprod_q8: cli.aarch64_dotprod_q8,
         #[cfg(target_arch = "aarch64")]
         aarch64_qk_mr4: cli.aarch64_qk_mr4,
+        #[cfg(target_arch = "aarch64")]
+        aarch64_i8mm: cli.aarch64_i8mm,
         #[cfg(target_arch = "x86_64")]
         x86_avx2: cli.x86_avx2,
         #[cfg(target_arch = "x86_64")]

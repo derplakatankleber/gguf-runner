@@ -423,11 +423,14 @@ fn normalize_description_text(raw: String) -> Option<String> {
     disable_help_subcommand = true
 )]
 struct Cli {
-    #[arg(long, required = true, value_name = "model.gguf")]
+    #[arg(long, required_unless_present = "show_features", default_value = "", value_name = "model.gguf")]
     model: String,
 
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "show_features", default_value = "")]
     prompt: String,
+
+    #[arg(long = "show-features", help = "Print CPU features (compiled-in vs runtime) and exit")]
+    show_features: bool,
 
     #[arg(long = "image", value_name = "path")]
     images: Vec<String>,
@@ -579,6 +582,15 @@ struct Cli {
     )]
     aarch64_qk_mr4: Option<bool>,
 
+    #[cfg(target_arch = "aarch64")]
+    #[arg(
+        long = "aarch64-i8mm",
+        hide = true,
+        env = "GGUF_AARCH64_I8MM",
+        value_parser = parse_boolish
+    )]
+    aarch64_i8mm: Option<bool>,
+
     #[cfg(target_arch = "x86_64")]
     #[arg(
         long = "x86-avx2",
@@ -659,6 +671,7 @@ pub(crate) struct CliOptions {
     pub(crate) shell_command_description_specs: Vec<ShellCommandDescriptionSpec>,
     pub(crate) tool_prompt_specs: Vec<ToolPromptSpec>,
     pub(crate) max_tool_calls: usize,
+    pub(crate) show_features: bool,
     pub(crate) profiling: bool,
     pub(crate) show_tokens: bool,
     pub(crate) show_timings: bool,
@@ -673,6 +686,8 @@ pub(crate) struct CliOptions {
     pub(crate) aarch64_dotprod_q8: Option<bool>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) aarch64_qk_mr4: Option<bool>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_i8mm: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_avx2: Option<bool>,
     #[cfg(target_arch = "x86_64")]
@@ -731,6 +746,7 @@ impl CliOptions {
             shell_command_description_specs,
             tool_prompt_specs,
             max_tool_calls: cli.max_tool_calls,
+            show_features: cli.show_features,
             profiling: cli.profiling,
             show_tokens: cli.show_tokens,
             show_timings: cli.show_timings,
@@ -745,6 +761,8 @@ impl CliOptions {
             aarch64_dotprod_q8: cli.aarch64_dotprod_q8,
             #[cfg(target_arch = "aarch64")]
             aarch64_qk_mr4: cli.aarch64_qk_mr4,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_i8mm: cli.aarch64_i8mm,
             #[cfg(target_arch = "x86_64")]
             x86_avx2: cli.x86_avx2,
             #[cfg(target_arch = "x86_64")]

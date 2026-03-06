@@ -2,7 +2,7 @@ use crate::engine::kernels::{
     accum, dot_f32_simd, finite_or_zero, l2_norm, matmul_f32_embeddings, matmul_quantized,
     matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
     rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, scale_slice_inplace, select_topk_softmax,
-    sigmoidf, softmax,
+    sigmoidf, silu_and_mul_inplace, softmax,
 };
 use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
 use crate::engine::switches::{
@@ -49,25 +49,155 @@ fn alloc_u8(len: usize, label: &str) -> Result<Vec<u8>, String> {
 }
 
 fn quantize_row_q8(src: &[f32], dst: &mut [i8], scale_out: &mut f32) {
-    let mut max_abs = 0.0f32;
-    for &x in src {
-        max_abs = max_abs.max(x.abs());
-    }
-    if max_abs == 0.0 {
-        *scale_out = 1.0;
-        dst.fill(0);
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let n = src.len();
+        // Vectorized abs-max scan
+        let max_abs = unsafe {
+            let mut vmax = vdupq_n_f32(0.0f32);
+            let mut i = 0usize;
+            while i + 16 <= n {
+                let v0 = vabsq_f32(vld1q_f32(src.as_ptr().add(i)));
+                let v1 = vabsq_f32(vld1q_f32(src.as_ptr().add(i + 4)));
+                let v2 = vabsq_f32(vld1q_f32(src.as_ptr().add(i + 8)));
+                let v3 = vabsq_f32(vld1q_f32(src.as_ptr().add(i + 12)));
+                vmax = vmaxq_f32(vmax, vmaxq_f32(vmaxq_f32(v0, v1), vmaxq_f32(v2, v3)));
+                i += 16;
+            }
+            while i + 4 <= n {
+                vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(src.as_ptr().add(i))));
+                i += 4;
+            }
+            let mut m = vmaxvq_f32(vmax);
+            while i < n {
+                let a = src[i].abs();
+                if a > m { m = a; }
+                i += 1;
+            }
+            m
+        };
+        if max_abs == 0.0 {
+            *scale_out = 1.0;
+            dst.fill(0);
+            return;
+        }
+        *scale_out = max_abs / 127.0;
+        let inv = 127.0 / max_abs;
+        // Vectorized quantize
+        unsafe {
+            let vinv = vdupq_n_f32(inv);
+            let vmin = vdupq_n_f32(-127.0);
+            let vmax = vdupq_n_f32(127.0);
+            let mut i = 0usize;
+            let dst_ptr = dst.as_mut_ptr();
+            while i + 16 <= n {
+                let f0 = vmaxq_f32(vmin, vminq_f32(vmax, vrndnq_f32(vmulq_f32(vld1q_f32(src.as_ptr().add(i)),      vinv))));
+                let f1 = vmaxq_f32(vmin, vminq_f32(vmax, vrndnq_f32(vmulq_f32(vld1q_f32(src.as_ptr().add(i + 4)),  vinv))));
+                let f2 = vmaxq_f32(vmin, vminq_f32(vmax, vrndnq_f32(vmulq_f32(vld1q_f32(src.as_ptr().add(i + 8)),  vinv))));
+                let f3 = vmaxq_f32(vmin, vminq_f32(vmax, vrndnq_f32(vmulq_f32(vld1q_f32(src.as_ptr().add(i + 12)), vinv))));
+                let i0 = vcombine_s16(vmovn_s32(vcvtq_s32_f32(f0)), vmovn_s32(vcvtq_s32_f32(f1)));
+                let i1 = vcombine_s16(vmovn_s32(vcvtq_s32_f32(f2)), vmovn_s32(vcvtq_s32_f32(f3)));
+                vst1q_s8(dst_ptr.add(i), vcombine_s8(vmovn_s16(i0), vmovn_s16(i1)));
+                i += 16;
+            }
+            while i < n {
+                dst[i] = (src[i] * inv).round().clamp(-127.0, 127.0) as i8;
+                i += 1;
+            }
+        }
         return;
     }
-    let inv = 127.0 / max_abs;
-    let scale = max_abs / 127.0;
-    *scale_out = scale;
-    for (i, &x) in src.iter().enumerate() {
-        let q = (x * inv).round().clamp(-127.0, 127.0) as i8;
-        dst[i] = q;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut max_abs = 0.0f32;
+        for &x in src {
+            max_abs = max_abs.max(x.abs());
+        }
+        if max_abs == 0.0 {
+            *scale_out = 1.0;
+            dst.fill(0);
+            return;
+        }
+        let inv = 127.0 / max_abs;
+        *scale_out = max_abs / 127.0;
+        for (i, &x) in src.iter().enumerate() {
+            dst[i] = (x * inv).round().clamp(-127.0, 127.0) as i8;
+        }
     }
 }
 
-fn quantize_row_q4(src: &[f32], dst: &mut [u8], base_elem: usize, scale_out: &mut f32) {
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_q8_row_neon(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
+    use std::arch::aarch64::*;
+    let n = q.len();
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    let q_ptr = q.as_ptr();
+    let k_ptr = cache.as_ptr().add(row_offset);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let kv = vld1q_s8(k_ptr.add(i));
+        let k_lo = vmovl_s8(vget_low_s8(kv));
+        let k_hi = vmovl_s8(vget_high_s8(kv));
+        let k0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(k_lo)));
+        let k1 = vcvtq_f32_s32(vmovl_high_s16(k_lo));
+        let k2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(k_hi)));
+        let k3 = vcvtq_f32_s32(vmovl_high_s16(k_hi));
+        acc0 = vfmaq_f32(acc0, vld1q_f32(q_ptr.add(i)),      k0);
+        acc1 = vfmaq_f32(acc1, vld1q_f32(q_ptr.add(i + 4)),  k1);
+        acc2 = vfmaq_f32(acc2, vld1q_f32(q_ptr.add(i + 8)),  k2);
+        acc3 = vfmaq_f32(acc3, vld1q_f32(q_ptr.add(i + 12)), k3);
+        i += 16;
+    }
+    let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+    while i < n {
+        sum += q[i] * cache[row_offset + i] as f32;
+        i += 1;
+    }
+    sum * scale
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn axpy_q8_row_neon(dst: &mut [f32], a: f32, cache: &[i8], row_offset: usize, scale: f32) {
+    use std::arch::aarch64::*;
+    let n = dst.len();
+    let scaled = vdupq_n_f32(a * scale);
+    let dst_ptr = dst.as_mut_ptr();
+    let k_ptr = cache.as_ptr().add(row_offset);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let kv = vld1q_s8(k_ptr.add(i));
+        let k_lo = vmovl_s8(vget_low_s8(kv));
+        let k_hi = vmovl_s8(vget_high_s8(kv));
+        let k0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(k_lo)));
+        let k1 = vcvtq_f32_s32(vmovl_high_s16(k_lo));
+        let k2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(k_hi)));
+        let k3 = vcvtq_f32_s32(vmovl_high_s16(k_hi));
+        vst1q_f32(dst_ptr.add(i),      vfmaq_f32(vld1q_f32(dst_ptr.add(i)),      scaled, k0));
+        vst1q_f32(dst_ptr.add(i + 4),  vfmaq_f32(vld1q_f32(dst_ptr.add(i + 4)),  scaled, k1));
+        vst1q_f32(dst_ptr.add(i + 8),  vfmaq_f32(vld1q_f32(dst_ptr.add(i + 8)),  scaled, k2));
+        vst1q_f32(dst_ptr.add(i + 12), vfmaq_f32(vld1q_f32(dst_ptr.add(i + 12)), scaled, k3));
+        i += 16;
+    }
+    let scalar = a * scale;
+    while i < n {
+        dst[i] += scalar * cache[row_offset + i] as f32;
+        i += 1;
+    }
+}
+
+/// Block size for Q4 KV cache quantization. Each block gets its own scale factor,
+/// matching the Q4_0 standard. Smaller blocks preserve more precision by limiting
+/// the impact of outlier activations.
+const Q4_BLOCK_SIZE: usize = 32;
+
+fn quantize_q4_block(src: &[f32], dst: &mut [u8], base_elem: usize, scale_out: &mut f32) {
+    debug_assert_eq!(src.len(), Q4_BLOCK_SIZE);
     let mut max_abs = 0.0f32;
     for &x in src {
         max_abs = max_abs.max(x.abs());
@@ -118,37 +248,63 @@ fn dequant_q4_at(src: &[u8], elem_idx: usize) -> i8 {
 
 #[inline]
 fn dot_q8_row(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
-    let mut acc = 0.0f32;
-    for (i, &qv) in q.iter().enumerate() {
-        acc += qv * (cache[row_offset + i] as f32 * scale);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_q8_row_neon(q, cache, row_offset, scale);
     }
-    acc
+    #[allow(unreachable_code)]
+    {
+        let mut acc = 0.0f32;
+        for (i, &qv) in q.iter().enumerate() {
+            acc += qv * (cache[row_offset + i] as f32 * scale);
+        }
+        acc
+    }
 }
 
 #[inline]
 fn axpy_q8_row(dst: &mut [f32], a: f32, cache: &[i8], row_offset: usize, scale: f32) {
-    let scaled = a * scale;
-    for (i, d) in dst.iter_mut().enumerate() {
-        *d += scaled * cache[row_offset + i] as f32;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        axpy_q8_row_neon(dst, a, cache, row_offset, scale);
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let scaled = a * scale;
+        for (i, d) in dst.iter_mut().enumerate() {
+            *d += scaled * cache[row_offset + i] as f32;
+        }
     }
 }
 
+
+/// Dot product of `q` against a Q4-quantized row in `cache` starting at element `row_offset`.
+/// `scales` has one scale per `Q4_BLOCK_SIZE`-element block covering `q.len()` elements.
 #[inline]
-fn dot_q4_row(q: &[f32], cache: &[u8], row_offset: usize, scale: f32) -> f32 {
+fn dot_q4_row(q: &[f32], cache: &[u8], row_offset: usize, scales: &[f32]) -> f32 {
     let mut acc = 0.0f32;
-    for (i, &qv) in q.iter().enumerate() {
-        let v = dequant_q4_at(cache, row_offset + i) as f32 * scale;
-        acc += qv * v;
+    for (bi, &scale) in scales.iter().enumerate() {
+        let start = bi * Q4_BLOCK_SIZE;
+        let end = (start + Q4_BLOCK_SIZE).min(q.len());
+        for i in start..end {
+            acc += q[i] * dequant_q4_at(cache, row_offset + i) as f32 * scale;
+        }
     }
     acc
 }
 
+/// Accumulate `a * scale * cached_q4` into `dst`.
+/// `scales` has one scale per `Q4_BLOCK_SIZE`-element block covering `dst.len()` elements.
 #[inline]
-fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scale: f32) {
-    let scaled = a * scale;
-    for (i, d) in dst.iter_mut().enumerate() {
-        let v = dequant_q4_at(cache, row_offset + i) as f32;
-        *d += scaled * v;
+fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scales: &[f32]) {
+    for (bi, &scale) in scales.iter().enumerate() {
+        let start = bi * Q4_BLOCK_SIZE;
+        let end = (start + Q4_BLOCK_SIZE).min(dst.len());
+        let coeff = a * scale;
+        for i in start..end {
+            dst[i] += coeff * dequant_q4_at(cache, row_offset + i) as f32;
+        }
     }
 }
 
@@ -361,8 +517,10 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         value_cache_q8,
         key_cache_q4,
         value_cache_q4,
-        key_cache_scale: alloc_f32(kv_cache_rows, "KV key scale buffer")?,
-        value_cache_scale: alloc_f32(kv_cache_rows, "KV value scale buffer")?,
+        // Q4 mode uses one scale per Q4_BLOCK_SIZE-element block per row. Q8 uses one scale
+        // per row. Allocate the larger Q4 layout; Q8 uses only the first kv_cache_rows entries.
+        key_cache_scale: alloc_f32(kv_cache_rows * (kv_dim / Q4_BLOCK_SIZE).max(1), "KV key scale buffer")?,
+        value_cache_scale: alloc_f32(kv_cache_rows * (kv_dim / Q4_BLOCK_SIZE).max(1), "KV value scale buffer")?,
         rope_freqs,
         rope_freqs_swa,
         rope_cos: vec![0.0; rope_size],
@@ -652,18 +810,26 @@ fn transformer_inner(
                     );
                 }
                 KvCacheFormat::Q4 => {
-                    quantize_row_q4(
-                        &s.k[..kv_dim],
-                        &mut s.key_cache_q4,
-                        row_elem_offset,
-                        &mut s.key_cache_scale[row_index],
-                    );
-                    quantize_row_q4(
-                        &s.v[..kv_dim],
-                        &mut s.value_cache_q4,
-                        row_elem_offset,
-                        &mut s.value_cache_scale[row_index],
-                    );
+                    // Quantize in Q4_BLOCK_SIZE-element blocks so each block has its own scale,
+                    // preventing outlier activations in one block from zeroing out other blocks.
+                    let n_blocks = kv_dim / Q4_BLOCK_SIZE;
+                    let scale_base = row_index * n_blocks;
+                    for b in 0..n_blocks {
+                        let src_start = b * Q4_BLOCK_SIZE;
+                        let elem_off = row_elem_offset + src_start;
+                        quantize_q4_block(
+                            &s.k[src_start..src_start + Q4_BLOCK_SIZE],
+                            &mut s.key_cache_q4,
+                            elem_off,
+                            &mut s.key_cache_scale[scale_base + b],
+                        );
+                        quantize_q4_block(
+                            &s.v[src_start..src_start + Q4_BLOCK_SIZE],
+                            &mut s.value_cache_q4,
+                            elem_off,
+                            &mut s.value_cache_scale[scale_base + b],
+                        );
+                    }
                 }
             }
 
@@ -677,6 +843,9 @@ fn transformer_inner(
             let value_cache_q4 = &s.value_cache_q4;
             let key_scales = &s.key_cache_scale;
             let value_scales = &s.value_cache_scale;
+            // Number of Q4 scale blocks per full kv_dim row; head_size/Q4_BLOCK_SIZE per KV head.
+            let n_blocks_per_row = kv_dim / Q4_BLOCK_SIZE;
+            let blocks_per_head = head_size / Q4_BLOCK_SIZE;
             let (att_all, xb_all) = (&mut s.att[..p.n_heads * p.seq_len], &mut s.xb[..q_dim]);
 
             if p.n_heads >= par_attn_min_heads() {
@@ -691,6 +860,9 @@ fn transformer_inner(
                         let kv_head_offset = kv_head * head_size;
 
                         let att_head = &mut att_head_full[..=pos];
+                        // Scale slice for this KV head: blocks_per_head blocks starting at
+                        // the head's block offset within the row.
+                        let head_block_off = kv_head * blocks_per_head;
                         for (t, slot) in att_head.iter_mut().enumerate() {
                             let t_row = layer_row_base + t;
                             let row_offset = t_row * kv_dim + kv_head_offset;
@@ -699,7 +871,8 @@ fn transformer_inner(
                                     dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
                                 }
                                 KvCacheFormat::Q4 => {
-                                    dot_q4_row(q_head, key_cache_q4, row_offset, key_scales[t_row])
+                                    let sb = t_row * n_blocks_per_row + head_block_off;
+                                    dot_q4_row(q_head, key_cache_q4, row_offset, &key_scales[sb..sb + blocks_per_head])
                                 }
                             };
                             if apply_attn_scale {
@@ -722,13 +895,16 @@ fn transformer_inner(
                                     row_offset,
                                     value_scales[t_row],
                                 ),
-                                KvCacheFormat::Q4 => axpy_q4_row(
-                                    xb_head,
-                                    a,
-                                    value_cache_q4,
-                                    row_offset,
-                                    value_scales[t_row],
-                                ),
+                                KvCacheFormat::Q4 => {
+                                    let sb = t_row * n_blocks_per_row + head_block_off;
+                                    axpy_q4_row(
+                                        xb_head,
+                                        a,
+                                        value_cache_q4,
+                                        row_offset,
+                                        &value_scales[sb..sb + blocks_per_head],
+                                    );
+                                }
                             }
                         }
                     });
@@ -738,6 +914,7 @@ fn transformer_inner(
                     let q_head = &q_all[hs..hs + head_size];
                     let kv_head = h / kv_mul;
                     let kv_head_offset = kv_head * head_size;
+                    let head_block_off = kv_head * blocks_per_head;
                     let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
                     let att_head = &mut att_head_full[..=pos];
 
@@ -749,7 +926,8 @@ fn transformer_inner(
                                 dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
                             }
                             KvCacheFormat::Q4 => {
-                                dot_q4_row(q_head, key_cache_q4, row_offset, key_scales[t_row])
+                                let sb = t_row * n_blocks_per_row + head_block_off;
+                                dot_q4_row(q_head, key_cache_q4, row_offset, &key_scales[sb..sb + blocks_per_head])
                             }
                         };
                         if apply_attn_scale {
@@ -773,13 +951,16 @@ fn transformer_inner(
                                 row_offset,
                                 value_scales[t_row],
                             ),
-                            KvCacheFormat::Q4 => axpy_q4_row(
-                                xb_head,
-                                a,
-                                value_cache_q4,
-                                row_offset,
-                                value_scales[t_row],
-                            ),
+                            KvCacheFormat::Q4 => {
+                                let sb = t_row * n_blocks_per_row + head_block_off;
+                                axpy_q4_row(
+                                    xb_head,
+                                    a,
+                                    value_cache_q4,
+                                    row_offset,
+                                    &value_scales[sb..sb + blocks_per_head],
+                                );
+                            }
                         }
                     }
                 }
@@ -904,9 +1085,7 @@ fn transformer_inner(
                     dim,
                     mapped,
                 )?;
-                for i in 0..dim {
-                    s.xb[i] += route_weight * s.moe_tmp[i];
-                }
+                crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], route_weight, &s.moe_tmp[..dim]);
             }
 
             if p.is_qwen3next && !w.moe_shared_gate_inp.is_empty() {
@@ -921,19 +1100,14 @@ fn transformer_inner(
 
                 matmul_quantized(&mut s.hb[..shared_hidden], &s.xb2[..dim], &w.w1[l], mapped)?;
                 matmul_quantized(&mut s.hb2[..shared_hidden], &s.xb2[..dim], &w.w3[l], mapped)?;
-                for i in 0..shared_hidden {
-                    let v = s.hb[i];
-                    s.hb[i] = (v * (1.0 / (1.0 + (-v).exp()))) * s.hb2[i];
-                }
+                silu_and_mul_inplace(&mut s.hb[..shared_hidden], &s.hb2[..shared_hidden]);
                 matmul_quantized(
                     &mut s.moe_tmp[..dim],
                     &s.hb[..shared_hidden],
                     &w.w2[l],
                     mapped,
                 )?;
-                for i in 0..dim {
-                    s.xb[i] += gate * s.moe_tmp[i];
-                }
+                crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], gate, &s.moe_tmp[..dim]);
             }
             prof_end(&PROF_MOE_NS, moe_prof);
         } else {
@@ -949,10 +1123,7 @@ fn transformer_inner(
                     s.hb[i] = gelu * s.hb2[i];
                 }
             } else {
-                for i in 0..hidden_dim {
-                    let v = s.hb[i];
-                    s.hb[i] = (v * (1.0 / (1.0 + (-v).exp()))) * s.hb2[i];
-                }
+                silu_and_mul_inplace(&mut s.hb[..hidden_dim], &s.hb2[..hidden_dim]);
             }
 
             matmul_quantized(&mut s.xb[..dim], &s.hb[..hidden_dim], &w.w2[l], mapped)?;

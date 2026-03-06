@@ -4,52 +4,128 @@ use crate::engine::kernels::{
     axpy_inplace, dot_f32_simd, matmul_quantized, matmul_quantized_rows, scale_slice_inplace,
 };
 use crate::engine::profiling::{prof_end, prof_start, PROF_SSM_NS};
-use crate::engine::switches::par_qwen3next_min_heads;
+use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows, par_qwen3next_min_heads};
 use crate::engine::types::{Config, RunState, TransformerWeights};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 pub(crate) fn accum(a: &mut [f32], b: &[f32], size: usize) {
-    for i in 0..size {
-        a[i] += b[i];
-    }
+    use crate::engine::kernels::axpy_inplace;
+    axpy_inplace(&mut a[..size], 1.0, &b[..size]);
 }
 
 pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
-    let mut ss = 0.0f32;
-    for i in 0..size {
-        ss += x[i] * x[i];
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut j = 0usize;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        while j + 16 <= size {
+            let x0 = vld1q_f32(x.as_ptr().add(j));
+            let x1 = vld1q_f32(x.as_ptr().add(j + 4));
+            let x2 = vld1q_f32(x.as_ptr().add(j + 8));
+            let x3 = vld1q_f32(x.as_ptr().add(j + 12));
+            acc0 = vfmaq_f32(acc0, x0, x0);
+            acc1 = vfmaq_f32(acc1, x1, x1);
+            acc2 = vfmaq_f32(acc2, x2, x2);
+            acc3 = vfmaq_f32(acc3, x3, x3);
+            j += 16;
+        }
+        let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while j + 4 <= size {
+            let xv = vld1q_f32(x.as_ptr().add(j));
+            acc = vfmaq_f32(acc, xv, xv);
+            j += 4;
+        }
+        let mut ss = vaddvq_f32(acc);
+        while j < size { ss += x[j] * x[j]; j += 1; }
+        ss /= size as f32;
+        ss += eps;
+        let scale = vdupq_n_f32(1.0 / ss.sqrt());
+        j = 0;
+        while j + 4 <= size {
+            let xv = vld1q_f32(x.as_ptr().add(j));
+            let wv = vld1q_f32(weight.as_ptr().add(j));
+            vst1q_f32(o.as_mut_ptr().add(j), vmulq_f32(wv, vmulq_f32(xv, scale)));
+            j += 4;
+        }
+        while j < size { o[j] = weight[j] * (vgetq_lane_f32(scale, 0) * x[j]); j += 1; }
+        return;
     }
-    ss /= size as f32;
-    ss += eps;
-    let ss = 1.0 / ss.sqrt();
-    for i in 0..size {
-        o[i] = weight[i] * (ss * x[i]);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut ss = 0.0f32;
+        for i in 0..size {
+            ss += x[i] * x[i];
+        }
+        ss /= size as f32;
+        ss += eps;
+        let ss = 1.0 / ss.sqrt();
+        for i in 0..size {
+            o[i] = weight[i] * (ss * x[i]);
+        }
     }
 }
 
 pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
-    let mut ss = 0.0f32;
-    for i in 0..size {
-        ss += x[i] * x[i];
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut j = 0usize;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        while j + 16 <= size {
+            let x0 = vld1q_f32(x.as_ptr().add(j));
+            let x1 = vld1q_f32(x.as_ptr().add(j + 4));
+            let x2 = vld1q_f32(x.as_ptr().add(j + 8));
+            let x3 = vld1q_f32(x.as_ptr().add(j + 12));
+            acc0 = vfmaq_f32(acc0, x0, x0);
+            acc1 = vfmaq_f32(acc1, x1, x1);
+            acc2 = vfmaq_f32(acc2, x2, x2);
+            acc3 = vfmaq_f32(acc3, x3, x3);
+            j += 16;
+        }
+        let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while j + 4 <= size {
+            let xv = vld1q_f32(x.as_ptr().add(j));
+            acc = vfmaq_f32(acc, xv, xv);
+            j += 4;
+        }
+        let mut ss = vaddvq_f32(acc);
+        while j < size { ss += x[j] * x[j]; j += 1; }
+        ss /= size as f32;
+        ss += eps;
+        let scale = vdupq_n_f32(1.0 / ss.sqrt());
+        j = 0;
+        while j + 4 <= size {
+            let xv = vld1q_f32(x.as_ptr().add(j));
+            let wv = vld1q_f32(weight.as_ptr().add(j));
+            vst1q_f32(x.as_mut_ptr().add(j), vmulq_f32(wv, vmulq_f32(xv, scale)));
+            j += 4;
+        }
+        while j < size { x[j] = weight[j] * (vgetq_lane_f32(scale, 0) * x[j]); j += 1; }
+        return;
     }
-    ss /= size as f32;
-    ss += eps;
-    let ss = 1.0 / ss.sqrt();
-    for i in 0..size {
-        x[i] = weight[i] * (ss * x[i]);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut ss = 0.0f32;
+        for i in 0..size {
+            ss += x[i] * x[i];
+        }
+        ss /= size as f32;
+        ss += eps;
+        let ss = 1.0 / ss.sqrt();
+        for i in 0..size {
+            x[i] = weight[i] * (ss * x[i]);
+        }
     }
 }
 
 pub(crate) fn rmsnorm_gemma(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
-    let mut ss = 0.0f32;
-    for i in 0..size {
-        ss += x[i] * x[i];
-    }
-    ss /= size as f32;
-    ss += eps;
-    let ss = 1.0 / ss.sqrt();
-    for i in 0..size {
-        o[i] = weight[i] * (ss * x[i]);
-    }
+    rmsnorm(o, x, weight, size, eps);
 }
 
 pub(crate) fn rmsnorm_per_head_gemma_inplace(
@@ -75,22 +151,163 @@ pub(crate) fn rmsnorm_per_head_gemma_inplace(
 }
 
 pub(crate) fn softmax(x: &mut [f32], size: usize) {
-    let mut max_val = x[0];
-    for &v in x.iter().take(size).skip(1) {
-        if v > max_val {
-            max_val = v;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let ptr = x.as_mut_ptr();
+
+        // Pass 1: vectorized max scan
+        let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+        let mut i = 0usize;
+        while i + 4 <= size {
+            vmax = vmaxq_f32(vmax, vld1q_f32(ptr.add(i)));
+            i += 4;
+        }
+        let mut max_val = vmaxvq_f32(vmax);
+        while i < size {
+            let v = *ptr.add(i);
+            if v > max_val { max_val = v; }
+            i += 1;
+        }
+
+        // Pass 2: exp(x[i] - max), accumulate sum
+        // Same degree-5 polynomial exp approximation as silu_and_mul_inplace
+        let log2e  = vdupq_n_f32(1.442_695_04_f32);
+        let ln2_hi = vdupq_n_f32(0.693_359_375_f32);
+        let ln2_lo = vdupq_n_f32(-2.121_944_4e-4_f32);
+        let one    = vdupq_n_f32(1.0_f32);
+        let c2     = vdupq_n_f32(0.5_f32);
+        let c3     = vdupq_n_f32(1.0_f32 / 6.0_f32);
+        let c4     = vdupq_n_f32(1.0_f32 / 24.0_f32);
+        let c5     = vdupq_n_f32(1.0_f32 / 120.0_f32);
+        let exp_lo = vdupq_n_f32(-88.0_f32);
+        let vmv    = vdupq_n_f32(max_val);
+        let mut vsum = vdupq_n_f32(0.0_f32);
+        i = 0;
+        while i + 4 <= size {
+            // x[i] - max, clamped to [-88, 0]
+            let xv = vmaxq_f32(vsubq_f32(vld1q_f32(ptr.add(i)), vmv), exp_lo);
+            // Range reduction: xv = n_f*ln2 + r
+            let n_f  = vrndnq_f32(vmulq_f32(xv, log2e));
+            let r    = vfmsq_f32(vfmsq_f32(xv, n_f, ln2_hi), n_f, ln2_lo);
+            // Horner: 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
+            let mut poly = vfmaq_f32(c4, r, c5);
+            poly = vfmaq_f32(c3, r, poly);
+            poly = vfmaq_f32(c2, r, poly);
+            poly = vfmaq_f32(one, r, poly);
+            poly = vfmaq_f32(one, r, poly);
+            // Scale by 2^n
+            let ni  = vcvtq_s32_f32(n_f);
+            let p2n = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
+            let ev  = vmulq_f32(poly, p2n);
+            vsum = vaddq_f32(vsum, ev);
+            vst1q_f32(ptr.add(i), ev);
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(vsum);
+        while i < size {
+            let v = (*ptr.add(i) - max_val).exp();
+            *ptr.add(i) = v;
+            sum += v;
+            i += 1;
+        }
+
+        // Pass 3: normalize
+        let inv_sum = vdupq_n_f32(1.0_f32 / sum);
+        i = 0;
+        while i + 4 <= size {
+            vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), inv_sum));
+            i += 4;
+        }
+        while i < size {
+            *ptr.add(i) /= sum;
+            i += 1;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut max_val = x[0];
+        for &v in x.iter().take(size).skip(1) {
+            if v > max_val {
+                max_val = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        for i in 0..size {
+            x[i] = (x[i] - max_val).exp();
+            sum += x[i];
+        }
+        let inv_sum = 1.0 / sum;
+        for i in 0..size {
+            x[i] *= inv_sum;
         }
     }
+}
 
-    let mut sum = 0.0f32;
-    for i in 0..size {
-        x[i] = (x[i] - max_val).exp();
-        sum += x[i];
+/// Fused SiLU-and-multiply: `hb[i] = silu(hb[i]) * hb2[i]` for all i.
+/// aarch64: vectorized with a degree-5 polynomial exp approximation (4 elements/iteration).
+/// Other: scalar fallback using libm expf.
+pub(crate) fn silu_and_mul_inplace(hb: &mut [f32], hb2: &[f32]) {
+    debug_assert_eq!(hb.len(), hb2.len());
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        // Range-reduction constants for exp(x): x = n*ln2 + r, |r| <= ln2/2
+        let log2e  = vdupq_n_f32(1.442_695_04_f32);
+        let ln2_hi = vdupq_n_f32(0.693_359_375_f32);       // upper part of ln2
+        let ln2_lo = vdupq_n_f32(-2.121_944_4e-4_f32);     // lower part of ln2
+        let one    = vdupq_n_f32(1.0_f32);
+        // Polynomial coefficients for exp(r), r in [-ln2/2, ln2/2]
+        // 5th-order Taylor: 1 + r + r^2/2! + r^3/3! + r^4/4! + r^5/5!
+        let c2 = vdupq_n_f32(0.5_f32);
+        let c3 = vdupq_n_f32(1.0_f32 / 6.0_f32);
+        let c4 = vdupq_n_f32(1.0_f32 / 24.0_f32);
+        let c5 = vdupq_n_f32(1.0_f32 / 120.0_f32);
+        // Clamp exp argument to prevent inf/nan
+        let exp_max = vdupq_n_f32(88.0_f32);
+        let exp_min = vdupq_n_f32(-88.0_f32);
+        let n = hb.len();
+        let p = hb.as_mut_ptr();
+        let q = hb2.as_ptr();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let v    = vld1q_f32(p.add(i));
+            let gate = vld1q_f32(q.add(i));
+            // exp(-v) for sigmoid(v) = 1/(1+exp(-v))
+            let nx = vminq_f32(vmaxq_f32(vnegq_f32(v), exp_min), exp_max);
+            // Range reduction: nx = n_f*ln2 + r
+            let n_f = vrndnq_f32(vmulq_f32(nx, log2e));
+            let r   = vfmsq_f32(vfmsq_f32(nx, n_f, ln2_hi), n_f, ln2_lo);
+            // Horner evaluation: 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
+            let mut poly = vfmaq_f32(c4, r, c5);
+            poly = vfmaq_f32(c3, r, poly);
+            poly = vfmaq_f32(c2, r, poly);
+            poly = vfmaq_f32(one, r, poly);
+            poly = vfmaq_f32(one, r, poly);
+            // Scale by 2^n via exponent field manipulation
+            let ni   = vcvtq_s32_f32(n_f);
+            let p2n  = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
+            let exp_neg_v = vmulq_f32(poly, p2n);
+            // sigmoid = 1 / (1 + exp(-v)); use one Newton-Raphson step for ~23-bit accuracy
+            let denom = vaddq_f32(one, exp_neg_v);
+            let rec   = vrecpeq_f32(denom);
+            let rec   = vmulq_f32(vrecpsq_f32(denom, rec), rec);
+            // result = v * sigmoid(v) * gate
+            vst1q_f32(p.add(i), vmulq_f32(vmulq_f32(v, gate), rec));
+            i += 4;
+        }
+        while i < n {
+            let v = *p.add(i);
+            *p.add(i) = (v / (1.0_f32 + (-v).exp())) * *q.add(i);
+            i += 1;
+        }
+        return;
     }
-
-    let inv_sum = 1.0 / sum;
-    for i in 0..size {
-        x[i] *= inv_sum;
+    #[allow(unreachable_code)]
+    for (h, &g) in hb.iter_mut().zip(hb2.iter()) {
+        let v = *h;
+        *h = (v / (1.0_f32 + (-v).exp())) * g;
     }
 }
 
@@ -519,8 +736,22 @@ pub(crate) fn matmul_f32_embeddings(
     rows: usize,
     cols: usize,
 ) {
-    for r in 0..rows {
-        let row = &emb[r * cols..(r + 1) * cols];
-        logits[r] = dot_f32_simd(row, &x[..cols]);
+    if rows >= par_matmul_min_rows() {
+        let chunk = par_matmul_chunk_rows();
+        logits[..rows]
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, out)| {
+                let base = ci * chunk;
+                for (j, slot) in out.iter_mut().enumerate() {
+                    let row = &emb[(base + j) * cols..(base + j + 1) * cols];
+                    *slot = dot_f32_simd(row, &x[..cols]);
+                }
+            });
+    } else {
+        for r in 0..rows {
+            let row = &emb[r * cols..(r + 1) * cols];
+            logits[r] = dot_f32_simd(row, &x[..cols]);
+        }
     }
 }

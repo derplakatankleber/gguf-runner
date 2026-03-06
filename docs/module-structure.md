@@ -242,7 +242,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including x86 AVX-VNNI/AVX512-VNNI Q8 paths), MR4 validation.
+- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including x86 AVX-VNNI/AVX512-VNNI Q8 paths and x86 Q4_K/Q5_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, and architecture-specific matmul row prefetch helpers (x86 + aarch64).
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
 ### `src/engine/runtime/*`
@@ -258,6 +258,7 @@ src/
   - quantized KV cache storage for attention state:
     - default Q8 cache
     - automatic Q4 fallback when Q8 allocation fails
+  - aarch64 attention helpers include NEON-accelerated block-scale Q8/Q4 KV dot+axpy paths for per-head cached key/value reads
 - `runtime/parallel.rs`:
   - `configure_rayon_threads(...)`
 - `runtime/mod.rs`:
@@ -271,8 +272,10 @@ src/
 - Includes:
   - `RuntimeSwitchConfig` (engine-owned overrides struct)
   - Parallel thresholds (`par_matmul_min_rows`, `par_matmul_chunk_rows`, `par_attn_min_heads`, `par_qwen3next_min_heads`)
+  - AArch64 matmul row prefetch distance switch (`aarch64_matmul_prefetch_rows`)
   - KV cache selection switch (`kv_cache_mode`: `auto` / `q8` / `q4`)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
+    - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
   - Layer debug toggles
   - MR4 status atomics
   - `init_runtime_config(&RuntimeSwitchConfig)`.

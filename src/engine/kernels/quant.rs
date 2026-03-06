@@ -2,12 +2,13 @@
 
 use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, read_u32_le};
 use crate::engine::profiling::{prof_end, prof_start, PROF_MATMUL_NS};
-use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::{
-    use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4, AARCH64_Q4K_MR4_STATUS,
-    AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS, AARCH64_Q8_0_MR2_STATUS,
+    aarch64_matmul_prefetch_rows, use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
+    AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS,
+    AARCH64_Q8_0_MR2_STATUS,
 };
+use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
     use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_avx_vnni, use_x86_f16c, use_x86_qk_mr4,
@@ -96,6 +97,61 @@ fn x86_prefetch_row(
         unsafe {
             _mm_prefetch(mapped.as_ptr().add(pf_off) as *const i8, _MM_HINT_T0);
         }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn aarch64_prefetch_row(
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    row_idx: usize,
+    total_rows: usize,
+) {
+    let dist = aarch64_matmul_prefetch_rows();
+    if dist == 0 {
+        return;
+    }
+    let Some(pf_row) = row_idx.checked_add(dist) else {
+        return;
+    };
+    if pf_row >= total_rows {
+        return;
+    }
+    let Some(pf_off) = pf_row
+        .checked_mul(row_size)
+        .and_then(|off| data_offset.checked_add(off))
+    else {
+        return;
+    };
+    if pf_off < mapped.len() {
+        let ptr = unsafe { mapped.as_ptr().add(pf_off) };
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+    }
+}
+
+#[inline(always)]
+fn matmul_prefetch_row(
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    row_idx: usize,
+    total_rows: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_prefetch_row(mapped, data_offset, row_size, row_idx, total_rows);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64_prefetch_row(mapped, data_offset, row_size, row_idx, total_rows);
     }
 }
 
@@ -1153,6 +1209,39 @@ unsafe fn sum_i8_32_ptr(v: *const i8) -> i32 {
         sum += *v.add(i) as i32;
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn quantize_f32_block_i8_32(src: &[f32], dst: &mut [i8; QK8_0]) -> f32 {
+    debug_assert_eq!(src.len(), QK8_0);
+    let mut abs_max = 0.0f32;
+    for &v in src {
+        let a = v.abs();
+        if a > abs_max {
+            abs_max = a;
+        }
+    }
+    if abs_max == 0.0 {
+        dst.fill(0);
+        return 0.0;
+    }
+    let inv_scale = 127.0 / abs_max;
+    for i in 0..QK8_0 {
+        dst[i] = (src[i] * inv_scale).round().clamp(-127.0, 127.0) as i8;
+    }
+    abs_max / 127.0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn unpack_q4_nibbles_32(q: &[u8], lo: &mut [u8; QK8_0], hi: &mut [u8; QK8_0]) {
+    debug_assert_eq!(q.len(), QK8_0);
+    for i in 0..QK8_0 {
+        let qv = q[i];
+        lo[i] = qv & 0x0f;
+        hi[i] = qv >> 4;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2321,8 +2410,16 @@ pub(crate) fn matmul_qk_mr4_chunk(
     n: usize,
     ttype: i32,
 ) {
+    let total_rows = out.len();
     let mut i = 0usize;
     while i + 4 <= out.len() {
+        aarch64_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
         let row0_off = data_offset + (base_row + i) * row_size;
         let row1_off = row0_off + row_size;
         let row2_off = row1_off + row_size;
@@ -2344,6 +2441,13 @@ pub(crate) fn matmul_qk_mr4_chunk(
         i += 4;
     }
     while i < out.len() {
+        aarch64_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
         let row_off = data_offset + (base_row + i) * row_size;
         let row = &mapped[row_off..row_off + row_size];
         out[i] = match ttype {
@@ -2490,6 +2594,16 @@ pub(crate) fn vec_dot_q4_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
+    if use_x86_avx512_vnni_q8() {
+        unsafe {
+            return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+        }
+    }
+    if use_x86_avx_vnni() {
+        unsafe {
+            return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+        }
+    }
     if use_x86_avx2_fma() {
         unsafe {
             return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
@@ -2558,6 +2672,16 @@ pub(crate) fn vec_dot_q5_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
+    if use_x86_avx512_vnni_q8() {
+        unsafe {
+            return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+        }
+    }
+    if use_x86_avx_vnni() {
+        unsafe {
+            return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+        }
+    }
     if use_x86_avx2_fma() {
         unsafe {
             return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
@@ -2935,6 +3059,330 @@ unsafe fn vec_dot_q6_k_4rows_x86_avx2(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni,fma")]
+unsafe fn vec_dot_q4_k_4rows_x86_avxvnni(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            q_off[r] = off + 16;
+        }
+
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut x0_q = [0i8; QK8_0];
+            let mut x1_q = [0i8; QK8_0];
+            let x0_scale = quantize_f32_block_i8_32(x0, &mut x0_q);
+            let x1_scale = quantize_f32_block_i8_32(x1, &mut x1_q);
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+
+                let q = &rows[r][q_off[r]..q_off[r] + QK8_0];
+                let mut q_lo = [0u8; QK8_0];
+                let mut q_hi = [0u8; QK8_0];
+                unpack_q4_nibbles_32(q, &mut q_lo, &mut q_hi);
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avxvnni(q_lo.as_ptr(), x0_q.as_ptr()) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avxvnni(q_hi.as_ptr(), x1_q.as_ptr()) as f32 * x1_scale
+                };
+                sums[r] +=
+                    a_lo[r] * dot_lo - b_lo[r] * x0_sum + a_hi[r] * dot_hi - b_hi[r] * x1_sum;
+                q_off[r] += 32;
+            }
+            is += 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni,fma")]
+unsafe fn vec_dot_q5_k_4rows_x86_avxvnni(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut qh = [&[][..]; 4];
+        let mut ql_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            qh[r] = &rows[r][off + 16..off + 16 + QK_K / 8];
+            ql_off[r] = off + 16 + QK_K / 8;
+        }
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut x0_q = [0i8; QK8_0];
+            let mut x1_q = [0i8; QK8_0];
+            let x0_scale = quantize_f32_block_i8_32(x0, &mut x0_q);
+            let x1_scale = quantize_f32_block_i8_32(x1, &mut x1_q);
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+
+                let ql = &rows[r][ql_off[r]..ql_off[r] + QK8_0];
+                let mut lo_vals = [0u8; QK8_0];
+                let mut hi_vals = [0u8; QK8_0];
+                for l in 0..QK8_0 {
+                    let qv = ql[l];
+                    lo_vals[l] = (qv & 0x0f) + if (qh[r][l] & u1) != 0 { 16 } else { 0 };
+                    hi_vals[l] = (qv >> 4) + if (qh[r][l] & u2) != 0 { 16 } else { 0 };
+                }
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avxvnni(lo_vals.as_ptr(), x0_q.as_ptr()) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avxvnni(hi_vals.as_ptr(), x1_q.as_ptr()) as f32 * x1_scale
+                };
+                sums[r] +=
+                    a_lo[r] * dot_lo - b_lo[r] * x0_sum + a_hi[r] * dot_hi - b_hi[r] * x1_sum;
+                ql_off[r] += 32;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl,fma")]
+unsafe fn vec_dot_q4_k_4rows_x86_avx512vnni(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            q_off[r] = off + 16;
+        }
+
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut x0_q = [0i8; QK8_0];
+            let mut x1_q = [0i8; QK8_0];
+            let x0_scale = quantize_f32_block_i8_32(x0, &mut x0_q);
+            let x1_scale = quantize_f32_block_i8_32(x1, &mut x1_q);
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+
+                let q = &rows[r][q_off[r]..q_off[r] + QK8_0];
+                let mut q_lo = [0u8; QK8_0];
+                let mut q_hi = [0u8; QK8_0];
+                unpack_q4_nibbles_32(q, &mut q_lo, &mut q_hi);
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avx512vnni(q_lo.as_ptr(), x0_q.as_ptr()) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avx512vnni(q_hi.as_ptr(), x1_q.as_ptr()) as f32 * x1_scale
+                };
+                sums[r] +=
+                    a_lo[r] * dot_lo - b_lo[r] * x0_sum + a_hi[r] * dot_hi - b_hi[r] * x1_sum;
+                q_off[r] += 32;
+            }
+            is += 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl,fma")]
+unsafe fn vec_dot_q5_k_4rows_x86_avx512vnni(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut qh = [&[][..]; 4];
+        let mut ql_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            qh[r] = &rows[r][off + 16..off + 16 + QK_K / 8];
+            ql_off[r] = off + 16 + QK_K / 8;
+        }
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut x0_q = [0i8; QK8_0];
+            let mut x1_q = [0i8; QK8_0];
+            let x0_scale = quantize_f32_block_i8_32(x0, &mut x0_q);
+            let x1_scale = quantize_f32_block_i8_32(x1, &mut x1_q);
+            let mut a_lo = [0.0f32; 4];
+            let mut b_lo = [0.0f32; 4];
+            let mut a_hi = [0.0f32; 4];
+            let mut b_hi = [0.0f32; 4];
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                a_lo[r] = d[r] * sc1 as f32;
+                b_lo[r] = dmin[r] * m1 as f32;
+                a_hi[r] = d[r] * sc2 as f32;
+                b_hi[r] = dmin[r] * m2 as f32;
+
+                let ql = &rows[r][ql_off[r]..ql_off[r] + QK8_0];
+                let mut lo_vals = [0u8; QK8_0];
+                let mut hi_vals = [0u8; QK8_0];
+                for l in 0..QK8_0 {
+                    let qv = ql[l];
+                    lo_vals[l] = (qv & 0x0f) + if (qh[r][l] & u1) != 0 { 16 } else { 0 };
+                    hi_vals[l] = (qv >> 4) + if (qh[r][l] & u2) != 0 { 16 } else { 0 };
+                }
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avx512vnni(lo_vals.as_ptr(), x0_q.as_ptr()) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    dot_u8_i8_32_x86_avx512vnni(hi_vals.as_ptr(), x1_q.as_ptr()) as f32 * x1_scale
+                };
+                sums[r] +=
+                    a_lo[r] * dot_lo - b_lo[r] * x0_sum + a_hi[r] * dot_hi - b_hi[r] * x1_sum;
+                ql_off[r] += 32;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_qk_mr4_chunk_x86(
@@ -3188,8 +3636,7 @@ pub(crate) fn matmul_quantized(
                     |(chunk_idx, out_chunk)| {
                         let base_row = chunk_idx * chunk_rows;
                         for (j, out) in out_chunk.iter_mut().enumerate() {
-                            #[cfg(target_arch = "x86_64")]
-                            x86_prefetch_row(mapped, data_offset, row_size, base_row + j, d);
+                            matmul_prefetch_row(mapped, data_offset, row_size, base_row + j, d);
                             let row_off = data_offset + (base_row + j) * row_size;
                             let row = &mapped[row_off..row_off + row_size];
                             *out = $dot(x, row, n);
@@ -3198,8 +3645,7 @@ pub(crate) fn matmul_quantized(
                 );
             } else {
                 for (i, out) in xout[..d].iter_mut().enumerate() {
-                    #[cfg(target_arch = "x86_64")]
-                    x86_prefetch_row(mapped, data_offset, row_size, i, d);
+                    matmul_prefetch_row(mapped, data_offset, row_size, i, d);
                     let row_off = data_offset + i * row_size;
                     let row = &mapped[row_off..row_off + row_size];
                     *out = $dot(x, row, n);
@@ -3388,8 +3834,7 @@ pub(crate) fn matmul_quantized_rows(
                     |(chunk_idx, out_chunk)| {
                         let base_row = chunk_idx * chunk_rows;
                         for (j, out) in out_chunk.iter_mut().enumerate() {
-                            #[cfg(target_arch = "x86_64")]
-                            x86_prefetch_row(mapped, data_offset, row_size, base_row + j, d);
+                            matmul_prefetch_row(mapped, data_offset, row_size, base_row + j, d);
                             let row_start = data_offset + (base_row + j) * row_size;
                             let row = &mapped[row_start..row_start + row_size];
                             *out = $dot(x, row, n);
@@ -3398,8 +3843,7 @@ pub(crate) fn matmul_quantized_rows(
                 );
             } else {
                 for (i, out) in xout[..d].iter_mut().enumerate() {
-                    #[cfg(target_arch = "x86_64")]
-                    x86_prefetch_row(mapped, data_offset, row_size, i, d);
+                    matmul_prefetch_row(mapped, data_offset, row_size, i, d);
                     let row_start = data_offset + i * row_size;
                     let row = &mapped[row_start..row_start + row_size];
                     *out = $dot(x, row, n);

@@ -376,6 +376,92 @@ fn dequant_q4_at(src: &[u8], elem_idx: usize) -> i8 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn s8x8_to_f32x4x2(
+    v: std::arch::aarch64::int8x8_t,
+) -> (
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+) {
+    use std::arch::aarch64::*;
+    let s16 = vmovl_s8(v);
+    let lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+    let hi = vcvtq_f32_s32(vmovl_high_s16(s16));
+    (lo, hi)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_q4_block_neon(q_block: &[f32], cache: &[u8], elem_offset: usize) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(q_block.len(), Q4_BLOCK_SIZE);
+    debug_assert_eq!(elem_offset & 1, 0);
+
+    let packed_ptr = cache.as_ptr().add(elem_offset / 2);
+    let q_ptr = q_block.as_ptr();
+    let nib_mask = vdup_n_u8(0x0f);
+    let sign_xor = vdup_n_u8(0x08);
+    let sign_sub = vdup_n_s8(8);
+    let mut acc = vdupq_n_f32(0.0);
+
+    // 32 q4 values are packed into 16 bytes => process two 8-byte chunks.
+    for chunk in 0..2usize {
+        let packed = vld1_u8(packed_ptr.add(chunk * 8));
+        let lo_u = vand_u8(packed, nib_mask);
+        let hi_u = vshr_n_u8(packed, 4);
+        // Map unsigned nibble [0, 15] -> signed q4 [-8, 7].
+        let lo_s = vsub_s8(vreinterpret_s8_u8(veor_u8(lo_u, sign_xor)), sign_sub);
+        let hi_s = vsub_s8(vreinterpret_s8_u8(veor_u8(hi_u, sign_xor)), sign_sub);
+        let (lo_f0, lo_f1) = s8x8_to_f32x4x2(lo_s);
+        let (hi_f0, hi_f1) = s8x8_to_f32x4x2(hi_s);
+
+        let base = chunk * 16;
+        let x_pairs0 = vld2q_f32(q_ptr.add(base));
+        let x_pairs1 = vld2q_f32(q_ptr.add(base + 8));
+        acc = vfmaq_f32(acc, x_pairs0.0, lo_f0);
+        acc = vfmaq_f32(acc, x_pairs0.1, hi_f0);
+        acc = vfmaq_f32(acc, x_pairs1.0, lo_f1);
+        acc = vfmaq_f32(acc, x_pairs1.1, hi_f1);
+    }
+    vaddvq_f32(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn axpy_q4_block_neon(dst_block: &mut [f32], a: f32, cache: &[u8], elem_offset: usize) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(dst_block.len(), Q4_BLOCK_SIZE);
+    debug_assert_eq!(elem_offset & 1, 0);
+
+    let packed_ptr = cache.as_ptr().add(elem_offset / 2);
+    let dst_ptr = dst_block.as_mut_ptr();
+    let nib_mask = vdup_n_u8(0x0f);
+    let sign_xor = vdup_n_u8(0x08);
+    let sign_sub = vdup_n_s8(8);
+    let coeff = vdupq_n_f32(a);
+
+    for chunk in 0..2usize {
+        let packed = vld1_u8(packed_ptr.add(chunk * 8));
+        let lo_u = vand_u8(packed, nib_mask);
+        let hi_u = vshr_n_u8(packed, 4);
+        let lo_s = vsub_s8(vreinterpret_s8_u8(veor_u8(lo_u, sign_xor)), sign_sub);
+        let hi_s = vsub_s8(vreinterpret_s8_u8(veor_u8(hi_u, sign_xor)), sign_sub);
+        let (lo_f0, lo_f1) = s8x8_to_f32x4x2(lo_s);
+        let (hi_f0, hi_f1) = s8x8_to_f32x4x2(hi_s);
+
+        let base = chunk * 16;
+        let mut dst_pairs0 = vld2q_f32(dst_ptr.add(base));
+        let mut dst_pairs1 = vld2q_f32(dst_ptr.add(base + 8));
+        dst_pairs0.0 = vfmaq_f32(dst_pairs0.0, coeff, lo_f0);
+        dst_pairs0.1 = vfmaq_f32(dst_pairs0.1, coeff, hi_f0);
+        dst_pairs1.0 = vfmaq_f32(dst_pairs1.0, coeff, lo_f1);
+        dst_pairs1.1 = vfmaq_f32(dst_pairs1.1, coeff, hi_f1);
+        vst2q_f32(dst_ptr.add(base), dst_pairs0);
+        vst2q_f32(dst_ptr.add(base + 8), dst_pairs1);
+    }
+}
+
 #[inline]
 fn dot_q8_row(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -409,56 +495,263 @@ fn axpy_q8_row(dst: &mut [f32], a: f32, cache: &[i8], row_offset: usize, scale: 
 }
 
 #[inline]
-fn dot_q8_row_blocks(q: &[f32], cache: &[i8], row_offset: usize, scales: &[f32]) -> f32 {
+unsafe fn dot_q8_row_blocks_ptr(
+    q: &[f32],
+    cache: &[i8],
+    row_offset: usize,
+    scales_ptr: *const f32,
+    n_blocks: usize,
+) -> f32 {
     let mut acc = 0.0f32;
-    for (bi, &scale) in scales.iter().enumerate() {
+    let n_full = n_blocks.min(q.len() / Q4_BLOCK_SIZE);
+    let mut bi = 0usize;
+
+    while bi + 4 <= n_full {
+        let s0 = *scales_ptr.add(bi);
+        let s1 = *scales_ptr.add(bi + 1);
+        let s2 = *scales_ptr.add(bi + 2);
+        let s3 = *scales_ptr.add(bi + 3);
+        let b0 = bi * Q4_BLOCK_SIZE;
+        let b1 = b0 + Q4_BLOCK_SIZE;
+        let b2 = b1 + Q4_BLOCK_SIZE;
+        let b3 = b2 + Q4_BLOCK_SIZE;
+        acc += dot_q8_row(&q[b0..b1], cache, row_offset + b0, s0);
+        acc += dot_q8_row(&q[b1..b2], cache, row_offset + b1, s1);
+        acc += dot_q8_row(&q[b2..b3], cache, row_offset + b2, s2);
+        acc += dot_q8_row(&q[b3..b3 + Q4_BLOCK_SIZE], cache, row_offset + b3, s3);
+        bi += 4;
+    }
+    while bi < n_full {
         let start = bi * Q4_BLOCK_SIZE;
-        let end = (start + Q4_BLOCK_SIZE).min(q.len());
-        for i in start..end {
-            acc += q[i] * (cache[row_offset + i] as f32 * scale);
+        let end = start + Q4_BLOCK_SIZE;
+        acc += dot_q8_row(
+            &q[start..end],
+            cache,
+            row_offset + start,
+            *scales_ptr.add(bi),
+        );
+        bi += 1;
+    }
+    while bi < n_blocks {
+        let start = bi * Q4_BLOCK_SIZE;
+        if start >= q.len() {
+            break;
         }
+        let end = (start + Q4_BLOCK_SIZE).min(q.len());
+        acc += dot_q8_row(
+            &q[start..end],
+            cache,
+            row_offset + start,
+            *scales_ptr.add(bi),
+        );
+        bi += 1;
     }
     acc
 }
 
 #[inline]
-fn axpy_q8_row_blocks(dst: &mut [f32], a: f32, cache: &[i8], row_offset: usize, scales: &[f32]) {
-    for (bi, &scale) in scales.iter().enumerate() {
+unsafe fn axpy_q8_row_blocks_ptr(
+    dst: &mut [f32],
+    a: f32,
+    cache: &[i8],
+    row_offset: usize,
+    scales_ptr: *const f32,
+    n_blocks: usize,
+) {
+    let n_full = n_blocks.min(dst.len() / Q4_BLOCK_SIZE);
+    let mut bi = 0usize;
+
+    while bi + 4 <= n_full {
+        let s0 = *scales_ptr.add(bi);
+        let s1 = *scales_ptr.add(bi + 1);
+        let s2 = *scales_ptr.add(bi + 2);
+        let s3 = *scales_ptr.add(bi + 3);
+        let b0 = bi * Q4_BLOCK_SIZE;
+        let b1 = b0 + Q4_BLOCK_SIZE;
+        let b2 = b1 + Q4_BLOCK_SIZE;
+        let b3 = b2 + Q4_BLOCK_SIZE;
+        axpy_q8_row(&mut dst[b0..b1], a, cache, row_offset + b0, s0);
+        axpy_q8_row(&mut dst[b1..b2], a, cache, row_offset + b1, s1);
+        axpy_q8_row(&mut dst[b2..b3], a, cache, row_offset + b2, s2);
+        axpy_q8_row(
+            &mut dst[b3..b3 + Q4_BLOCK_SIZE],
+            a,
+            cache,
+            row_offset + b3,
+            s3,
+        );
+        bi += 4;
+    }
+    while bi < n_full {
         let start = bi * Q4_BLOCK_SIZE;
-        let end = (start + Q4_BLOCK_SIZE).min(dst.len());
-        let coeff = a * scale;
-        for i in start..end {
-            dst[i] += coeff * cache[row_offset + i] as f32;
+        let end = start + Q4_BLOCK_SIZE;
+        axpy_q8_row(
+            &mut dst[start..end],
+            a,
+            cache,
+            row_offset + start,
+            *scales_ptr.add(bi),
+        );
+        bi += 1;
+    }
+    while bi < n_blocks {
+        let start = bi * Q4_BLOCK_SIZE;
+        if start >= dst.len() {
+            break;
         }
+        let end = (start + Q4_BLOCK_SIZE).min(dst.len());
+        axpy_q8_row(
+            &mut dst[start..end],
+            a,
+            cache,
+            row_offset + start,
+            *scales_ptr.add(bi),
+        );
+        bi += 1;
     }
 }
 
-/// Dot product of `q` against a Q4-quantized row in `cache` starting at element `row_offset`.
-/// `scales` has one scale per `Q4_BLOCK_SIZE`-element block covering `q.len()` elements.
-#[inline]
-fn dot_q4_row(q: &[f32], cache: &[u8], row_offset: usize, scales: &[f32]) -> f32 {
-    let mut acc = 0.0f32;
-    for (bi, &scale) in scales.iter().enumerate() {
-        let start = bi * Q4_BLOCK_SIZE;
-        let end = (start + Q4_BLOCK_SIZE).min(q.len());
-        for i in start..end {
-            acc += q[i] * dequant_q4_at(cache, row_offset + i) as f32 * scale;
+#[inline(always)]
+fn dot_q4_full_block(q_block: &[f32], cache: &[u8], elem_offset: usize, scale: f32) -> f32 {
+    debug_assert_eq!(q_block.len(), Q4_BLOCK_SIZE);
+    #[cfg(target_arch = "aarch64")]
+    if (elem_offset & 1) == 0 {
+        unsafe {
+            return dot_q4_block_neon(q_block, cache, elem_offset) * scale;
         }
+    }
+    let mut acc = 0.0f32;
+    for (i, &qv) in q_block.iter().enumerate() {
+        acc += qv * dequant_q4_at(cache, elem_offset + i) as f32 * scale;
     }
     acc
 }
 
-/// Accumulate `a * scale * cached_q4` into `dst`.
-/// `scales` has one scale per `Q4_BLOCK_SIZE`-element block covering `dst.len()` elements.
-#[inline]
-fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scales: &[f32]) {
-    for (bi, &scale) in scales.iter().enumerate() {
-        let start = bi * Q4_BLOCK_SIZE;
-        let end = (start + Q4_BLOCK_SIZE).min(dst.len());
-        let coeff = a * scale;
-        for i in start..end {
-            dst[i] += coeff * dequant_q4_at(cache, row_offset + i) as f32;
+#[inline(always)]
+fn axpy_q4_full_block(dst_block: &mut [f32], a: f32, cache: &[u8], elem_offset: usize, scale: f32) {
+    debug_assert_eq!(dst_block.len(), Q4_BLOCK_SIZE);
+    let coeff = a * scale;
+    #[cfg(target_arch = "aarch64")]
+    if (elem_offset & 1) == 0 {
+        unsafe {
+            axpy_q4_block_neon(dst_block, coeff, cache, elem_offset);
+            return;
         }
+    }
+    for (i, d) in dst_block.iter_mut().enumerate() {
+        *d += coeff * dequant_q4_at(cache, elem_offset + i) as f32;
+    }
+}
+
+#[inline]
+unsafe fn dot_q4_row_ptr(
+    q: &[f32],
+    cache: &[u8],
+    row_offset: usize,
+    scales_ptr: *const f32,
+    n_blocks: usize,
+) -> f32 {
+    let mut acc = 0.0f32;
+    let n_full = n_blocks.min(q.len() / Q4_BLOCK_SIZE);
+    let mut bi = 0usize;
+
+    while bi + 4 <= n_full {
+        let s0 = *scales_ptr.add(bi);
+        let s1 = *scales_ptr.add(bi + 1);
+        let s2 = *scales_ptr.add(bi + 2);
+        let s3 = *scales_ptr.add(bi + 3);
+        let b0 = bi * Q4_BLOCK_SIZE;
+        let b1 = b0 + Q4_BLOCK_SIZE;
+        let b2 = b1 + Q4_BLOCK_SIZE;
+        let b3 = b2 + Q4_BLOCK_SIZE;
+        acc += dot_q4_full_block(&q[b0..b1], cache, row_offset + b0, s0);
+        acc += dot_q4_full_block(&q[b1..b2], cache, row_offset + b1, s1);
+        acc += dot_q4_full_block(&q[b2..b3], cache, row_offset + b2, s2);
+        acc += dot_q4_full_block(&q[b3..b3 + Q4_BLOCK_SIZE], cache, row_offset + b3, s3);
+        bi += 4;
+    }
+    while bi < n_full {
+        let start = bi * Q4_BLOCK_SIZE;
+        let end = start + Q4_BLOCK_SIZE;
+        acc += dot_q4_full_block(
+            &q[start..end],
+            cache,
+            row_offset + start,
+            *scales_ptr.add(bi),
+        );
+        bi += 1;
+    }
+    while bi < n_blocks {
+        let start = bi * Q4_BLOCK_SIZE;
+        if start >= q.len() {
+            break;
+        }
+        let end = (start + Q4_BLOCK_SIZE).min(q.len());
+        let scale = *scales_ptr.add(bi);
+        for (i, &qv) in q[start..end].iter().enumerate() {
+            acc += qv * dequant_q4_at(cache, row_offset + start + i) as f32 * scale;
+        }
+        bi += 1;
+    }
+    acc
+}
+
+#[inline]
+unsafe fn axpy_q4_row_ptr(
+    dst: &mut [f32],
+    a: f32,
+    cache: &[u8],
+    row_offset: usize,
+    scales_ptr: *const f32,
+    n_blocks: usize,
+) {
+    let n_full = n_blocks.min(dst.len() / Q4_BLOCK_SIZE);
+    let mut bi = 0usize;
+
+    while bi + 4 <= n_full {
+        let s0 = *scales_ptr.add(bi);
+        let s1 = *scales_ptr.add(bi + 1);
+        let s2 = *scales_ptr.add(bi + 2);
+        let s3 = *scales_ptr.add(bi + 3);
+        let b0 = bi * Q4_BLOCK_SIZE;
+        let b1 = b0 + Q4_BLOCK_SIZE;
+        let b2 = b1 + Q4_BLOCK_SIZE;
+        let b3 = b2 + Q4_BLOCK_SIZE;
+        axpy_q4_full_block(&mut dst[b0..b1], a, cache, row_offset + b0, s0);
+        axpy_q4_full_block(&mut dst[b1..b2], a, cache, row_offset + b1, s1);
+        axpy_q4_full_block(&mut dst[b2..b3], a, cache, row_offset + b2, s2);
+        axpy_q4_full_block(
+            &mut dst[b3..b3 + Q4_BLOCK_SIZE],
+            a,
+            cache,
+            row_offset + b3,
+            s3,
+        );
+        bi += 4;
+    }
+    while bi < n_full {
+        let start = bi * Q4_BLOCK_SIZE;
+        let end = start + Q4_BLOCK_SIZE;
+        axpy_q4_full_block(
+            &mut dst[start..end],
+            a,
+            cache,
+            row_offset + start,
+            *scales_ptr.add(bi),
+        );
+        bi += 1;
+    }
+    while bi < n_blocks {
+        let start = bi * Q4_BLOCK_SIZE;
+        if start >= dst.len() {
+            break;
+        }
+        let end = (start + Q4_BLOCK_SIZE).min(dst.len());
+        let coeff = a * *scales_ptr.add(bi);
+        for (i, d) in dst[start..end].iter_mut().enumerate() {
+            *d += coeff * dequant_q4_at(cache, row_offset + start + i) as f32;
+        }
+        bi += 1;
     }
 }
 
@@ -1064,19 +1357,26 @@ fn transformer_inner(
                         // Scale slice for this KV head: blocks_per_head blocks starting at
                         // the head's block offset within the row.
                         let head_block_off = kv_head * blocks_per_head;
+                        let key_head_scales_ptr =
+                            unsafe { key_scales.as_ptr().add(head_block_off) };
+                        let value_head_scales_ptr =
+                            unsafe { value_scales.as_ptr().add(head_block_off) };
                         for (t, slot) in att_head.iter_mut().enumerate() {
                             let t_row = layer_row_base + t;
                             let row_offset = t_row * kv_dim + kv_head_offset;
                             let mut score = match kv_format {
                                 KvCacheFormat::Q8 => {
                                     if q8_block_scales {
-                                        let sb = t_row * n_blocks_per_row + head_block_off;
-                                        dot_q8_row_blocks(
-                                            q_head,
-                                            key_cache_q8,
-                                            row_offset,
-                                            &key_scales[sb..sb + blocks_per_head],
-                                        )
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            dot_q8_row_blocks_ptr(
+                                                q_head,
+                                                key_cache_q8,
+                                                row_offset,
+                                                key_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            )
+                                        }
                                     } else {
                                         dot_q8_row(
                                             q_head,
@@ -1087,13 +1387,16 @@ fn transformer_inner(
                                     }
                                 }
                                 KvCacheFormat::Q4 => {
-                                    let sb = t_row * n_blocks_per_row + head_block_off;
-                                    dot_q4_row(
-                                        q_head,
-                                        key_cache_q4,
-                                        row_offset,
-                                        &key_scales[sb..sb + blocks_per_head],
-                                    )
+                                    let sb = t_row * n_blocks_per_row;
+                                    unsafe {
+                                        dot_q4_row_ptr(
+                                            q_head,
+                                            key_cache_q4,
+                                            row_offset,
+                                            key_head_scales_ptr.add(sb),
+                                            blocks_per_head,
+                                        )
+                                    }
                                 }
                             };
                             if apply_attn_scale {
@@ -1111,14 +1414,17 @@ fn transformer_inner(
                             match kv_format {
                                 KvCacheFormat::Q8 => {
                                     if q8_block_scales {
-                                        let sb = t_row * n_blocks_per_row + head_block_off;
-                                        axpy_q8_row_blocks(
-                                            xb_head,
-                                            a,
-                                            value_cache_q8,
-                                            row_offset,
-                                            &value_scales[sb..sb + blocks_per_head],
-                                        );
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            axpy_q8_row_blocks_ptr(
+                                                xb_head,
+                                                a,
+                                                value_cache_q8,
+                                                row_offset,
+                                                value_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            );
+                                        }
                                     } else {
                                         axpy_q8_row(
                                             xb_head,
@@ -1130,14 +1436,17 @@ fn transformer_inner(
                                     }
                                 }
                                 KvCacheFormat::Q4 => {
-                                    let sb = t_row * n_blocks_per_row + head_block_off;
-                                    axpy_q4_row(
-                                        xb_head,
-                                        a,
-                                        value_cache_q4,
-                                        row_offset,
-                                        &value_scales[sb..sb + blocks_per_head],
-                                    );
+                                    let sb = t_row * n_blocks_per_row;
+                                    unsafe {
+                                        axpy_q4_row_ptr(
+                                            xb_head,
+                                            a,
+                                            value_cache_q4,
+                                            row_offset,
+                                            value_head_scales_ptr.add(sb),
+                                            blocks_per_head,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1149,6 +1458,9 @@ fn transformer_inner(
                     let kv_head = h / kv_mul;
                     let kv_head_offset = kv_head * head_size;
                     let head_block_off = kv_head * blocks_per_head;
+                    let key_head_scales_ptr = unsafe { key_scales.as_ptr().add(head_block_off) };
+                    let value_head_scales_ptr =
+                        unsafe { value_scales.as_ptr().add(head_block_off) };
                     let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
                     let att_head = &mut att_head_full[..=pos];
 
@@ -1158,25 +1470,31 @@ fn transformer_inner(
                         let mut score = match kv_format {
                             KvCacheFormat::Q8 => {
                                 if q8_block_scales {
-                                    let sb = t_row * n_blocks_per_row + head_block_off;
-                                    dot_q8_row_blocks(
-                                        q_head,
-                                        key_cache_q8,
-                                        row_offset,
-                                        &key_scales[sb..sb + blocks_per_head],
-                                    )
+                                    let sb = t_row * n_blocks_per_row;
+                                    unsafe {
+                                        dot_q8_row_blocks_ptr(
+                                            q_head,
+                                            key_cache_q8,
+                                            row_offset,
+                                            key_head_scales_ptr.add(sb),
+                                            blocks_per_head,
+                                        )
+                                    }
                                 } else {
                                     dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
                                 }
                             }
                             KvCacheFormat::Q4 => {
-                                let sb = t_row * n_blocks_per_row + head_block_off;
-                                dot_q4_row(
-                                    q_head,
-                                    key_cache_q4,
-                                    row_offset,
-                                    &key_scales[sb..sb + blocks_per_head],
-                                )
+                                let sb = t_row * n_blocks_per_row;
+                                unsafe {
+                                    dot_q4_row_ptr(
+                                        q_head,
+                                        key_cache_q4,
+                                        row_offset,
+                                        key_head_scales_ptr.add(sb),
+                                        blocks_per_head,
+                                    )
+                                }
                             }
                         };
                         if apply_attn_scale {
@@ -1195,14 +1513,17 @@ fn transformer_inner(
                         match kv_format {
                             KvCacheFormat::Q8 => {
                                 if q8_block_scales {
-                                    let sb = t_row * n_blocks_per_row + head_block_off;
-                                    axpy_q8_row_blocks(
-                                        xb_head,
-                                        a,
-                                        value_cache_q8,
-                                        row_offset,
-                                        &value_scales[sb..sb + blocks_per_head],
-                                    );
+                                    let sb = t_row * n_blocks_per_row;
+                                    unsafe {
+                                        axpy_q8_row_blocks_ptr(
+                                            xb_head,
+                                            a,
+                                            value_cache_q8,
+                                            row_offset,
+                                            value_head_scales_ptr.add(sb),
+                                            blocks_per_head,
+                                        );
+                                    }
                                 } else {
                                     axpy_q8_row(
                                         xb_head,
@@ -1214,14 +1535,17 @@ fn transformer_inner(
                                 }
                             }
                             KvCacheFormat::Q4 => {
-                                let sb = t_row * n_blocks_per_row + head_block_off;
-                                axpy_q4_row(
-                                    xb_head,
-                                    a,
-                                    value_cache_q4,
-                                    row_offset,
-                                    &value_scales[sb..sb + blocks_per_head],
-                                );
+                                let sb = t_row * n_blocks_per_row;
+                                unsafe {
+                                    axpy_q4_row_ptr(
+                                        xb_head,
+                                        a,
+                                        value_cache_q4,
+                                        row_offset,
+                                        value_head_scales_ptr.add(sb),
+                                        blocks_per_head,
+                                    );
+                                }
                             }
                         }
                     }

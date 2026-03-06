@@ -39,6 +39,12 @@ fn par_matmul_chunk_rows_default() -> usize {
     32
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn aarch64_matmul_prefetch_rows_default() -> usize {
+    6
+}
+
 #[inline]
 fn par_attn_min_heads_default() -> usize {
     let n_threads = std::thread::available_parallelism()
@@ -65,6 +71,8 @@ fn par_qwen3next_min_heads_default() -> usize {
 
 static PAR_MATMUL_MIN_ROWS_CFG: OnceLock<usize> = OnceLock::new();
 static PAR_MATMUL_CHUNK_ROWS_CFG: OnceLock<usize> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+static AARCH64_MATMUL_PREFETCH_ROWS_CFG: OnceLock<usize> = OnceLock::new();
 static PAR_ATTN_MIN_HEADS_CFG: OnceLock<usize> = OnceLock::new();
 static PAR_QWEN3NEXT_MIN_HEADS_CFG: OnceLock<usize> = OnceLock::new();
 #[cfg(target_arch = "aarch64")]
@@ -111,6 +119,8 @@ pub(crate) enum KvCacheMode {
 pub(crate) struct RuntimeSwitchConfig {
     pub(crate) par_matmul_min_rows: Option<usize>,
     pub(crate) par_matmul_chunk_rows: Option<usize>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_matmul_prefetch_rows: Option<usize>,
     pub(crate) par_attn_min_heads: Option<usize>,
     pub(crate) par_qwen3next_min_heads: Option<usize>,
     #[cfg(target_arch = "aarch64")]
@@ -154,6 +164,12 @@ pub(crate) fn par_matmul_chunk_rows() -> usize {
     *PAR_MATMUL_CHUNK_ROWS_CFG.get_or_init(par_matmul_chunk_rows_default)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn aarch64_matmul_prefetch_rows() -> usize {
+    *AARCH64_MATMUL_PREFETCH_ROWS_CFG.get_or_init(aarch64_matmul_prefetch_rows_default)
+}
+
 #[inline]
 pub(crate) fn par_attn_min_heads() -> usize {
     *PAR_ATTN_MIN_HEADS_CFG.get_or_init(par_attn_min_heads_default)
@@ -172,7 +188,7 @@ pub(crate) fn kv_cache_mode() -> KvCacheMode {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn use_aarch64_dotprod_q8() -> bool {
-    *AARCH64_DOTPROD_Q8_CFG.get_or_init(|| false)
+    *AARCH64_DOTPROD_Q8_CFG.get_or_init(|| std::arch::is_aarch64_feature_detected!("dotprod"))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -223,7 +239,10 @@ pub(crate) fn use_x86_avx_vnni() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn use_x86_avx512_vnni_q8() -> bool {
-    *X86_AVX512VNNI_Q8_CFG.get_or_init(|| false)
+    *X86_AVX512VNNI_Q8_CFG.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    })
 }
 
 pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
@@ -232,6 +251,10 @@ pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
     }
     if let Some(v) = config.par_matmul_chunk_rows {
         let _ = PAR_MATMUL_CHUNK_ROWS_CFG.set(v);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let Some(v) = config.aarch64_matmul_prefetch_rows {
+        let _ = AARCH64_MATMUL_PREFETCH_ROWS_CFG.set(v);
     }
     if let Some(v) = config.par_attn_min_heads {
         let _ = PAR_ATTN_MIN_HEADS_CFG.set(v);

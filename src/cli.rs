@@ -37,6 +37,11 @@ fn parse_positive_usize(raw: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_nonnegative_usize(raw: &str) -> Result<usize, String> {
+    raw.parse::<usize>()
+        .map_err(|e| format!("invalid value '{raw}': {e}"))
+}
+
 fn parse_boolish(raw: &str) -> Result<bool, String> {
     let v = raw.trim();
     if v.eq_ignore_ascii_case("1")
@@ -574,6 +579,15 @@ struct Cli {
 
     #[cfg(target_arch = "aarch64")]
     #[arg(
+        long = "aarch64-matmul-prefetch-rows",
+        hide = true,
+        env = "GGUF_AARCH64_MATMUL_PREFETCH_ROWS",
+        value_parser = parse_nonnegative_usize
+    )]
+    aarch64_matmul_prefetch_rows: Option<usize>,
+
+    #[cfg(target_arch = "aarch64")]
+    #[arg(
         long = "aarch64-dotprod-q8",
         hide = true,
         env = "GGUF_AARCH64_DOTPROD_Q8",
@@ -691,6 +705,8 @@ pub(crate) struct CliOptions {
     pub(crate) par_attn_min_heads: Option<usize>,
     pub(crate) par_qwen3next_min_heads: Option<usize>,
     #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_matmul_prefetch_rows: Option<usize>,
+    #[cfg(target_arch = "aarch64")]
     pub(crate) aarch64_dotprod_q8: Option<bool>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) aarch64_qk_mr4: Option<bool>,
@@ -765,6 +781,8 @@ impl CliOptions {
             par_matmul_chunk_rows: cli.par_matmul_chunk_rows,
             par_attn_min_heads: cli.par_attn_min_heads,
             par_qwen3next_min_heads: cli.par_qwen3next_min_heads,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_matmul_prefetch_rows: cli.aarch64_matmul_prefetch_rows,
             #[cfg(target_arch = "aarch64")]
             aarch64_dotprod_q8: cli.aarch64_dotprod_q8,
             #[cfg(target_arch = "aarch64")]

@@ -4,6 +4,8 @@ mod tools;
 
 use crate::cli::CliOptions;
 use crate::engine::profiling::{print_profile_report, profiling_reset, set_profiling_enabled};
+#[cfg(target_arch = "aarch64")]
+use crate::engine::switches::aarch64_matmul_prefetch_rows;
 use crate::engine::switches::{
     init_runtime_config, kv_cache_mode, par_attn_min_heads, par_matmul_chunk_rows,
     par_matmul_min_rows, par_qwen3next_min_heads, KvCacheMode, RuntimeSwitchConfig,
@@ -223,6 +225,8 @@ pub(crate) fn run() -> Result<(), String> {
     let runtime_switch_config = RuntimeSwitchConfig {
         par_matmul_min_rows: cli.par_matmul_min_rows,
         par_matmul_chunk_rows: cli.par_matmul_chunk_rows,
+        #[cfg(target_arch = "aarch64")]
+        aarch64_matmul_prefetch_rows: cli.aarch64_matmul_prefetch_rows,
         par_attn_min_heads: cli.par_attn_min_heads,
         par_qwen3next_min_heads: cli.par_qwen3next_min_heads,
         #[cfg(target_arch = "aarch64")]
@@ -260,6 +264,11 @@ pub(crate) fn run() -> Result<(), String> {
             par_matmul_chunk_rows(),
             par_attn_min_heads(),
             par_qwen3next_min_heads()
+        );
+        #[cfg(target_arch = "aarch64")]
+        eprintln!(
+            "AArch64 prefetch: matmul_prefetch_rows={}",
+            aarch64_matmul_prefetch_rows()
         );
         eprintln!("KV cache mode request: {:?}", kv_cache_mode());
     }

@@ -608,9 +608,8 @@ impl ModelRuntime {
                 // beyond that the resolution continues to grow for OCR and fine-detail tasks,
                 // capped at 2× base_size where bilinear position-embedding interpolation still
                 // produces reliable results.
-                let balanced_size =
-                    ((base_size as f32 * self.config.dim as f32 / 3072.0) as usize)
-                        .clamp(align_to.max(224), base_size * 2);
+                let balanced_size = ((base_size as f32 * self.config.dim as f32 / 3072.0) as usize)
+                    .clamp(align_to.max(224), base_size * 2);
                 let aligned = if align_to > 1 {
                     (balanced_size / align_to) * align_to
                 } else {
@@ -1189,9 +1188,8 @@ impl ModelRuntime {
         // The prompt already ends with "<think>\n" for Yes/Hidden modes, so generation starts
         // inside the thinking block. For No mode the prompt closes it immediately.
         let think_mode = self.settings.think_mode;
-        let model_has_thinking = self.config.is_qwen3next
-            || self.config.is_qwen3vl
-            || self.config.is_qwen35;
+        let model_has_thinking =
+            self.config.is_qwen3next || self.config.is_qwen3vl || self.config.is_qwen35;
         let thinking_active = model_has_thinking && think_mode != ThinkMode::No;
         let mut is_thinking = thinking_active;
         if thinking_active && think_mode == ThinkMode::Yes && stream_stdout {

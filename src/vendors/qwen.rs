@@ -299,8 +299,6 @@ pub(super) fn encode_qwen3_request(
                         media_index: image_index,
                     });
                     image_index += 1;
-                    tokenizer.bpe_encode("\n", &mut temp);
-                    tokens.extend_from_slice(&temp);
                 }
                 ContentPart::Video(_) => {
                     let (token_start, token_len) = append_vision_wrapped_placeholder(
@@ -318,8 +316,6 @@ pub(super) fn encode_qwen3_request(
                         media_index: video_index,
                     });
                     video_index += 1;
-                    tokenizer.bpe_encode("\n", &mut temp);
-                    tokens.extend_from_slice(&temp);
                 }
                 ContentPart::Audio(_) => {
                     let (token_start, token_len) = append_audio_placeholder(
@@ -336,8 +332,6 @@ pub(super) fn encode_qwen3_request(
                         media_index: audio_index,
                     });
                     audio_index += 1;
-                    tokenizer.bpe_encode("\n", &mut temp);
-                    tokens.extend_from_slice(&temp);
                 }
             }
         }
@@ -348,7 +342,12 @@ pub(super) fn encode_qwen3_request(
         tokens.push(start);
         tokenizer.bpe_encode("assistant\n", &mut temp);
         tokens.extend_from_slice(&temp);
-        tokenizer.bpe_encode("<think>\n", &mut temp);
+        let think_prefix = if think_mode == ThinkMode::No {
+            "<think>\n\n</think>\n\n"
+        } else {
+            "<think>\n"
+        };
+        tokenizer.bpe_encode(think_prefix, &mut temp);
         tokens.extend_from_slice(&temp);
 
         return EncodedPrompt {
@@ -392,8 +391,6 @@ pub(super) fn encode_qwen3_request(
                     media_index: image_index,
                 });
                 image_index += 1;
-                tokenizer.bpe_encode("\n", &mut temp);
-                tokens.extend_from_slice(&temp);
             }
             ContentPart::Video(_) => {
                 let (token_start, token_len) = append_vision_wrapped_placeholder(
@@ -411,8 +408,6 @@ pub(super) fn encode_qwen3_request(
                     media_index: video_index,
                 });
                 video_index += 1;
-                tokenizer.bpe_encode("\n", &mut temp);
-                tokens.extend_from_slice(&temp);
             }
             ContentPart::Audio(_) => {
                 let (token_start, token_len) = append_audio_placeholder(
@@ -429,8 +424,6 @@ pub(super) fn encode_qwen3_request(
                     media_index: audio_index,
                 });
                 audio_index += 1;
-                tokenizer.bpe_encode("\n", &mut temp);
-                tokens.extend_from_slice(&temp);
             }
         }
     }
@@ -438,7 +431,7 @@ pub(super) fn encode_qwen3_request(
     // - Yes/Hidden: open <think> block (model will generate thinking then </think> then answer)
     // - No: immediately close <think></think> so the model skips thinking
     let assistant_suffix = if think_mode == ThinkMode::No {
-        "<|im_end|>\n<|im_start|>assistant\n<think></think>\n"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     } else {
         "<|im_end|>\n<|im_start|>assistant\n<think>\n"
     };

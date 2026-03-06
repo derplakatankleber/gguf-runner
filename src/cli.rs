@@ -423,13 +423,21 @@ fn normalize_description_text(raw: String) -> Option<String> {
     disable_help_subcommand = true
 )]
 struct Cli {
-    #[arg(long, required_unless_present = "show_features", default_value = "", value_name = "model.gguf")]
+    #[arg(
+        long,
+        required_unless_present = "show_features",
+        default_value = "",
+        value_name = "model.gguf"
+    )]
     model: String,
 
     #[arg(long, required_unless_present = "show_features", default_value = "")]
     prompt: String,
 
-    #[arg(long = "show-features", help = "Print CPU features (compiled-in vs runtime) and exit")]
+    #[arg(
+        long = "show-features",
+        help = "Print CPU features (compiled-in vs runtime) and exit"
+    )]
     show_features: bool,
 
     #[arg(long = "image", value_name = "path")]

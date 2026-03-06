@@ -602,8 +602,7 @@ impl Qwen3VlVisionEncoder {
                     } else {
                         (px as f32, ic - quarter_head)
                     };
-                    let freq =
-                        1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / self.head_dim as f32);
+                    let freq = 1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / self.head_dim as f32);
                     let theta = pos_val * freq;
                     let c = theta.cos();
                     let s = theta.sin();

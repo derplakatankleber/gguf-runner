@@ -32,6 +32,10 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 #### image_v1
   "Describe the content of this image."
 
+```bash
+gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg --prompt 'Describe the content of this image.' --show-tokens --show-timings
+```
+
 ### Benchmark Runs - Current Models
 
 | date | model | host_id | prompts | tokens/sec | runtime sec | notes |
@@ -40,6 +44,7 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 | 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.522 | 275.898 | |
 | 2026-03-07 | gemma-3-4b-it-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 5.483 | 186.410 | |
 | 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 6.894 | 147.734 | |
+| 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | mac-m4-32g | image_v1 | 7.469 | 136.642 | |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 2.770 | 135.304 | |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.109 | 124.928 |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.292 | 111.207 | |
@@ -54,6 +59,7 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 | 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 1.936 | 239.441 | |
 | 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 10.774 | 47.773 | |
 | 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 15.915 | 33.569 | |
+| 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m4-32g | image_v1 | 16.418 | 62.619 | |
 
 
 ### Benchmark Runs - Older Models

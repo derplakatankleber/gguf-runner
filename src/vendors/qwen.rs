@@ -22,6 +22,13 @@ const QWEN_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
     },
 ];
 
+fn qwen35_detail_crop_enabled() -> bool {
+    matches!(
+        std::env::var("GGUF_QWEN35_DETAIL_CROP"),
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+    )
+}
+
 pub(super) fn finalize_moe_config(config: &mut Config) -> Result<(), String> {
     if config.expert_hidden_dim == 0 || config.n_experts == 0 {
         return Err(
@@ -145,7 +152,7 @@ pub(super) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
         MultimodalBackend::Qwen35 => VendorMultimodalPolicy {
             image_prompt_suffix: "\nPlease avoid guessing uncertain details. If text is unclear, explicitly say it is unreadable.",
             detail_crop: VendorDetailCropPolicy {
-                enabled: true,
+                enabled: qwen35_detail_crop_enabled(),
                 max_layers: 24,
                 note_text: "\n(Second image: centered close-up crop of the same source.)\n",
                 temp_file_prefix: "gguf-runner-qwen35-detail",

@@ -325,6 +325,62 @@ pub(crate) fn silu_and_mul_inplace(hb: &mut [f32], hb2: &[f32]) {
     }
 }
 
+/// Multiply `dst[i]` by `sigmoid(gate[i])` in-place.
+/// aarch64: vectorized with same exp approximation strategy used in other kernels.
+pub(crate) fn sigmoid_mul_inplace(dst: &mut [f32], gate: &[f32]) {
+    debug_assert_eq!(dst.len(), gate.len());
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let log2e = vdupq_n_f32(std::f32::consts::LOG2_E);
+        let ln2_hi = vdupq_n_f32(0.693_359_4_f32);
+        let ln2_lo = vdupq_n_f32(-2.121_944_4e-4_f32);
+        let one = vdupq_n_f32(1.0_f32);
+        let c2 = vdupq_n_f32(0.5_f32);
+        let c3 = vdupq_n_f32(1.0_f32 / 6.0_f32);
+        let c4 = vdupq_n_f32(1.0_f32 / 24.0_f32);
+        let c5 = vdupq_n_f32(1.0_f32 / 120.0_f32);
+        let exp_max = vdupq_n_f32(88.0_f32);
+        let exp_min = vdupq_n_f32(-88.0_f32);
+
+        let n = dst.len();
+        let p = dst.as_mut_ptr();
+        let g = gate.as_ptr();
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let dv = vld1q_f32(p.add(i));
+            let gv = vld1q_f32(g.add(i));
+            let nx = vminq_f32(vmaxq_f32(vnegq_f32(gv), exp_min), exp_max);
+            let n_f = vrndnq_f32(vmulq_f32(nx, log2e));
+            let r = vfmsq_f32(vfmsq_f32(nx, n_f, ln2_hi), n_f, ln2_lo);
+            let mut poly = vfmaq_f32(c4, r, c5);
+            poly = vfmaq_f32(c3, r, poly);
+            poly = vfmaq_f32(c2, r, poly);
+            poly = vfmaq_f32(one, r, poly);
+            poly = vfmaq_f32(one, r, poly);
+            let ni = vcvtq_s32_f32(n_f);
+            let p2n = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
+            let exp_neg_g = vmulq_f32(poly, p2n);
+            let denom = vaddq_f32(one, exp_neg_g);
+            let rec = vrecpeq_f32(denom);
+            let rec = vmulq_f32(vrecpsq_f32(denom, rec), rec);
+            vst1q_f32(p.add(i), vmulq_f32(dv, rec));
+            i += 4;
+        }
+        while i < n {
+            let s = 1.0_f32 / (1.0_f32 + (-*g.add(i)).exp());
+            *p.add(i) = finite_or_zero(*p.add(i) * s);
+            i += 1;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for (d, &g) in dst.iter_mut().zip(gate.iter()) {
+        let s = 1.0_f32 / (1.0_f32 + (-g).exp());
+        *d = finite_or_zero(*d * s);
+    }
+}
+
 #[inline(always)]
 pub(crate) fn sigmoidf(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())

@@ -4,7 +4,7 @@ use crate::engine::io::{
 };
 use crate::engine::kernels::{
     axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size, matmul_quantized,
-    softmax,
+    scale_slice_inplace,
 };
 use crate::engine::multimodal::injection::ImageEmbeddingSequence;
 use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
@@ -88,6 +88,111 @@ fn load_tensor_quantized(
         rows,
         cols,
     })
+}
+
+#[inline]
+fn layer_norm_affine(dst: &mut [f32], src: &[f32], w: &[f32], b: &[f32], eps: f32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = src.len();
+        let x_ptr = src.as_ptr();
+        let w_ptr = w.as_ptr();
+        let b_ptr = b.as_ptr();
+        let y_ptr = dst.as_mut_ptr();
+
+        let mut i = 0usize;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        while i + 16 <= n {
+            acc0 = vaddq_f32(acc0, vld1q_f32(x_ptr.add(i)));
+            acc1 = vaddq_f32(acc1, vld1q_f32(x_ptr.add(i + 4)));
+            acc2 = vaddq_f32(acc2, vld1q_f32(x_ptr.add(i + 8)));
+            acc3 = vaddq_f32(acc3, vld1q_f32(x_ptr.add(i + 12)));
+            i += 16;
+        }
+        let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while i + 4 <= n {
+            acc = vaddq_f32(acc, vld1q_f32(x_ptr.add(i)));
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(acc);
+        while i < n {
+            sum += *x_ptr.add(i);
+            i += 1;
+        }
+        let mean = sum / n as f32;
+        let meanv = vdupq_n_f32(mean);
+
+        i = 0;
+        acc0 = vdupq_n_f32(0.0);
+        acc1 = vdupq_n_f32(0.0);
+        acc2 = vdupq_n_f32(0.0);
+        acc3 = vdupq_n_f32(0.0);
+        while i + 16 <= n {
+            let d0 = vsubq_f32(vld1q_f32(x_ptr.add(i)), meanv);
+            let d1 = vsubq_f32(vld1q_f32(x_ptr.add(i + 4)), meanv);
+            let d2 = vsubq_f32(vld1q_f32(x_ptr.add(i + 8)), meanv);
+            let d3 = vsubq_f32(vld1q_f32(x_ptr.add(i + 12)), meanv);
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            acc2 = vfmaq_f32(acc2, d2, d2);
+            acc3 = vfmaq_f32(acc3, d3, d3);
+            i += 16;
+        }
+        acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while i + 4 <= n {
+            let d = vsubq_f32(vld1q_f32(x_ptr.add(i)), meanv);
+            acc = vfmaq_f32(acc, d, d);
+            i += 4;
+        }
+        let mut var = vaddvq_f32(acc);
+        while i < n {
+            let d = *x_ptr.add(i) - mean;
+            var += d * d;
+            i += 1;
+        }
+        var /= n as f32;
+        let inv = 1.0f32 / (var + eps).sqrt();
+        let invv = vdupq_n_f32(inv);
+
+        i = 0;
+        while i + 4 <= n {
+            let xv = vld1q_f32(x_ptr.add(i));
+            let wv = vld1q_f32(w_ptr.add(i));
+            let bv = vld1q_f32(b_ptr.add(i));
+            let norm = vmulq_f32(vsubq_f32(xv, meanv), invv);
+            let out = vfmaq_f32(bv, norm, wv);
+            vst1q_f32(y_ptr.add(i), out);
+            i += 4;
+        }
+        while i < n {
+            *y_ptr.add(i) = ((*x_ptr.add(i) - mean) * inv) * *w_ptr.add(i) + *b_ptr.add(i);
+            i += 1;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut mean = 0.0f32;
+        for &v in src {
+            mean += v;
+        }
+        mean /= src.len() as f32;
+
+        let mut var = 0.0f32;
+        for &v in src {
+            let d = v - mean;
+            var += d * d;
+        }
+        var /= src.len() as f32;
+        let inv = 1.0f32 / (var + eps).sqrt();
+        for i in 0..src.len() {
+            dst[i] = ((src[i] - mean) * inv) * w[i] + b[i];
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -360,22 +465,7 @@ impl Gemma3VisionEncoder {
     }
 
     fn layer_norm(&self, dst: &mut [f32], src: &[f32], w: &[f32], b: &[f32]) {
-        let mut mean = 0.0f32;
-        for &v in src {
-            mean += v;
-        }
-        mean /= src.len() as f32;
-
-        let mut var = 0.0f32;
-        for &v in src {
-            let d = v - mean;
-            var += d * d;
-        }
-        var /= src.len() as f32;
-        let inv = 1.0f32 / (var + self.eps).sqrt();
-        for i in 0..src.len() {
-            dst[i] = ((src[i] - mean) * inv) * w[i] + b[i];
-        }
+        layer_norm_affine(dst, src, w, b, self.eps);
     }
 
     fn rms_norm_mul_weight(&self, dst: &mut [f32], src: &[f32], w: &[f32]) {
@@ -482,30 +572,41 @@ impl Gemma3VisionEncoder {
         let mut tokens = vec![0.0f32; patch_count * self.dim];
         let chw = &image.data_chw;
         let image_plane = image.width * image.height;
+        let kernel_elems = 3 * self.patch_size * self.patch_size;
+        let dim = self.dim;
+        let patch_size = self.patch_size;
+        let image_width = image.width;
+        let patch_embd_b = &self.patch_embd_b;
+        let patch_embd_w = &self.patch_embd_w;
 
-        for py in 0..ph {
-            for px in 0..pw {
-                let patch_idx = py * pw + px;
-                let out = &mut tokens[patch_idx * self.dim..(patch_idx + 1) * self.dim];
-                out.copy_from_slice(&self.patch_embd_b);
-                for (oc, outv) in out.iter_mut().enumerate().take(self.dim) {
-                    let mut acc = *outv;
-                    for ch in 0..3 {
-                        for ky in 0..self.patch_size {
-                            for kx in 0..self.patch_size {
-                                let iy = py * self.patch_size + ky;
-                                let ix = px * self.patch_size + kx;
-                                let pix = chw[ch * image_plane + iy * image.width + ix];
-                                let widx =
-                                    ((oc * 3 + ch) * self.patch_size + ky) * self.patch_size + kx;
-                                acc += pix * self.patch_embd_w[widx];
-                            }
-                        }
+        tokens.par_chunks_mut(dim).enumerate().for_each_init(
+            || vec![0.0f32; kernel_elems],
+            |patch_buf, (patch_idx, out)| {
+                let py = patch_idx / pw;
+                let px = patch_idx % pw;
+                out.copy_from_slice(patch_embd_b);
+
+                let mut patch_off = 0usize;
+                for ch in 0..3 {
+                    let ch_base = ch * image_plane;
+                    let y_base = py * patch_size;
+                    let x_base = px * patch_size;
+                    for ky in 0..patch_size {
+                        let src_row = ch_base + (y_base + ky) * image_width + x_base;
+                        let src = &chw[src_row..src_row + patch_size];
+                        let dst = &mut patch_buf[patch_off..patch_off + patch_size];
+                        dst.copy_from_slice(src);
+                        patch_off += patch_size;
                     }
-                    *outv = acc;
                 }
-            }
-        }
+
+                let mut woff = 0usize;
+                for outv in out.iter_mut().take(dim) {
+                    *outv += dot_f32_simd(patch_buf, &patch_embd_w[woff..woff + kernel_elems]);
+                    woff += kernel_elems;
+                }
+            },
+        );
 
         for py in 0..ph {
             for px in 0..pw {
@@ -550,14 +651,10 @@ impl Gemma3VisionEncoder {
                         let ix = ox * self.merge_factor + mx;
                         let in_idx = iy * patch_w + ix;
                         let src = &tokens[in_idx * self.dim..(in_idx + 1) * self.dim];
-                        for c in 0..self.dim {
-                            dst[c] += src[c];
-                        }
+                        axpy_inplace(dst, 1.0, src);
                     }
                 }
-                for v in dst.iter_mut() {
-                    *v *= inv;
-                }
+                scale_slice_inplace(dst, inv);
             }
         }
 
@@ -589,60 +686,70 @@ impl Gemma3VisionEncoder {
         let mut attn_head_major = vec![0.0f32; self.head_count * head_token_stride];
         let mut attn_out = vec![0.0f32; n_tokens * self.dim];
         let mut proj_out = vec![0.0f32; n_tokens * self.dim];
-        let mut ffn_up = vec![0.0f32; self.ff_dim];
-        let mut ffn_down = vec![0.0f32; self.dim];
+        let dim = self.dim;
+        let ff_dim = self.ff_dim;
+        let eps = self.eps;
+        let use_gelu = self.use_gelu;
 
         for l in 0..self.n_layers {
             let layer = &self.layers[l];
 
-            for t in 0..n_tokens {
-                let src = &x[t * self.dim..(t + 1) * self.dim];
-                let dst = &mut x_norm[t * self.dim..(t + 1) * self.dim];
-                self.layer_norm(dst, src, &layer.ln1_w, &layer.ln1_b);
-            }
+            x_norm.par_chunks_mut(dim).enumerate().for_each(|(t, dst)| {
+                let src = &x[t * dim..(t + 1) * dim];
+                layer_norm_affine(dst, src, &layer.ln1_w, &layer.ln1_b, eps);
+            });
 
-            for t in 0..n_tokens {
-                let src = &x_norm[t * self.dim..(t + 1) * self.dim];
-
-                let q_dst = &mut q[t * self.dim..(t + 1) * self.dim];
-                matmul_quantized(q_dst, src, &layer.attn_q_w, mapped)?;
-                Self::add_bias(q_dst, &layer.attn_q_b);
-
-                let k_dst = &mut k[t * self.dim..(t + 1) * self.dim];
-                matmul_quantized(k_dst, src, &layer.attn_k_w, mapped)?;
-                Self::add_bias(k_dst, &layer.attn_k_b);
-
-                let v_dst = &mut v[t * self.dim..(t + 1) * self.dim];
-                matmul_quantized(v_dst, src, &layer.attn_v_w, mapped)?;
-                Self::add_bias(v_dst, &layer.attn_v_b);
-            }
+            q.par_chunks_mut(dim)
+                .zip(k.par_chunks_mut(dim))
+                .zip(v.par_chunks_mut(dim))
+                .enumerate()
+                .try_for_each(|(t, ((q_dst, k_dst), v_dst))| -> Result<(), String> {
+                    let src = &x_norm[t * dim..(t + 1) * dim];
+                    matmul_quantized(q_dst, src, &layer.attn_q_w, mapped)?;
+                    Self::add_bias(q_dst, &layer.attn_q_b);
+                    matmul_quantized(k_dst, src, &layer.attn_k_w, mapped)?;
+                    Self::add_bias(k_dst, &layer.attn_k_b);
+                    matmul_quantized(v_dst, src, &layer.attn_v_w, mapped)?;
+                    Self::add_bias(v_dst, &layer.attn_v_b);
+                    Ok(())
+                })?;
 
             let inv_scale = 1.0 / (self.head_dim as f32).sqrt();
-            let dim = self.dim;
             let head_dim = self.head_dim;
             attn_head_major
-                .par_chunks_mut(head_token_stride)
+                .par_chunks_mut(head_dim)
                 .enumerate()
-                .for_each(|(h, head_out)| {
+                .for_each(|(row_idx, out)| {
+                    let h = row_idx / n_tokens;
+                    let i = row_idx % n_tokens;
                     let h_off = h * head_dim;
-                    let mut scores = vec![0.0f32; n_tokens];
-                    for i in 0..n_tokens {
-                        let qi = &q[i * dim + h_off..i * dim + h_off + head_dim];
-                        for j in 0..n_tokens {
-                            let kj = &k[j * dim + h_off..j * dim + h_off + head_dim];
-                            scores[j] = dot_f32_simd(qi, kj) * inv_scale;
-                        }
-                        softmax(&mut scores, n_tokens);
+                    let qi = &q[i * dim + h_off..i * dim + h_off + head_dim];
 
-                        let out = &mut head_out[i * head_dim..(i + 1) * head_dim];
-                        out.fill(0.0);
-                        for (j, &weight) in scores.iter().enumerate().take(n_tokens) {
-                            if weight == 0.0 {
-                                continue;
+                    out.fill(0.0);
+                    let mut max_score = f32::NEG_INFINITY;
+                    let mut score_sum = 0.0f32;
+                    for j in 0..n_tokens {
+                        let kj = &k[j * dim + h_off..j * dim + h_off + head_dim];
+                        let score = dot_f32_simd(qi, kj) * inv_scale;
+
+                        if score > max_score {
+                            if score_sum > 0.0 {
+                                let rescale = (max_score - score).exp();
+                                scale_slice_inplace(out, rescale);
+                                score_sum *= rescale;
                             }
-                            let vj = &v[j * dim + h_off..j * dim + h_off + head_dim];
-                            axpy_inplace(out, weight, vj);
+                            max_score = score;
                         }
+
+                        let weight = (score - max_score).exp();
+                        score_sum += weight;
+                        let vj = &v[j * dim + h_off..j * dim + h_off + head_dim];
+                        axpy_inplace(out, weight, vj);
+                    }
+
+                    if score_sum > 0.0 {
+                        let inv = 1.0 / score_sum;
+                        scale_slice_inplace(out, inv);
                     }
                 });
             for t in 0..n_tokens {
@@ -655,47 +762,50 @@ impl Gemma3VisionEncoder {
                 }
             }
 
-            for t in 0..n_tokens {
-                let src = &attn_out[t * self.dim..(t + 1) * self.dim];
-                let dst = &mut proj_out[t * self.dim..(t + 1) * self.dim];
-                matmul_quantized(dst, src, &layer.attn_out_w, mapped)?;
-                Self::add_bias(dst, &layer.attn_out_b);
-            }
+            proj_out.par_chunks_mut(dim).enumerate().try_for_each(
+                |(t, dst)| -> Result<(), String> {
+                    let src = &attn_out[t * dim..(t + 1) * dim];
+                    matmul_quantized(dst, src, &layer.attn_out_w, mapped)?;
+                    Self::add_bias(dst, &layer.attn_out_b);
+                    Ok(())
+                },
+            )?;
             for i in 0..x.len() {
                 x[i] += proj_out[i];
             }
 
-            for t in 0..n_tokens {
-                let src = &x[t * self.dim..(t + 1) * self.dim];
-                let dst = &mut x_norm[t * self.dim..(t + 1) * self.dim];
-                self.layer_norm(dst, src, &layer.ln2_w, &layer.ln2_b);
-            }
+            x_norm.par_chunks_mut(dim).enumerate().for_each(|(t, dst)| {
+                let src = &x[t * dim..(t + 1) * dim];
+                layer_norm_affine(dst, src, &layer.ln2_w, &layer.ln2_b, eps);
+            });
 
-            for t in 0..n_tokens {
-                let src = &x_norm[t * self.dim..(t + 1) * self.dim];
-                matmul_quantized(&mut ffn_up, src, &layer.ffn_up_w, mapped)?;
-                Self::add_bias(&mut ffn_up, &layer.ffn_up_b);
-                for v in &mut ffn_up {
-                    *v = if self.use_gelu {
-                        Self::gelu(*v)
-                    } else {
-                        Self::quick_gelu(*v)
-                    };
-                }
-                matmul_quantized(&mut ffn_down, &ffn_up, &layer.ffn_down_w, mapped)?;
-                Self::add_bias(&mut ffn_down, &layer.ffn_down_b);
-                let dst = &mut x[t * self.dim..(t + 1) * self.dim];
-                for i in 0..self.dim {
-                    dst[i] += ffn_down[i];
-                }
-            }
+            x.par_chunks_mut(dim).enumerate().try_for_each_init(
+                || (vec![0.0f32; ff_dim], vec![0.0f32; dim]),
+                |(ffn_up, ffn_down), (t, dst)| -> Result<(), String> {
+                    let src = &x_norm[t * dim..(t + 1) * dim];
+                    matmul_quantized(ffn_up, src, &layer.ffn_up_w, mapped)?;
+                    Self::add_bias(ffn_up, &layer.ffn_up_b);
+                    for v in ffn_up.iter_mut() {
+                        *v = if use_gelu {
+                            Self::gelu(*v)
+                        } else {
+                            Self::quick_gelu(*v)
+                        };
+                    }
+                    matmul_quantized(ffn_down, ffn_up, &layer.ffn_down_w, mapped)?;
+                    Self::add_bias(ffn_down, &layer.ffn_down_b);
+                    axpy_inplace(dst, 1.0, ffn_down);
+                    Ok(())
+                },
+            )?;
         }
 
         for t in 0..n_tokens {
-            let src = x[t * self.dim..(t + 1) * self.dim].to_vec();
-            let dst = &mut x[t * self.dim..(t + 1) * self.dim];
-            self.layer_norm(dst, &src, &self.post_ln_w, &self.post_ln_b);
+            let src = &x[t * dim..(t + 1) * dim];
+            let dst = &mut x_norm[t * dim..(t + 1) * dim];
+            self.layer_norm(dst, src, &self.post_ln_w, &self.post_ln_b);
         }
+        std::mem::swap(&mut x, &mut x_norm);
 
         let pooled = if pre_pooled_for_speed {
             x

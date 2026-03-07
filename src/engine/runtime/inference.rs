@@ -1,8 +1,8 @@
 use crate::engine::kernels::{
-    accum, dot_f32_simd, finite_or_zero, get_row_size, l2_norm, matmul_f32_embeddings,
-    matmul_quantized, matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm,
-    rmsnorm_gemma, rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace,
-    scale_slice_inplace, select_topk_softmax, sigmoidf, silu_and_mul_inplace, softmax,
+    accum, dot_f32_simd, get_row_size, l2_norm, matmul_f32_embeddings, matmul_quantized,
+    matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
+    rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace, scale_slice_inplace,
+    select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
 };
 use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
 use crate::engine::switches::{
@@ -12,7 +12,11 @@ use crate::engine::switches::{
 use crate::engine::types::{
     Config, KvCacheFormat, QuantizedTensor, RunState, TransformerWeights, GGML_TYPE_BF16,
 };
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+};
+
+type MoeRoutedScratch = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -1341,6 +1345,7 @@ fn transformer_inner(
             // Number of Q4 scale blocks per full kv_dim row; head_size/Q4_BLOCK_SIZE per KV head.
             let blocks_per_head = head_size / Q4_BLOCK_SIZE;
             let (att_all, xb_all) = (&mut s.att[..p.n_heads * p.seq_len], &mut s.xb[..q_dim]);
+            let fuse_qwen35_online_attn = p.is_qwen35;
 
             if p.n_heads >= par_attn_min_heads() {
                 att_all
@@ -1361,6 +1366,310 @@ fn transformer_inner(
                             unsafe { key_scales.as_ptr().add(head_block_off) };
                         let value_head_scales_ptr =
                             unsafe { value_scales.as_ptr().add(head_block_off) };
+                        if fuse_qwen35_online_attn {
+                            xb_head.fill(0.0);
+                            let mut max_score = f32::NEG_INFINITY;
+                            let mut score_sum = 0.0f32;
+                            for t in 0..=pos {
+                                let t_row = layer_row_base + t;
+                                let row_offset = t_row * kv_dim + kv_head_offset;
+                                let mut score = match kv_format {
+                                    KvCacheFormat::Q8 => {
+                                        if q8_block_scales {
+                                            let sb = t_row * n_blocks_per_row;
+                                            unsafe {
+                                                dot_q8_row_blocks_ptr(
+                                                    q_head,
+                                                    key_cache_q8,
+                                                    row_offset,
+                                                    key_head_scales_ptr.add(sb),
+                                                    blocks_per_head,
+                                                )
+                                            }
+                                        } else {
+                                            dot_q8_row(
+                                                q_head,
+                                                key_cache_q8,
+                                                row_offset,
+                                                key_scales[t_row],
+                                            )
+                                        }
+                                    }
+                                    KvCacheFormat::Q4 => {
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            dot_q4_row_ptr(
+                                                q_head,
+                                                key_cache_q4,
+                                                row_offset,
+                                                key_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            )
+                                        }
+                                    }
+                                };
+                                if apply_attn_scale {
+                                    score *= attn_scale_score;
+                                }
+
+                                if score > max_score {
+                                    if score_sum > 0.0 {
+                                        let rescale = (max_score - score).exp();
+                                        scale_slice_inplace(xb_head, rescale);
+                                        score_sum *= rescale;
+                                    }
+                                    max_score = score;
+                                }
+
+                                let weight = (score - max_score).exp();
+                                score_sum += weight;
+                                match kv_format {
+                                    KvCacheFormat::Q8 => {
+                                        if q8_block_scales {
+                                            let sb = t_row * n_blocks_per_row;
+                                            unsafe {
+                                                axpy_q8_row_blocks_ptr(
+                                                    xb_head,
+                                                    weight,
+                                                    value_cache_q8,
+                                                    row_offset,
+                                                    value_head_scales_ptr.add(sb),
+                                                    blocks_per_head,
+                                                );
+                                            }
+                                        } else {
+                                            axpy_q8_row(
+                                                xb_head,
+                                                weight,
+                                                value_cache_q8,
+                                                row_offset,
+                                                value_scales[t_row],
+                                            );
+                                        }
+                                    }
+                                    KvCacheFormat::Q4 => {
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            axpy_q4_row_ptr(
+                                                xb_head,
+                                                weight,
+                                                value_cache_q4,
+                                                row_offset,
+                                                value_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if score_sum > 0.0 {
+                                scale_slice_inplace(xb_head, 1.0 / score_sum);
+                            }
+                        } else {
+                            for (t, slot) in att_head.iter_mut().enumerate() {
+                                let t_row = layer_row_base + t;
+                                let row_offset = t_row * kv_dim + kv_head_offset;
+                                let mut score = match kv_format {
+                                    KvCacheFormat::Q8 => {
+                                        if q8_block_scales {
+                                            let sb = t_row * n_blocks_per_row;
+                                            unsafe {
+                                                dot_q8_row_blocks_ptr(
+                                                    q_head,
+                                                    key_cache_q8,
+                                                    row_offset,
+                                                    key_head_scales_ptr.add(sb),
+                                                    blocks_per_head,
+                                                )
+                                            }
+                                        } else {
+                                            dot_q8_row(
+                                                q_head,
+                                                key_cache_q8,
+                                                row_offset,
+                                                key_scales[t_row],
+                                            )
+                                        }
+                                    }
+                                    KvCacheFormat::Q4 => {
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            dot_q4_row_ptr(
+                                                q_head,
+                                                key_cache_q4,
+                                                row_offset,
+                                                key_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            )
+                                        }
+                                    }
+                                };
+                                if apply_attn_scale {
+                                    score *= attn_scale_score;
+                                }
+                                *slot = score;
+                            }
+
+                            softmax(att_head, pos + 1);
+
+                            xb_head.fill(0.0);
+                            for (t, &a) in att_head.iter().enumerate() {
+                                let t_row = layer_row_base + t;
+                                let row_offset = t_row * kv_dim + kv_head_offset;
+                                match kv_format {
+                                    KvCacheFormat::Q8 => {
+                                        if q8_block_scales {
+                                            let sb = t_row * n_blocks_per_row;
+                                            unsafe {
+                                                axpy_q8_row_blocks_ptr(
+                                                    xb_head,
+                                                    a,
+                                                    value_cache_q8,
+                                                    row_offset,
+                                                    value_head_scales_ptr.add(sb),
+                                                    blocks_per_head,
+                                                );
+                                            }
+                                        } else {
+                                            axpy_q8_row(
+                                                xb_head,
+                                                a,
+                                                value_cache_q8,
+                                                row_offset,
+                                                value_scales[t_row],
+                                            );
+                                        }
+                                    }
+                                    KvCacheFormat::Q4 => {
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            axpy_q4_row_ptr(
+                                                xb_head,
+                                                a,
+                                                value_cache_q4,
+                                                row_offset,
+                                                value_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+            } else {
+                for h in 0..p.n_heads {
+                    let hs = h * head_size;
+                    let q_head = &q_all[hs..hs + head_size];
+                    let kv_head = h / kv_mul;
+                    let kv_head_offset = kv_head * head_size;
+                    let head_block_off = kv_head * blocks_per_head;
+                    let key_head_scales_ptr = unsafe { key_scales.as_ptr().add(head_block_off) };
+                    let value_head_scales_ptr =
+                        unsafe { value_scales.as_ptr().add(head_block_off) };
+                    let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
+                    let att_head = &mut att_head_full[..=pos];
+                    let xb_head = &mut xb_all[hs..hs + head_size];
+                    if fuse_qwen35_online_attn {
+                        xb_head.fill(0.0);
+                        let mut max_score = f32::NEG_INFINITY;
+                        let mut score_sum = 0.0f32;
+                        for t in 0..=pos {
+                            let t_row = layer_row_base + t;
+                            let row_offset = t_row * kv_dim + kv_head_offset;
+                            let mut score = match kv_format {
+                                KvCacheFormat::Q8 => {
+                                    if q8_block_scales {
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            dot_q8_row_blocks_ptr(
+                                                q_head,
+                                                key_cache_q8,
+                                                row_offset,
+                                                key_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            )
+                                        }
+                                    } else {
+                                        dot_q8_row(
+                                            q_head,
+                                            key_cache_q8,
+                                            row_offset,
+                                            key_scales[t_row],
+                                        )
+                                    }
+                                }
+                                KvCacheFormat::Q4 => {
+                                    let sb = t_row * n_blocks_per_row;
+                                    unsafe {
+                                        dot_q4_row_ptr(
+                                            q_head,
+                                            key_cache_q4,
+                                            row_offset,
+                                            key_head_scales_ptr.add(sb),
+                                            blocks_per_head,
+                                        )
+                                    }
+                                }
+                            };
+                            if apply_attn_scale {
+                                score *= attn_scale_score;
+                            }
+
+                            if score > max_score {
+                                if score_sum > 0.0 {
+                                    let rescale = (max_score - score).exp();
+                                    scale_slice_inplace(xb_head, rescale);
+                                    score_sum *= rescale;
+                                }
+                                max_score = score;
+                            }
+
+                            let weight = (score - max_score).exp();
+                            score_sum += weight;
+                            match kv_format {
+                                KvCacheFormat::Q8 => {
+                                    if q8_block_scales {
+                                        let sb = t_row * n_blocks_per_row;
+                                        unsafe {
+                                            axpy_q8_row_blocks_ptr(
+                                                xb_head,
+                                                weight,
+                                                value_cache_q8,
+                                                row_offset,
+                                                value_head_scales_ptr.add(sb),
+                                                blocks_per_head,
+                                            );
+                                        }
+                                    } else {
+                                        axpy_q8_row(
+                                            xb_head,
+                                            weight,
+                                            value_cache_q8,
+                                            row_offset,
+                                            value_scales[t_row],
+                                        );
+                                    }
+                                }
+                                KvCacheFormat::Q4 => {
+                                    let sb = t_row * n_blocks_per_row;
+                                    unsafe {
+                                        axpy_q4_row_ptr(
+                                            xb_head,
+                                            weight,
+                                            value_cache_q4,
+                                            row_offset,
+                                            value_head_scales_ptr.add(sb),
+                                            blocks_per_head,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if score_sum > 0.0 {
+                            scale_slice_inplace(xb_head, 1.0 / score_sum);
+                        }
+                    } else {
                         for (t, slot) in att_head.iter_mut().enumerate() {
                             let t_row = layer_row_base + t;
                             let row_offset = t_row * kv_dim + kv_head_offset;
@@ -1450,104 +1759,6 @@ fn transformer_inner(
                                 }
                             }
                         }
-                    });
-            } else {
-                for h in 0..p.n_heads {
-                    let hs = h * head_size;
-                    let q_head = &q_all[hs..hs + head_size];
-                    let kv_head = h / kv_mul;
-                    let kv_head_offset = kv_head * head_size;
-                    let head_block_off = kv_head * blocks_per_head;
-                    let key_head_scales_ptr = unsafe { key_scales.as_ptr().add(head_block_off) };
-                    let value_head_scales_ptr =
-                        unsafe { value_scales.as_ptr().add(head_block_off) };
-                    let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
-                    let att_head = &mut att_head_full[..=pos];
-
-                    for (t, slot) in att_head.iter_mut().enumerate() {
-                        let t_row = layer_row_base + t;
-                        let row_offset = t_row * kv_dim + kv_head_offset;
-                        let mut score = match kv_format {
-                            KvCacheFormat::Q8 => {
-                                if q8_block_scales {
-                                    let sb = t_row * n_blocks_per_row;
-                                    unsafe {
-                                        dot_q8_row_blocks_ptr(
-                                            q_head,
-                                            key_cache_q8,
-                                            row_offset,
-                                            key_head_scales_ptr.add(sb),
-                                            blocks_per_head,
-                                        )
-                                    }
-                                } else {
-                                    dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
-                                }
-                            }
-                            KvCacheFormat::Q4 => {
-                                let sb = t_row * n_blocks_per_row;
-                                unsafe {
-                                    dot_q4_row_ptr(
-                                        q_head,
-                                        key_cache_q4,
-                                        row_offset,
-                                        key_head_scales_ptr.add(sb),
-                                        blocks_per_head,
-                                    )
-                                }
-                            }
-                        };
-                        if apply_attn_scale {
-                            score *= attn_scale_score;
-                        }
-                        *slot = score;
-                    }
-
-                    softmax(att_head, pos + 1);
-
-                    let xb_head = &mut xb_all[hs..hs + head_size];
-                    xb_head.fill(0.0);
-                    for (t, &a) in att_head.iter().enumerate() {
-                        let t_row = layer_row_base + t;
-                        let row_offset = t_row * kv_dim + kv_head_offset;
-                        match kv_format {
-                            KvCacheFormat::Q8 => {
-                                if q8_block_scales {
-                                    let sb = t_row * n_blocks_per_row;
-                                    unsafe {
-                                        axpy_q8_row_blocks_ptr(
-                                            xb_head,
-                                            a,
-                                            value_cache_q8,
-                                            row_offset,
-                                            value_head_scales_ptr.add(sb),
-                                            blocks_per_head,
-                                        );
-                                    }
-                                } else {
-                                    axpy_q8_row(
-                                        xb_head,
-                                        a,
-                                        value_cache_q8,
-                                        row_offset,
-                                        value_scales[t_row],
-                                    );
-                                }
-                            }
-                            KvCacheFormat::Q4 => {
-                                let sb = t_row * n_blocks_per_row;
-                                unsafe {
-                                    axpy_q4_row_ptr(
-                                        xb_head,
-                                        a,
-                                        value_cache_q4,
-                                        row_offset,
-                                        value_head_scales_ptr.add(sb),
-                                        blocks_per_head,
-                                    );
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -1556,11 +1767,12 @@ fn transformer_inner(
                 for h in 0..p.n_heads {
                     let src_base = h * 2 * head_size + head_size;
                     let dst_base = h * head_size;
-                    for i in 0..head_size {
-                        s.xb[dst_base + i] =
-                            finite_or_zero(s.xb[dst_base + i] * sigmoidf(s.hb[src_base + i]));
-                    }
+                    sigmoid_mul_inplace(
+                        &mut s.xb[dst_base..dst_base + head_size],
+                        &s.hb[src_base..src_base + head_size],
+                    );
                 }
+                sanitize_finite_inplace(&mut s.xb[..q_dim]);
             }
             matmul_quantized(&mut s.xb2[..dim], &s.xb[..q_dim], &w.wo[l], mapped)?;
             sanitize_finite_inplace(&mut s.xb2[..dim]);
@@ -1633,47 +1845,129 @@ fn transformer_inner(
             s.xb[..dim].fill(0.0);
 
             if !disable_routed {
+                let mut routed_selected = Vec::with_capacity(n_selected);
                 for j in 0..n_selected {
-                    let expert_idx = s.moe_topk_indices[j];
                     let route_weight = s.moe_topk_weights[j];
-                    if route_weight == 0.0 {
-                        continue;
+                    if route_weight != 0.0 {
+                        routed_selected.push((s.moe_topk_indices[j], route_weight));
                     }
+                }
 
-                    let row_start_ffn = expert_idx * expert_hidden;
-                    matmul_quantized_rows(
-                        &mut s.hb[..expert_hidden],
-                        &s.xb2[..dim],
-                        &w.moe_gate_exps[l],
-                        row_start_ffn,
-                        expert_hidden,
-                        mapped,
-                    )?;
-                    matmul_quantized_rows(
-                        &mut s.hb2[..expert_hidden],
-                        &s.xb2[..dim],
-                        &w.moe_up_exps[l],
-                        row_start_ffn,
-                        expert_hidden,
-                        mapped,
-                    )?;
+                if routed_selected.len() >= 2 {
+                    let xb2 = &s.xb2[..dim];
+                    let gate_exps = &w.moe_gate_exps[l];
+                    let up_exps = &w.moe_up_exps[l];
+                    let down_exps = &w.moe_down_exps[l];
 
-                    silu_and_mul_inplace(&mut s.hb[..expert_hidden], &s.hb2[..expert_hidden]);
+                    let (_, _, _, routed_acc) = routed_selected
+                        .par_iter()
+                        .try_fold(
+                            || {
+                                (
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; dim],
+                                    vec![0.0f32; dim],
+                                )
+                            },
+                            |(mut hb_local, mut hb2_local, mut moe_tmp_local, mut acc_local),
+                             &(expert_idx, route_weight)|
+                             -> Result<MoeRoutedScratch, String> {
+                                let row_start_ffn = expert_idx * expert_hidden;
+                                matmul_quantized_rows(
+                                    &mut hb_local[..expert_hidden],
+                                    xb2,
+                                    gate_exps,
+                                    row_start_ffn,
+                                    expert_hidden,
+                                    mapped,
+                                )?;
+                                matmul_quantized_rows(
+                                    &mut hb2_local[..expert_hidden],
+                                    xb2,
+                                    up_exps,
+                                    row_start_ffn,
+                                    expert_hidden,
+                                    mapped,
+                                )?;
+                                silu_and_mul_inplace(
+                                    &mut hb_local[..expert_hidden],
+                                    &hb2_local[..expert_hidden],
+                                );
 
-                    let row_start_down = expert_idx * dim;
-                    matmul_quantized_rows(
-                        &mut s.moe_tmp[..dim],
-                        &s.hb[..expert_hidden],
-                        &w.moe_down_exps[l],
-                        row_start_down,
-                        dim,
-                        mapped,
-                    )?;
-                    crate::engine::kernels::axpy_inplace(
-                        &mut s.xb[..dim],
-                        route_weight,
-                        &s.moe_tmp[..dim],
-                    );
+                                let row_start_down = expert_idx * dim;
+                                matmul_quantized_rows(
+                                    &mut moe_tmp_local[..dim],
+                                    &hb_local[..expert_hidden],
+                                    down_exps,
+                                    row_start_down,
+                                    dim,
+                                    mapped,
+                                )?;
+                                crate::engine::kernels::axpy_inplace(
+                                    &mut acc_local[..dim],
+                                    route_weight,
+                                    &moe_tmp_local[..dim],
+                                );
+                                Ok((hb_local, hb2_local, moe_tmp_local, acc_local))
+                            },
+                        )
+                        .try_reduce(
+                            || {
+                                (
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; dim],
+                                    vec![0.0f32; dim],
+                                )
+                            },
+                            |(hb_a, hb2_a, tmp_a, mut acc_a), (_, _, _, acc_b)| {
+                                crate::engine::kernels::axpy_inplace(
+                                    &mut acc_a[..dim],
+                                    1.0,
+                                    &acc_b[..dim],
+                                );
+                                Ok((hb_a, hb2_a, tmp_a, acc_a))
+                            },
+                        )?;
+                    s.xb[..dim].copy_from_slice(&routed_acc[..dim]);
+                } else {
+                    for &(expert_idx, route_weight) in &routed_selected {
+                        let row_start_ffn = expert_idx * expert_hidden;
+                        matmul_quantized_rows(
+                            &mut s.hb[..expert_hidden],
+                            &s.xb2[..dim],
+                            &w.moe_gate_exps[l],
+                            row_start_ffn,
+                            expert_hidden,
+                            mapped,
+                        )?;
+                        matmul_quantized_rows(
+                            &mut s.hb2[..expert_hidden],
+                            &s.xb2[..dim],
+                            &w.moe_up_exps[l],
+                            row_start_ffn,
+                            expert_hidden,
+                            mapped,
+                        )?;
+
+                        silu_and_mul_inplace(&mut s.hb[..expert_hidden], &s.hb2[..expert_hidden]);
+
+                        let row_start_down = expert_idx * dim;
+                        matmul_quantized_rows(
+                            &mut s.moe_tmp[..dim],
+                            &s.hb[..expert_hidden],
+                            &w.moe_down_exps[l],
+                            row_start_down,
+                            dim,
+                            mapped,
+                        )?;
+                        crate::engine::kernels::axpy_inplace(
+                            &mut s.xb[..dim],
+                            route_weight,
+                            &s.moe_tmp[..dim],
+                        );
+                    }
                 }
             }
 

@@ -44,3 +44,13 @@ Example downloads:
 Notes:
 - Use a same-family pair (`Qwen3.5` text model with `Qwen3.5` mmproj). Do not mix `Qwen3-VL` and `Qwen3.5` sidecars.
 - Place the sidecar in the same directory as the model; discovery is automatic.
+
+## Gemma3 `mmproj` (vision encoder)
+
+Gemma3 GGUF multimodal use also requires a sidecar:
+- LLM (`gemma-3-...*.gguf`)
+- vision encoder sidecar (`mmproj-gemma-3-...*.gguf`, `clip.projector_type=gemma3`)
+
+Notes:
+- Use a same-checkpoint pair (for example, `gemma-3-4b-it` text model with `mmproj-gemma-3-4b-it` sidecar).
+- Place the sidecar in the same directory as the model; discovery is automatic.

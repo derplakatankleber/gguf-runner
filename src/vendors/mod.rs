@@ -86,12 +86,112 @@ fn has_tensor_with_any_prefix(gguf: &GGUFFile, prefixes: &[&str]) -> bool {
     })
 }
 
+fn normalize_alpha_num(input: &str) -> String {
+    input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect::<String>()
+}
+
+fn qwen_mmproj_family_markers(mmproj: &GGUFFile) -> (bool, bool) {
+    let mut combined = String::new();
+    for key in [
+        "general.name",
+        "general.basename",
+        "general.finetune",
+        "general.base_model.0.name",
+        "general.base_model.0.repo_url",
+        "general.repo_url",
+    ] {
+        if let Some(value) = get_gguf_string_from_map(&mmproj.kv, key) {
+            combined.push_str(value);
+            combined.push(' ');
+        }
+    }
+    let normalized = normalize_alpha_num(&combined);
+    let has_qwen3vl = normalized.contains("qwen3vl");
+    let has_qwen35 = normalized.contains("qwen35") || normalized.contains("qwen3p5");
+    (has_qwen3vl, has_qwen35)
+}
+
+pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Result<(), String> {
+    let arch = get_gguf_string_from_map(&mmproj.kv, "general.architecture").unwrap_or_default();
+    let projector = get_gguf_string_from_map(&mmproj.kv, "clip.projector_type").unwrap_or_default();
+    let projection_dim =
+        get_gguf_int_from_map(&mmproj.kv, "clip.vision.projection_dim", 0) as usize;
+    if projection_dim == 0 {
+        return Err(
+            "mmproj is missing clip.vision.projection_dim; cannot verify text/vision dim compatibility"
+                .to_string(),
+        );
+    }
+    if projection_dim != cfg.dim {
+        return Err(format!(
+            "mmproj/text dim mismatch: clip.vision.projection_dim={} but model embedding dim={}. hint: this mmproj likely belongs to a different checkpoint",
+            projection_dim, cfg.dim
+        ));
+    }
+
+    match cfg.capabilities.multimodal_backend {
+        MultimodalBackend::Gemma3 => {
+            if arch != "clip" || projector != "gemma3" {
+                return Err(
+                    "unsupported mmproj for this runner: expected clip.projector_type='gemma3'"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
+            if arch != "clip" || projector != "qwen3vl_merger" {
+                return Err(
+                    "unsupported mmproj for this runner: expected clip.projector_type='qwen3vl_merger'"
+                        .to_string(),
+                );
+            }
+            let (has_qwen3vl, has_qwen35) = qwen_mmproj_family_markers(mmproj);
+            match cfg.capabilities.multimodal_backend {
+                MultimodalBackend::Qwen35 => {
+                    if has_qwen3vl && !has_qwen35 {
+                        return Err("incompatible mmproj family for qwen35 backend: sidecar metadata indicates Qwen3-VL; use a Qwen3.5 mmproj from the same checkpoint family".to_string());
+                    }
+                    if mmproj
+                        .tensors
+                        .iter()
+                        .any(|tensor| tensor.name.starts_with("v.deepstack."))
+                    {
+                        return Err("incompatible mmproj family for qwen35 backend: deepstack vision tensors detected (Qwen3-VL style); use a Qwen3.5 mmproj sidecar".to_string());
+                    }
+                }
+                MultimodalBackend::Qwen3Vl => {
+                    if has_qwen35 && !has_qwen3vl {
+                        return Err("incompatible mmproj family for qwen3vl backend: sidecar metadata indicates Qwen3.5; use a Qwen3-VL mmproj from the same checkpoint family".to_string());
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "external vision mmproj is unsupported for backend '{}'",
+            cfg.capabilities.multimodal_backend.as_str()
+        )),
+    }
+}
+
 fn detect_model_capabilities(
     gguf: &GGUFFile,
     family: ModelFamily,
     debug_mode: bool,
 ) -> ModelCapabilities {
     let multimodal_backend = match family {
+        ModelFamily::Gemma
+            if get_gguf_string_from_map(&gguf.kv, "general.architecture").unwrap_or_default()
+                == "gemma3" =>
+        {
+            MultimodalBackend::Gemma3
+        }
         ModelFamily::Qwen3Vl => MultimodalBackend::Qwen3Vl,
         ModelFamily::Qwen35 => MultimodalBackend::Qwen35,
         _ => MultimodalBackend::None,
@@ -101,34 +201,40 @@ fn detect_model_capabilities(
         return ModelCapabilities::default();
     }
 
-    let has_vision_start = has_vocab_token(gguf, "<|vision_start|>");
-    let has_vision_end = has_vocab_token(gguf, "<|vision_end|>");
-    let has_image_pad = has_vocab_token(gguf, "<|image_pad|>");
-    let has_video_pad = has_vocab_token(gguf, "<|video_pad|>");
-    let has_audio_pad = has_vocab_token(gguf, "<|audio_pad|>");
+    let (has_image_tokens, has_video_tokens, has_audio_tokens) = match multimodal_backend {
+        MultimodalBackend::Gemma3 => (
+            has_vocab_token(gguf, "<start_of_image>") && has_vocab_token(gguf, "<end_of_image>"),
+            false,
+            false,
+        ),
+        MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => (
+            has_vocab_token(gguf, "<|vision_start|>")
+                && has_vocab_token(gguf, "<|vision_end|>")
+                && has_vocab_token(gguf, "<|image_pad|>"),
+            has_vocab_token(gguf, "<|vision_start|>")
+                && has_vocab_token(gguf, "<|vision_end|>")
+                && has_vocab_token(gguf, "<|video_pad|>"),
+            has_vocab_token(gguf, "<|audio_pad|>"),
+        ),
+        MultimodalBackend::None => (false, false, false),
+    };
     let has_vision_tensors = has_tensor_with_any_prefix(gguf, VISION_TENSOR_PREFIXES);
     let has_audio_tensors = has_tensor_with_any_prefix(gguf, AUDIO_TENSOR_PREFIXES);
 
     let capabilities = ModelCapabilities {
         multimodal_backend,
-        supports_native_image: has_vision_start
-            && has_vision_end
-            && has_image_pad
-            && has_vision_tensors,
-        supports_native_video: has_vision_start
-            && has_vision_end
-            && has_video_pad
-            && has_vision_tensors,
-        supports_native_audio: has_audio_pad && has_audio_tensors,
+        supports_native_image: has_image_tokens && has_vision_tensors,
+        supports_native_video: has_video_tokens && has_vision_tensors,
+        supports_native_audio: has_audio_tokens && has_audio_tensors,
     };
 
     if debug_mode {
         eprintln!(
             "Multimodal capability probe (backend={}): tokens(image={} video={} audio={}) tensors(vision={} audio={}) native(image={} video={} audio={})",
             capabilities.multimodal_backend.as_str(),
-            has_vision_start && has_vision_end && has_image_pad,
-            has_vision_start && has_vision_end && has_video_pad,
-            has_audio_pad,
+            has_image_tokens,
+            has_video_tokens,
+            has_audio_tokens,
             has_vision_tensors,
             has_audio_tensors,
             capabilities.supports_native_image,
@@ -463,14 +569,15 @@ pub(crate) fn encode_generation_request(
     request: &GenerationRequest,
     think_mode: ThinkMode,
 ) -> EncodedPrompt {
+    if config.is_gemma3 {
+        return gemma::encode_generation_request(tokenizer, request);
+    }
     if config.is_qwen3moe || config.is_qwen3next || config.is_qwen3vl || config.is_qwen35 {
         return qwen::encode_qwen3_request(tokenizer, request, think_mode);
     }
 
     let prompt = join_request_text(&request.parts);
-    let token_ids = if config.is_gemma3 {
-        gemma::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
-    } else if config.is_qwen2 {
+    let token_ids = if config.is_qwen2 {
         qwen::encode_qwen2_chat(tokenizer, &prompt, &request.system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)

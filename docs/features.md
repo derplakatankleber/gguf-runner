@@ -32,7 +32,7 @@ Supported tensor data paths include:
 - Linux mmap memory-advice hints for mapped model pages (best-effort)
 - tokenizer initialization from GGUF vocab/metadata
 - model-family-specific chat prompt rendering
-- multimodal request/model capability scaffolding for Qwen3-VL and Qwen3.5:
+- multimodal request/model capability scaffolding for Gemma3, Qwen3-VL, and Qwen3.5:
   - startup capability probe for native image/video/audio support (token + tensor checks)
   - llama-style local `mmproj*.gguf` sidecar auto-discovery/probe (no extra CLI flag)
   - strict native-only multimodal execution (no metadata fallback path)
@@ -44,7 +44,9 @@ Supported tensor data paths include:
 - multimodal request scaffolding:
   - repeatable `--video <path>` input parsing/validation (`mp4`)
   - repeatable `--audio <path>` input parsing/validation (extension-agnostic)
-  - structured prompt encoding for multimodal requests with placeholder span mapping (image/video/audio)
+  - structured prompt encoding for multimodal requests with placeholder span mapping:
+    - Gemma3 image placeholders (`<start_of_image>` / `<end_of_image>`)
+    - Qwen image/video/audio placeholders
   - runtime prompt/media alignment validation before preprocessing
   - generation loop prefill hook for external embeddings (`transformer_with_embedding`) is wired for future native media injection
   - clearer media capability diagnostics when GGUF is missing native multimodal tensor groups
@@ -52,7 +54,7 @@ Supported tensor data paths include:
   - native preprocessing foundation:
     - image:
       - PNG/JPEG/WebP decode
-      - deterministic resize + center crop
+      - deterministic resize modes (`CenterCrop`, `FitWithin`, `Stretch`) selected per backend/profile
       - RGB -> CHW tensor conversion
       - normalization profiles (`UnitRange` and `MeanStd`)
     - video:

@@ -1,7 +1,25 @@
-use super::{VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy};
-use crate::engine::types::{
-    Config, Tokenizer, VendorTokenizerPolicy, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
+use super::{
+    MmprojFilenameScoreHint, VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy,
 };
+use crate::engine::types::{
+    Config, ContentPart, EncodedPrompt, GenerationRequest, MultimodalBackend, PlaceholderSpan,
+    Tokenizer, VendorTokenizerPolicy, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
+};
+
+const GEMMA_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
+    MmprojFilenameScoreHint {
+        token: "gemma3",
+        backend: MultimodalBackend::Gemma3,
+        match_score: 100,
+        mismatch_score: -100,
+    },
+    MmprojFilenameScoreHint {
+        token: "gemma",
+        backend: MultimodalBackend::Gemma3,
+        match_score: 25,
+        mismatch_score: -25,
+    },
+];
 
 pub(super) fn default_rope_theta() -> f32 {
     1_000_000.0
@@ -30,20 +48,62 @@ pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
 }
 
 pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
-    VendorMultimodalPolicy::default()
+    VendorMultimodalPolicy {
+        mmproj_filename_score_hints: GEMMA_MMPROJ_SCORE_HINTS,
+        missing_sidecar_hint: " hint: Gemma3 image inputs require a compatible Gemma3 mmproj sidecar from the same checkpoint family.",
+        ..VendorMultimodalPolicy::default()
+    }
 }
 
 pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
     VendorRuntimeDebugPolicy::default()
 }
 
-pub(super) fn encode_chat_prompt(
+fn append_encoded_literal(
     tokenizer: &mut Tokenizer,
-    prompt: &str,
-    system_prompt: &str,
-) -> Vec<i32> {
+    temp: &mut Vec<i32>,
+    tokens: &mut Vec<i32>,
+    literal: &str,
+) -> (usize, usize) {
+    let start = tokens.len();
+    tokenizer.bpe_encode(literal, temp);
+    tokens.extend_from_slice(temp);
+    (start, tokens.len().saturating_sub(start))
+}
+
+fn append_image_placeholder(
+    tokenizer: &mut Tokenizer,
+    temp: &mut Vec<i32>,
+    tokens: &mut Vec<i32>,
+    image_index: usize,
+    image_spans: &mut Vec<PlaceholderSpan>,
+) {
+    let image_start = tokenizer.find_special_token("<start_of_image>");
+    let image_end = tokenizer.find_special_token("<end_of_image>");
+    let (token_start, token_len) = if let (Some(start), Some(end)) = (image_start, image_end) {
+        let start_idx = tokens.len();
+        tokens.push(start);
+        tokens.push(end);
+        (start_idx, 2)
+    } else {
+        append_encoded_literal(tokenizer, temp, tokens, "<start_of_image><end_of_image>")
+    };
+
+    image_spans.push(PlaceholderSpan {
+        token_start,
+        token_len,
+        media_index: image_index,
+    });
+}
+
+pub(super) fn encode_generation_request(
+    tokenizer: &mut Tokenizer,
+    request: &GenerationRequest,
+) -> EncodedPrompt {
     let mut tokens: Vec<i32> = Vec::with_capacity(8192);
     let mut temp: Vec<i32> = Vec::with_capacity(8192);
+    let mut image_spans: Vec<PlaceholderSpan> = Vec::new();
+    let mut image_index = 0usize;
 
     let bos_token = tokenizer
         .find_special_token("<bos>")
@@ -56,16 +116,36 @@ pub(super) fn encode_chat_prompt(
         .unwrap_or(GEMMA3_END_TURN);
 
     tokens.push(bos_token);
-
-    let full_prompt = if !system_prompt.is_empty() {
-        format!("{}\n\n{}", system_prompt, prompt)
-    } else {
-        prompt.to_string()
-    };
-
     tokens.push(start_turn);
-    tokenizer.bpe_encode(&format!("user\n{}", full_prompt), &mut temp);
+    tokenizer.bpe_encode("user\n", &mut temp);
     tokens.extend_from_slice(&temp);
+
+    let system_prompt = request.system_prompt.trim();
+    if !system_prompt.is_empty() {
+        tokenizer.bpe_encode(system_prompt, &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode("\n\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+    for part in &request.parts {
+        match part {
+            ContentPart::Text(text) => {
+                tokenizer.bpe_encode(text, &mut temp);
+                tokens.extend_from_slice(&temp);
+            }
+            ContentPart::Image(_) => {
+                append_image_placeholder(
+                    tokenizer,
+                    &mut temp,
+                    &mut tokens,
+                    image_index,
+                    &mut image_spans,
+                );
+                image_index += 1;
+            }
+            ContentPart::Video(_) | ContentPart::Audio(_) => {}
+        }
+    }
 
     tokens.push(end_turn);
     tokenizer.bpe_encode("\n", &mut temp);
@@ -75,5 +155,69 @@ pub(super) fn encode_chat_prompt(
     tokenizer.bpe_encode("model\n", &mut temp);
     tokens.extend_from_slice(&temp);
 
-    tokens
+    EncodedPrompt {
+        token_ids: tokens,
+        image_spans,
+        video_spans: Vec::new(),
+        audio_spans: Vec::new(),
+    }
+}
+
+pub(super) fn encode_chat_prompt(
+    tokenizer: &mut Tokenizer,
+    prompt: &str,
+    system_prompt: &str,
+) -> Vec<i32> {
+    let request = GenerationRequest {
+        system_prompt: system_prompt.to_string(),
+        parts: vec![ContentPart::Text(prompt.to_string())],
+    };
+    encode_generation_request(tokenizer, &request).token_ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_generation_request;
+    use crate::engine::types::{ContentPart, GenerationRequest, MediaRef, Tokenizer};
+
+    fn tokenizer_with_gemma_specials() -> Tokenizer {
+        Tokenizer {
+            vocab: vec![
+                "<bos>".to_string(),
+                "<start_of_turn>".to_string(),
+                "<end_of_turn>".to_string(),
+                "<start_of_image>".to_string(),
+                "<end_of_image>".to_string(),
+            ],
+            ..Tokenizer::default()
+        }
+    }
+
+    #[test]
+    fn gemma_request_maps_image_placeholder_span() {
+        let mut tokenizer = tokenizer_with_gemma_specials();
+        let request = GenerationRequest {
+            system_prompt: String::new(),
+            parts: vec![
+                ContentPart::Text("describe".to_string()),
+                ContentPart::Image(MediaRef {
+                    path: "img.png".to_string(),
+                }),
+            ],
+        };
+
+        let encoded = encode_generation_request(&mut tokenizer, &request);
+        assert_eq!(encoded.image_spans.len(), 1);
+
+        let start = tokenizer
+            .find_special_token("<start_of_image>")
+            .expect("start_of_image");
+        let end = tokenizer
+            .find_special_token("<end_of_image>")
+            .expect("end_of_image");
+        let span = encoded.image_spans[0];
+        assert_eq!(encoded.token_ids[span.token_start], start);
+        assert_eq!(encoded.token_ids[span.token_start + 1], end);
+        assert_eq!(encoded.image_spans[0].token_len, 2);
+    }
 }

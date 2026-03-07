@@ -2,8 +2,7 @@ use crate::cli::CliOptions;
 use crate::engine::io::{get_gguf_string_from_map, parse_gguf_file};
 use crate::engine::kernels::{argmax, sample, softmax, TopKSampler};
 use crate::engine::multimodal::{
-    build_vision_encoder_from_mmproj, expand_prompt_with_image_embeddings,
-    validate_mmproj_for_backend, VisionEncoder,
+    build_vision_encoder_from_mmproj, expand_prompt_with_image_embeddings, VisionEncoder,
 };
 use crate::engine::profiling::{prof_end, prof_start, record_forward_pass, PROF_TRANSFORMER_NS};
 use crate::engine::types::{
@@ -418,19 +417,37 @@ impl ModelRuntime {
     }
 
     fn has_image_tokens(&self) -> bool {
-        self.has_vocab_token("<|vision_start|>")
-            && self.has_vocab_token("<|vision_end|>")
-            && self.has_vocab_token("<|image_pad|>")
+        match self.config.capabilities.multimodal_backend {
+            MultimodalBackend::Gemma3 => {
+                self.has_vocab_token("<start_of_image>") && self.has_vocab_token("<end_of_image>")
+            }
+            MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
+                self.has_vocab_token("<|vision_start|>")
+                    && self.has_vocab_token("<|vision_end|>")
+                    && self.has_vocab_token("<|image_pad|>")
+            }
+            MultimodalBackend::None => false,
+        }
     }
 
     fn has_video_tokens(&self) -> bool {
-        self.has_vocab_token("<|vision_start|>")
-            && self.has_vocab_token("<|vision_end|>")
-            && self.has_vocab_token("<|video_pad|>")
+        match self.config.capabilities.multimodal_backend {
+            MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
+                self.has_vocab_token("<|vision_start|>")
+                    && self.has_vocab_token("<|vision_end|>")
+                    && self.has_vocab_token("<|video_pad|>")
+            }
+            MultimodalBackend::Gemma3 | MultimodalBackend::None => false,
+        }
     }
 
     fn has_audio_tokens(&self) -> bool {
-        self.has_vocab_token("<|audio_pad|>")
+        match self.config.capabilities.multimodal_backend {
+            MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
+                self.has_vocab_token("<|audio_pad|>")
+            }
+            MultimodalBackend::Gemma3 | MultimodalBackend::None => false,
+        }
     }
 
     fn supports_external_vision(&self) -> bool {
@@ -747,7 +764,7 @@ impl ModelRuntime {
                 ),
                 n_tensors: sidecar.n_tensors,
             };
-            if let Err(e) = validate_mmproj_for_backend(cfg, &sidecar) {
+            if let Err(e) = crate::vendors::validate_mmproj_for_backend(cfg, &sidecar) {
                 if debug_mode {
                     eprintln!(
                         "Skipping mmproj sidecar '{}': not compatible with backend '{}' ({e})",
@@ -794,11 +811,24 @@ impl ModelRuntime {
     }
 
     fn native_media_probe_details(&self) -> String {
-        let has_vision_start = self.has_vocab_token("<|vision_start|>");
-        let has_vision_end = self.has_vocab_token("<|vision_end|>");
-        let has_image_pad = self.has_vocab_token("<|image_pad|>");
-        let has_video_pad = self.has_vocab_token("<|video_pad|>");
-        let has_audio_pad = self.has_vocab_token("<|audio_pad|>");
+        let (has_image_start, has_image_end, has_image_pad, has_video_pad, has_audio_pad) =
+            match self.config.capabilities.multimodal_backend {
+                MultimodalBackend::Gemma3 => (
+                    self.has_vocab_token("<start_of_image>"),
+                    self.has_vocab_token("<end_of_image>"),
+                    false,
+                    false,
+                    false,
+                ),
+                MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => (
+                    self.has_vocab_token("<|vision_start|>"),
+                    self.has_vocab_token("<|vision_end|>"),
+                    self.has_vocab_token("<|image_pad|>"),
+                    self.has_vocab_token("<|video_pad|>"),
+                    self.has_vocab_token("<|audio_pad|>"),
+                ),
+                MultimodalBackend::None => (false, false, false, false, false),
+            };
         let has_vision_encoder =
             self.has_tensor_with_any_prefix(Self::VISION_ENCODER_TENSOR_PREFIXES);
         let has_vision_projector =
@@ -806,7 +836,7 @@ impl ModelRuntime {
         let has_audio_encoder = self.has_tensor_with_any_prefix(Self::AUDIO_TENSOR_PREFIXES);
         let top_prefixes = self.summarize_tensor_prefixes(8);
         let vision_placeholders =
-            has_vision_start && has_vision_end && (has_image_pad || has_video_pad);
+            has_image_start && has_image_end && (self.has_image_tokens() || has_video_pad);
         let likely_text_only_export =
             vision_placeholders && !has_vision_encoder && !has_vision_projector;
         let text_only_hint = if likely_text_only_export {
@@ -827,11 +857,11 @@ impl ModelRuntime {
         };
 
         format!(
-            "probe details: arch='{}', n_tensors={}, tokens(vision_start={} vision_end={} image_pad={} video_pad={} audio_pad={}), tensor_groups_main(vision_encoder={} vision_projector={} audio={}), effective_support(image={} video={} audio={}), {}, top_tensor_prefixes=[{}].{}{}",
+            "probe details: arch='{}', n_tensors={}, tokens(image_start={} image_end={} image_pad={} video_pad={} audio_pad={}), tensor_groups_main(vision_encoder={} vision_projector={} audio={}), effective_support(image={} video={} audio={}), {}, top_tensor_prefixes=[{}].{}{}",
             self.model_architecture(),
             self.gguf.n_tensors,
-            has_vision_start,
-            has_vision_end,
+            has_image_start,
+            has_image_end,
             has_image_pad,
             has_video_pad,
             has_audio_pad,
@@ -930,6 +960,17 @@ impl ModelRuntime {
                     align_to,
                 );
             }
+            if self.config.capabilities.multimodal_backend == MultimodalBackend::Gemma3 {
+                // Gemma3 SigLIP path follows llama.cpp behavior: direct resize to fixed
+                // square input size (no aspect-preserving fit + crop).
+                return ImagePreprocessProfile::new_with_mode(
+                    base_size,
+                    base_size,
+                    clip_norm,
+                    ImageResizeMode::Stretch,
+                    1,
+                );
+            }
             return ImagePreprocessProfile::new_with_mode(
                 base_size,
                 base_size,
@@ -943,6 +984,13 @@ impl ModelRuntime {
             MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
                 ImagePreprocessProfile::new(224, 224, fallback_norm)
             }
+            MultimodalBackend::Gemma3 => ImagePreprocessProfile::new_with_mode(
+                896,
+                896,
+                fallback_norm,
+                ImageResizeMode::Stretch,
+                1,
+            ),
             MultimodalBackend::None => {
                 ImagePreprocessProfile::new(448, 448, ImageNormalization::UnitRange)
             }
@@ -1215,6 +1263,35 @@ impl ModelRuntime {
         }
 
         let weights = crate::engine::weights::init_weights_from_gguf(&gguf, &config, debug_mode)?;
+        if debug_mode && config.is_gemma3 && config.dim > 0 {
+            let sample_rows = config.vocab_size.min(2048);
+            if sample_rows > 0 {
+                let mut min_norm = f32::INFINITY;
+                let mut max_norm = 0.0f32;
+                let mut sum_norm = 0.0f32;
+                let scale = (config.dim as f32).sqrt();
+                for row in 0..sample_rows {
+                    let start = row * config.dim;
+                    let end = start + config.dim;
+                    let norm = weights.token_embedding_table[start..end]
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f32>()
+                        .sqrt()
+                        * scale;
+                    min_norm = min_norm.min(norm);
+                    max_norm = max_norm.max(norm);
+                    sum_norm += norm;
+                }
+                eprintln!(
+                    "Gemma token embedding norms (scaled, sample={}): min/avg/max={:.4}/{:.4}/{:.4}",
+                    sample_rows,
+                    min_norm,
+                    sum_norm / sample_rows as f32,
+                    max_norm
+                );
+            }
+        }
         let multimodal_weights =
             crate::engine::weights::init_multimodal_weights_from_gguf(&gguf, &config, debug_mode)?;
         let vendor_decode_policy = crate::vendors::decode_policy(&config);
@@ -1414,6 +1491,32 @@ impl ModelRuntime {
                 )
             })?;
             let image_embeddings = encoder.encode_images(&prepared_images)?;
+            if self.settings.debug_mode {
+                if let Some(first) = image_embeddings.first() {
+                    let mut min_norm = f32::INFINITY;
+                    let mut max_norm = 0.0f32;
+                    let mut sum_norm = 0.0f32;
+                    for token in &first.tokens {
+                        let norm = token.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        min_norm = min_norm.min(norm);
+                        max_norm = max_norm.max(norm);
+                        sum_norm += norm;
+                    }
+                    let avg_norm = if first.tokens.is_empty() {
+                        0.0
+                    } else {
+                        sum_norm / first.tokens.len() as f32
+                    };
+                    let backend = self.config.capabilities.multimodal_backend.as_str();
+                    eprintln!(
+                        "{backend} image embeddings: tokens={} norm(min/avg/max)={:.4}/{:.4}/{:.4}",
+                        first.tokens.len(),
+                        min_norm,
+                        avg_norm,
+                        max_norm
+                    );
+                }
+            }
             let (expanded_tokens, injected) = expand_prompt_with_image_embeddings(
                 &encoded_prompt,
                 &image_embeddings,
@@ -1549,8 +1652,7 @@ impl ModelRuntime {
             .len()
             .saturating_add(max_new_tokens)
             .min(self.config.seq_len);
-        let hidden_mode_caps = if decode_policy.parse_think_tags && think_mode == ThinkMode::Hidden
-        {
+        let think_caps = if decode_policy.parse_think_tags {
             let new_budget = total_limit.saturating_sub(prompt_tokens.len());
             let vendor_base = if self.config.is_qwen35 || self.config.is_qwen3next {
                 384usize
@@ -1599,6 +1701,17 @@ impl ModelRuntime {
         } else {
             None
         };
+        let hidden_mode_caps = if think_mode == ThinkMode::Hidden {
+            think_caps
+        } else {
+            None
+        };
+        let visible_yes_think_cap = if think_mode == ThinkMode::Yes {
+            think_caps.map(|(think_cap, _)| think_cap)
+        } else {
+            None
+        };
+        let mut visible_yes_think_token_count = 0usize;
         if let Some((think_cap, total_cap)) = hidden_mode_caps {
             if debug_mode {
                 eprintln!(
@@ -1769,6 +1882,28 @@ impl ModelRuntime {
                             );
                         }
                         break;
+                    }
+                }
+                if let Some(visible_think_cap) = visible_yes_think_cap {
+                    if is_thinking {
+                        visible_yes_think_token_count =
+                            visible_yes_think_token_count.saturating_add(1);
+                        if visible_yes_think_token_count >= visible_think_cap {
+                            is_thinking = false;
+                            think_tail.clear();
+                            append_visible_text(
+                                THINK_CLOSE_TAG,
+                                &mut output,
+                                &mut pending_newline,
+                                stream_stdout,
+                            );
+                            if debug_mode || show_tokens {
+                                eprintln!(
+                                    "\nNote: forced close of visible thinking block after {} tokens without </think>",
+                                    visible_think_cap
+                                );
+                            }
+                        }
                     }
                 }
                 if token == self.tokenizer.eos_token || token == self.tokenizer.eot_token {

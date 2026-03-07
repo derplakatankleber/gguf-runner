@@ -12,6 +12,7 @@ Use this section as a starting point for structured performance collection.
 
 | host_id | os | cpu | cores | memory gb | notes |
 |---|---|---|---|---:|---|
+| mac-m2-24g | macOS 15.3 | Apple M2 | 8 | 24 | laptop |
 | mac-m4-32g | macOS 15.3 | Apple M4 | 10 | 32 | laptop |
 | lnx-n150-12g | Gentoo Linux | Intel N150 | 4 | 12 | Beelink ME mini |
 | lnx-1340p-32g | Fedora 14 | Intel i5-1340P | 16 | 32 | Framework 13 |
@@ -28,16 +29,37 @@ Use this section as a starting point for structured performance collection.
 gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write me a programm in Rust that can convert PNG images to JPEG" --temperature=0 --show-tokens --show-timings
 ```
 
-### Benchmark Runs
+#### image_v1
+  "Describe the content of this image."
+
+### Benchmark Runs - Current Models
 
 | date | model | host_id | prompts | tokens/sec | runtime sec | notes |
 |---|---|---|---|---:|---:|---|
 | 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.106 | 317.936 | |
 | 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.522 | 275.898 | |
-| 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 4.753 | 206.488 | |
+| 2026-03-07 | gemma-3-4b-it-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 5.483 | 186.410 | |
+| 2026-02-15 | gemma-3-4b-it-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 6.894 | 147.734 | |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 2.770 | 135.304 | |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.109 | 124.928 |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.292 | 111.207 | |
+| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 0.409 | 2240.847 | |
+| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.613 | 530.794 | |
+| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-125h-32g | png_to_jpeg_v1 | 2.228 | 369.767 | |
+| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 4.932 | 186.182 | |
+| 2026-02-16 | Qwen3-235B-A22B-Instruct-2507-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 0.652 | 1125.015 | |
+| 2026-03-07 | Qwen3.5-0.8B-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 4.456 | 110.072 | |
+| 2026-03-07 | Qwen3.5-0.8B-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 22.116 | 22.764 | |
+| 2026-03-07 | Qwen3.5-0.8B-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 34.652 | 14.941 | |
+| 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 1.936 | 239.441 | |
+| 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 10.774 | 47.773 | |
+| 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 15.915 | 33.569 | |
+
+
+### Benchmark Runs - Older Models
+
+| date | model | host_id | prompts | tokens/sec | runtime sec | notes |
+|---|---|---|---|---:|---:|---|
 | 2026-02-15 | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.251 | 421.389 | |
 | 2026-02-15 | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 1.798 | 289.223 | |
 | 2026-02-15 | Qwen3-0.6B-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 6.236 | 179.751 | |
@@ -55,11 +77,6 @@ gguf-runner --model Qwen3-4B-Instruct-2507-Q4_K_M.gguf --prompt "Can you write m
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | mac-m4-32g | png_to_jpeg_v1 | 3.625 | 268.448 | |
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | lnx-125h-32g | png_to_jpeg_v1 | 5.010 | 256.944 | |
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | lnx-9700-64g | png_to_jpeg_v1 | 7.287 | 154.820 | |
-| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 0.409 | 2240.847 | |
-| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.613 | 530.794 | |
-| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-125h-32g | png_to_jpeg_v1 | 2.228 | 369.767 | |
-| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 4.932 | 186.182 | |
-| 2026-02-16 | Qwen3-235B-A22B-Instruct-2507-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 0.652 | 1125.015 | |
 
 ## Benchmark Caveats
 

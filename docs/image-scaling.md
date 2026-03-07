@@ -52,6 +52,12 @@ preserving aspect ratio, with no cropping.
 Qwen3-VL models always use exactly `base_size` (768 px) with a **CenterCrop** resize mode.
 The image is first scaled so the shorter edge equals the target, then center-cropped to a square.
 
+## Gemma3 — fixed SigLIP resolution
+
+Gemma3 multimodal models use the mmproj encoder `base_size` (typically 896 px) with a
+**Stretch** resize mode, matching llama.cpp Gemma3 preprocessing: direct bilinear resize to
+`base_size × base_size` without aspect-preserving fit or center-crop.
+
 ## Detail crop (Qwen3.5 small models only)
 
 For Qwen3.5 models with 24 or fewer transformer layers (e.g. the 2B variant), a second image
@@ -70,3 +76,4 @@ with the caption `(Second image: centered close-up crop of the same source.)`.
 ## Fallback (no mmproj sidecar)
 
 If no mmproj sidecar is found, a minimal 224 × 224 fallback profile is used for Qwen models.
+Gemma3 fallback uses 896 × 896 with the same **Stretch** resize mode.

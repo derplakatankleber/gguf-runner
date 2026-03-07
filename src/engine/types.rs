@@ -134,6 +134,7 @@ impl EncodedPrompt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MultimodalBackend {
     None,
+    Gemma3,
     Qwen3Vl,
     Qwen35,
 }
@@ -142,6 +143,7 @@ impl MultimodalBackend {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             MultimodalBackend::None => "none",
+            MultimodalBackend::Gemma3 => "gemma3",
             MultimodalBackend::Qwen3Vl => "qwen3vl",
             MultimodalBackend::Qwen35 => "qwen35",
         }
@@ -312,7 +314,7 @@ pub(crate) enum GgufValue {
     F64(f64),
     F32Array(Vec<f32>),
     I64Array(Vec<i64>),
-    Bool(()),
+    Bool(bool),
     Str(String),
 }
 

@@ -157,6 +157,7 @@ pub(super) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
             mmproj_filename_score_hints: QWEN_MMPROJ_SCORE_HINTS,
             ..VendorMultimodalPolicy::default()
         },
+        MultimodalBackend::Gemma3 => VendorMultimodalPolicy::default(),
         MultimodalBackend::None => VendorMultimodalPolicy::default(),
     }
 }

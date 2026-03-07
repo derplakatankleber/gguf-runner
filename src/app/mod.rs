@@ -337,7 +337,6 @@ fn build_generation_request(
     audios: Vec<String>,
 ) -> GenerationRequest {
     let mut parts = Vec::with_capacity(1 + images.len() + videos.len() + audios.len());
-    parts.push(ContentPart::Text(prompt.to_string()));
     for path in images {
         parts.push(ContentPart::Image(MediaRef { path }));
     }
@@ -347,6 +346,7 @@ fn build_generation_request(
     for path in audios {
         parts.push(ContentPart::Audio(MediaRef { path }));
     }
+    parts.push(ContentPart::Text(prompt.to_string()));
     GenerationRequest {
         system_prompt: system_prompt.to_string(),
         parts,

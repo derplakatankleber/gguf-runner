@@ -105,8 +105,8 @@ Known-good status from `docs/performance.md` (text benchmarks) and local model/m
 
 | Model | Text | Vision |
 |---|---|---|
+| `gemma-3-4b-it-Q4_K_M.gguf` | ✅ | ✅ |
 | `Meta-Llama-3-8B-Instruct-Q4_K_M.gguf` | ✅ | ❌ |
-| `gemma-3-4b-it-Q4_K_M.gguf` | ✅ | ❌ |
 | `Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf` | ✅ | ❌ |
 | `Qwen3-0.6B-Q4_K_M.gguf` | ✅ | ❌ |
 | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | ✅ | ❌ |

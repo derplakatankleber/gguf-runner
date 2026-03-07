@@ -11,9 +11,9 @@ pub(crate) struct ImageEmbeddingSequence {
 fn validate_image_spans(encoded: &EncodedPrompt) -> Result<(), String> {
     let mut prev_end = 0usize;
     for span in &encoded.image_spans {
-        if span.token_len < 3 {
+        if span.token_len < 2 {
             return Err(format!(
-                "image placeholder span[{}] is too short: token_len={} (expected at least 3 for vision_start/image_pad/vision_end)",
+                "image placeholder span[{}] is too short: token_len={} (expected at least 2 for image begin/end markers)",
                 span.media_index, span.token_len
             ));
         }
@@ -28,14 +28,16 @@ fn validate_image_spans(encoded: &EncodedPrompt) -> Result<(), String> {
     Ok(())
 }
 
-fn image_pad_token_id(encoded: &EncodedPrompt, span: &PlaceholderSpan) -> Result<i32, String> {
-    let pad_idx = span.token_start + 1;
-    encoded.token_ids.get(pad_idx).copied().ok_or_else(|| {
-        format!(
-            "cannot read image_pad token for image span[{}]",
-            span.media_index
-        )
-    })
+fn image_marker_tokens(encoded: &EncodedPrompt, span: &PlaceholderSpan) -> (i32, i32, i32) {
+    let span_tokens = &encoded.token_ids[span.token_start..span.token_start + span.token_len];
+    let begin = span_tokens[0];
+    let end = span_tokens[span_tokens.len() - 1];
+    let placeholder = if span.token_len >= 3 {
+        span_tokens[1]
+    } else {
+        begin
+    };
+    (begin, placeholder, end)
 }
 
 pub(crate) fn expand_prompt_with_image_embeddings(
@@ -72,11 +74,8 @@ pub(crate) fn expand_prompt_with_image_embeddings(
 
         out_tokens.extend_from_slice(&encoded.token_ids[src_cursor..span.token_start]);
 
-        let span_tokens = &encoded.token_ids[span.token_start..span.token_start + span.token_len];
-        let vision_start = span_tokens[0];
-        let vision_end = span_tokens[span_tokens.len() - 1];
-        let image_pad = image_pad_token_id(encoded, span)?;
-        out_tokens.push(vision_start);
+        let (image_begin, image_placeholder, image_end) = image_marker_tokens(encoded, span);
+        out_tokens.push(image_begin);
 
         let seq = &image_embeddings[image_idx];
         if seq.tokens.is_empty() {
@@ -96,11 +95,11 @@ pub(crate) fn expand_prompt_with_image_embeddings(
                 ));
             }
             let dst_pos = out_tokens.len();
-            out_tokens.push(image_pad);
+            out_tokens.push(image_placeholder);
             injected_embeddings.insert(dst_pos, emb.clone());
         }
 
-        out_tokens.push(vision_end);
+        out_tokens.push(image_end);
         src_cursor = span.token_start + span.token_len;
     }
 

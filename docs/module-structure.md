@@ -26,6 +26,7 @@ src/
       gguf.rs
     multimodal/
       mod.rs
+      gemma3.rs
       injection.rs
       qwen3vl.rs
     vision/
@@ -99,9 +100,14 @@ src/
       - images: decode + resize/crop + normalize + CHW tensor conversion
       - for external mmproj vision backends, image resize target is taken from encoder metadata (for example `clip.vision.image_size`) instead of a fixed 224x224 fallback
       - qwen35 backend uses fit-within preprocessing (aspect-ratio preserving, patch-aligned) at a balanced intermediate scale to retain full-frame text regions while limiting visual-token overload
+      - gemma3 backend uses fixed-size stretch resize to encoder image_size (llama.cpp-compatible SigLIP preprocess semantics)
       - videos: currently unavailable in no-external-dependency mode
       - audio: currently unavailable in no-external-dependency mode
     - native image embedding execution via in-engine multimodal backend (`qwen3vl`/`qwen35` mmproj sidecar path)
+      - Gemma3 sidecar path uses `<start_of_image>`/`<end_of_image>` prompt markers and SigLIP-style projector pooling
+    - think-tag decode safeguards:
+      - hidden-think mode enforces bounded think/total token caps
+      - visible-think mode enforces a bounded think phase and auto-closes missing `</think>` when exceeded
     - explicit current-state errors for unimplemented native video/audio embedding execution
   - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
 
@@ -197,7 +203,7 @@ src/
 - `vision/preprocess.rs` currently provides deterministic preprocessing:
   - images:
     - decode (`png`/`jpeg`/`webp` via `image` crate)
-    - resize + center crop to profile target size
+    - resize to profile target using mode (`CenterCrop` / `FitWithin` / `Stretch`)
     - CHW float tensor conversion
     - configurable normalization profile (`UnitRange` / `MeanStd`)
   - videos:
@@ -218,10 +224,14 @@ src/
   - loads and applies optional `v.deepstack.*` layer branches, fused into projected media embeddings
   - uses SIMD dot products + rayon head-parallel attention for the vision self-attention hot path
   - emits language-space image token embeddings for prompt injection
+- `multimodal/gemma3.rs`:
+  - Gemma3 CLIP/mmproj image encoder path (`clip.projector_type='gemma3'`)
+  - runs ViT layers with separate q/k/v projections, patch-grid average pooling, RMS normalization, and `mm.input_projection` into text embedding space
+  - full-resolution ViT path is default; optional pre-attention fast-pooling shortcut is opt-in via `GGUF_GEMMA3_ENABLE_FAST_POOL=1`
+  - emits language-space image token embeddings for prompt injection
 - `multimodal/mod.rs`:
   - backend construction (`build_vision_encoder_from_mmproj`)
-  - validates sidecar compatibility (`validate_mmproj_for_backend`) and enables external `mmproj` construction for `qwen3vl` and `qwen35` backends
-  - enforces strict family checks to prevent cross-pairing (`qwen3vl` sidecar on `qwen35` text model and vice versa)
+  - enables external `mmproj` encoder construction for `gemma3`, `qwen3vl`, and `qwen35` backends
   - encoder abstraction (`VisionEncoder`)
 
 ### `src/engine/tokenizer/mod.rs`
@@ -295,7 +305,8 @@ src/
   - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
   - Builds `Config` from family-specific key conventions.
   - Detects `qwen35` explicitly and maps it onto the Qwen3Next-style runtime path.
-  - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `qwen3vl` and `qwen35`.
+  - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `gemma3`, `qwen3vl`, and `qwen35`.
+  - Performs vendor-specific mmproj sidecar compatibility checks (`validate_mmproj_for_backend(...)`) including projector type, projection dim matching, and Qwen family/deepstack guards.
   - Dispatches vendor policies used by app/tokenizer decode paths:
     - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`)
     - `tokenizer_policy(...)` returning `VendorTokenizerPolicy`
@@ -303,7 +314,7 @@ src/
     - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
   - Routes both simple chat prompt encoding and structured `GenerationRequest` encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
-  - Family-specific defaults, validations, prompt rendering, and family-owned policy constructors (including Qwen MoE routing defaults/scaling and Qwen image/video/audio placeholder-span mapping).
+  - Family-specific defaults, validations, prompt rendering, and family-owned policy constructors (including Qwen MoE routing defaults/scaling, Qwen image/video/audio placeholder-span mapping, and Gemma image placeholder-span mapping via `<start_of_image>`/`<end_of_image>`).
 
 ## Runtime Data Flow
 
@@ -317,7 +328,7 @@ src/
 8. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
 9. Standard mode:
   - CLI media inputs are normalized into `engine::types::GenerationRequest` with `ContentPart` items.
-  - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths.
+  - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths and image spans on Gemma multimodal path.
   - runtime validates prompt/media alignment before starting preprocessing.
   - if native multimodal tensors are unavailable, runtime fails with a qualified native-capability error that includes architecture/token/tensor probe details.
   - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, stop-token matching, and deterministic loop-guard behavior.

@@ -12,6 +12,7 @@ pub(crate) enum ImageNormalization {
 pub(crate) enum ImageResizeMode {
     CenterCrop,
     FitWithin,
+    Stretch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -260,6 +261,29 @@ fn resize_fit_within(
     ))
 }
 
+fn resize_stretch_exact(
+    rgb: &RgbImage,
+    target_width: usize,
+    target_height: usize,
+) -> Result<RgbImage, String> {
+    if target_width == 0 || target_height == 0 {
+        return Err("invalid image target size: width/height must be > 0".to_string());
+    }
+    let src_w = rgb.width() as usize;
+    let src_h = rgb.height() as usize;
+    if src_w == target_width && src_h == target_height {
+        return Ok(rgb.clone());
+    }
+    // Match llama.cpp clip preprocess behavior for Gemma3 projector path:
+    // direct bilinear resize to the model's fixed image size.
+    Ok(image::imageops::resize(
+        rgb,
+        target_width as u32,
+        target_height as u32,
+        FilterType::Triangle,
+    ))
+}
+
 fn resize_for_profile(rgb: &RgbImage, profile: ImagePreprocessProfile) -> Result<RgbImage, String> {
     match profile.resize_mode {
         ImageResizeMode::CenterCrop => {
@@ -271,6 +295,9 @@ fn resize_for_profile(rgb: &RgbImage, profile: ImagePreprocessProfile) -> Result
             profile.target_height,
             profile.align_to,
         ),
+        ImageResizeMode::Stretch => {
+            resize_stretch_exact(rgb, profile.target_width, profile.target_height)
+        }
     }
 }
 
@@ -485,6 +512,21 @@ mod tests {
         assert_eq!(out.height(), 1024);
         assert_eq!(out.width() % 32, 0);
         assert_eq!(out.height() % 32, 0);
+    }
+
+    #[test]
+    fn resize_stretch_forces_target_dimensions() {
+        let src = RgbImage::from_fn(100, 50, |_, _| image::Rgb([255, 255, 255]));
+        let profile = ImagePreprocessProfile::new_with_mode(
+            64,
+            64,
+            ImageNormalization::UnitRange,
+            ImageResizeMode::Stretch,
+            1,
+        );
+        let out = resize_for_profile(&src, profile).unwrap();
+        assert_eq!(out.width(), 64);
+        assert_eq!(out.height(), 64);
     }
 
     fn write_fixture_image(path: &std::path::Path, format: ImageFormat) {

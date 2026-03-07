@@ -1,5 +1,6 @@
 use crate::engine::io::{
-    find_gguf_tensor, get_gguf_f32_array_from_map, get_gguf_float_from_map, get_gguf_int_from_map,
+    find_gguf_tensor, get_gguf_bool_from_map, get_gguf_f32_array_from_map, get_gguf_float_from_map,
+    get_gguf_int_from_map,
 };
 use crate::engine::kernels::{
     axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size, matmul_quantized,
@@ -9,8 +10,6 @@ use crate::engine::multimodal::injection::ImageEmbeddingSequence;
 use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-
-type PatchTokenGrid = (Vec<f32>, Vec<(usize, usize)>, usize, usize);
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n_elements = 1usize;
@@ -91,31 +90,18 @@ fn load_tensor_quantized(
     })
 }
 
-fn tensor_matrix_shape(tensor: &Gguftensor, name: &str) -> Result<(usize, usize), String> {
-    if tensor.n_dims < 2 {
-        return Err(format!(
-            "tensor {name} has n_dims={}, expected at least 2 for matrix weight",
-            tensor.n_dims
-        ));
-    }
-    let cols = tensor.ne[0] as usize;
-    let rows = tensor.ne[1] as usize;
-    if rows == 0 || cols == 0 {
-        return Err(format!(
-            "tensor {name} has invalid matrix shape rows={rows} cols={cols}"
-        ));
-    }
-    Ok((rows, cols))
-}
-
 #[derive(Clone)]
 struct VisionLayerWeights {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
     ln2_w: Vec<f32>,
     ln2_b: Vec<f32>,
-    attn_qkv_w: QuantizedTensor,
-    attn_qkv_b: Vec<f32>,
+    attn_q_w: QuantizedTensor,
+    attn_q_b: Vec<f32>,
+    attn_k_w: QuantizedTensor,
+    attn_k_b: Vec<f32>,
+    attn_v_w: QuantizedTensor,
+    attn_v_b: Vec<f32>,
     attn_out_w: QuantizedTensor,
     attn_out_b: Vec<f32>,
     ffn_up_w: QuantizedTensor,
@@ -124,17 +110,7 @@ struct VisionLayerWeights {
     ffn_down_b: Vec<f32>,
 }
 
-#[derive(Clone)]
-struct DeepstackLayerWeights {
-    norm_w: Vec<f32>,
-    norm_b: Vec<f32>,
-    fc1_w: QuantizedTensor,
-    fc1_b: Vec<f32>,
-    fc2_w: QuantizedTensor,
-    fc2_b: Vec<f32>,
-}
-
-pub(crate) struct Qwen3VlVisionEncoder {
+pub(crate) struct Gemma3VisionEncoder {
     gguf: GGUFFile,
     dim: usize,
     head_count: usize,
@@ -144,25 +120,32 @@ pub(crate) struct Qwen3VlVisionEncoder {
     eps: f32,
     patch_size: usize,
     base_image_size: usize,
-    spatial_merge: usize,
+    merge_factor: usize,
     image_mean: [f32; 3],
     image_std: [f32; 3],
-    patch_embd_w0: Vec<f32>,
-    patch_embd_w1: Vec<f32>,
+    use_gelu: bool,
+    patch_embd_w: Vec<f32>,
     patch_embd_b: Vec<f32>,
     position_embd: Vec<f32>,
     post_ln_w: Vec<f32>,
     post_ln_b: Vec<f32>,
-    mm0_w: QuantizedTensor,
-    mm0_b: Vec<f32>,
-    mm2_w: QuantizedTensor,
-    mm2_b: Vec<f32>,
+    mm_input_proj_w: Vec<f32>,
+    mm_input_proj_ne0: usize,
+    mm_input_proj_ne1: usize,
+    mm_soft_emb_norm_w: Vec<f32>,
     layers: Vec<VisionLayerWeights>,
-    deepstack_layers: Vec<DeepstackLayerWeights>,
-    deepstack_by_layer: Vec<Option<usize>>,
 }
 
-impl Qwen3VlVisionEncoder {
+impl Gemma3VisionEncoder {
+    const FAST_PRE_ATTENTION_POOL_THRESHOLD: usize = 2_048;
+
+    fn fast_pooling_enabled() -> bool {
+        matches!(
+            std::env::var("GGUF_GEMMA3_ENABLE_FAST_POOL"),
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        )
+    }
+
     fn parse_rgb_triplet(
         kv_values: Option<&[f32]>,
         default: [f32; 3],
@@ -185,18 +168,14 @@ impl Qwen3VlVisionEncoder {
     }
 
     pub(crate) fn recommended_image_alignment(&self) -> usize {
-        self.patch_size.saturating_mul(self.spatial_merge).max(1)
+        self.patch_size.saturating_mul(self.merge_factor).max(1)
     }
 
     pub(crate) fn recommended_image_normalization(&self) -> ([f32; 3], [f32; 3]) {
         (self.image_mean, self.image_std)
     }
 
-    pub(crate) fn new(
-        gguf: GGUFFile,
-        target_dim: usize,
-        expected_deepstack_layers: usize,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(gguf: GGUFFile, target_dim: usize) -> Result<Self, String> {
         let dim = get_gguf_int_from_map(&gguf.kv, "clip.vision.embedding_length", 0) as usize;
         let head_count =
             get_gguf_int_from_map(&gguf.kv, "clip.vision.attention.head_count", 0) as usize;
@@ -204,32 +183,45 @@ impl Qwen3VlVisionEncoder {
         let n_layers = get_gguf_int_from_map(&gguf.kv, "clip.vision.block_count", 0) as usize;
         let eps =
             get_gguf_float_from_map(&gguf.kv, "clip.vision.attention.layer_norm_epsilon", 1e-6);
-        let patch_size = get_gguf_int_from_map(&gguf.kv, "clip.vision.patch_size", 16) as usize;
+        let patch_size = get_gguf_int_from_map(&gguf.kv, "clip.vision.patch_size", 14) as usize;
         let base_image_size =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.image_size", 768) as usize;
-        let spatial_merge =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.spatial_merge_size", 2) as usize;
+            get_gguf_int_from_map(&gguf.kv, "clip.vision.image_size", 896) as usize;
+        let merge_factor =
+            get_gguf_int_from_map(&gguf.kv, "clip.vision.projector.scale_factor", 4) as usize;
         let image_mean = Self::parse_rgb_triplet(
             get_gguf_f32_array_from_map(&gguf.kv, "clip.vision.image_mean"),
-            [0.48145466, 0.4578275, 0.40821073],
+            [0.5, 0.5, 0.5],
             "clip.vision.image_mean",
         )?;
         let image_std = Self::parse_rgb_triplet(
             get_gguf_f32_array_from_map(&gguf.kv, "clip.vision.image_std"),
-            [0.26862954, 0.261_302_6, 0.2757771],
+            [0.5, 0.5, 0.5],
             "clip.vision.image_std",
         )?;
+        let use_gelu = get_gguf_bool_from_map(&gguf.kv, "clip.use_gelu", true);
 
-        if dim == 0 || head_count == 0 || ff_dim == 0 || n_layers == 0 || patch_size == 0 {
+        if dim == 0
+            || head_count == 0
+            || ff_dim == 0
+            || n_layers == 0
+            || patch_size == 0
+            || merge_factor == 0
+        {
             return Err(
-                "invalid qwen3vl mmproj metadata: one or more required clip.vision.* keys are missing/zero"
+                "invalid gemma3 mmproj metadata: one or more required clip.vision.* keys are missing/zero"
                     .to_string(),
             );
         }
         if !dim.is_multiple_of(head_count) {
             return Err(format!(
-                "invalid qwen3vl mmproj metadata: dim {} is not divisible by head_count {}",
+                "invalid gemma3 mmproj metadata: dim {} is not divisible by head_count {}",
                 dim, head_count
+            ));
+        }
+        if !base_image_size.is_multiple_of(patch_size) {
+            return Err(format!(
+                "invalid gemma3 mmproj metadata: image_size {} is not divisible by patch_size {}",
+                base_image_size, patch_size
             ));
         }
         let head_dim = dim / head_count;
@@ -239,41 +231,36 @@ impl Qwen3VlVisionEncoder {
             .and_then(|v| v.checked_mul(3))
             .and_then(|v| v.checked_mul(dim))
             .ok_or_else(|| "patch kernel element count overflow".to_string())?;
-        let base_patch_grid = base_image_size
-            .checked_div(patch_size)
-            .ok_or_else(|| "invalid base image/patch ratio".to_string())?;
+        let base_patch_grid = base_image_size / patch_size;
         let base_pos_tokens = base_patch_grid
             .checked_mul(base_patch_grid)
             .ok_or_else(|| "position token count overflow".to_string())?;
 
-        let patch_embd_w0 =
+        let patch_embd_w =
             load_tensor_float(&gguf, "v.patch_embd.weight", Some(patch_kernel_elems))?;
-        let patch_embd_w1 =
-            load_tensor_float(&gguf, "v.patch_embd.weight.1", Some(patch_kernel_elems))?;
         let patch_embd_b = load_tensor_float(&gguf, "v.patch_embd.bias", Some(dim))?;
         let position_embd =
             load_tensor_float(&gguf, "v.position_embd.weight", Some(base_pos_tokens * dim))?;
         let post_ln_w = load_tensor_float(&gguf, "v.post_ln.weight", Some(dim))?;
         let post_ln_b = load_tensor_float(&gguf, "v.post_ln.bias", Some(dim))?;
-
-        let mm0_w = load_tensor_quantized(
-            &gguf,
-            "mm.0.weight",
-            dim * spatial_merge * spatial_merge,
-            dim * spatial_merge * spatial_merge,
-        )?;
-        let mm0_b = load_tensor_float(
-            &gguf,
-            "mm.0.bias",
-            Some(dim * spatial_merge * spatial_merge),
-        )?;
-        let mm2_w = load_tensor_quantized(
-            &gguf,
-            "mm.2.weight",
-            target_dim,
-            dim * spatial_merge * spatial_merge,
-        )?;
-        let mm2_b = load_tensor_float(&gguf, "mm.2.bias", Some(target_dim))?;
+        let mm_input_proj_t = find_gguf_tensor(&gguf, "mm.input_projection.weight")
+            .ok_or_else(|| "tensor not found: mm.input_projection.weight".to_string())?;
+        if mm_input_proj_t.n_dims < 2 {
+            return Err("tensor mm.input_projection.weight must be at least 2D".to_string());
+        }
+        let mm_input_proj_ne0 = mm_input_proj_t.ne[0] as usize;
+        let mm_input_proj_ne1 = mm_input_proj_t.ne[1] as usize;
+        // llama.cpp gemma3 path multiplies transpose(mm.input_projection.weight),
+        // so we expect stored shape [text_dim, vision_dim] and project to [vision_dim, text_dim].
+        if mm_input_proj_ne0 != target_dim || mm_input_proj_ne1 != dim {
+            return Err(format!(
+                "unexpected mm.input_projection.weight shape: got {}x{}, expected {}x{} (text_dim x vision_dim)",
+                mm_input_proj_ne0, mm_input_proj_ne1, target_dim, dim
+            ));
+        }
+        let mm_input_proj_w =
+            load_tensor_float(&gguf, "mm.input_projection.weight", Some(target_dim * dim))?;
+        let mm_soft_emb_norm_w = load_tensor_float(&gguf, "mm.soft_emb_norm.weight", Some(dim))?;
 
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -283,17 +270,27 @@ impl Qwen3VlVisionEncoder {
                 ln1_b: load_tensor_float(&gguf, &format!("{prefix}.ln1.bias"), Some(dim))?,
                 ln2_w: load_tensor_float(&gguf, &format!("{prefix}.ln2.weight"), Some(dim))?,
                 ln2_b: load_tensor_float(&gguf, &format!("{prefix}.ln2.bias"), Some(dim))?,
-                attn_qkv_w: load_tensor_quantized(
+                attn_q_w: load_tensor_quantized(
                     &gguf,
-                    &format!("{prefix}.attn_qkv.weight"),
-                    dim * 3,
+                    &format!("{prefix}.attn_q.weight"),
+                    dim,
                     dim,
                 )?,
-                attn_qkv_b: load_tensor_float(
+                attn_q_b: load_tensor_float(&gguf, &format!("{prefix}.attn_q.bias"), Some(dim))?,
+                attn_k_w: load_tensor_quantized(
                     &gguf,
-                    &format!("{prefix}.attn_qkv.bias"),
-                    Some(dim * 3),
+                    &format!("{prefix}.attn_k.weight"),
+                    dim,
+                    dim,
                 )?,
+                attn_k_b: load_tensor_float(&gguf, &format!("{prefix}.attn_k.bias"), Some(dim))?,
+                attn_v_w: load_tensor_quantized(
+                    &gguf,
+                    &format!("{prefix}.attn_v.weight"),
+                    dim,
+                    dim,
+                )?,
+                attn_v_b: load_tensor_float(&gguf, &format!("{prefix}.attn_v.bias"), Some(dim))?,
                 attn_out_w: load_tensor_quantized(
                     &gguf,
                     &format!("{prefix}.attn_out.weight"),
@@ -326,74 +323,6 @@ impl Qwen3VlVisionEncoder {
             });
         }
 
-        let merged_dim = dim
-            .checked_mul(spatial_merge)
-            .and_then(|v| v.checked_mul(spatial_merge))
-            .ok_or_else(|| "deepstack merged dimension overflow".to_string())?;
-        let mut deepstack_layers = Vec::new();
-        let mut deepstack_by_layer = vec![None; n_layers];
-        for (l, ds_slot) in deepstack_by_layer.iter_mut().enumerate() {
-            if expected_deepstack_layers == 0 {
-                continue;
-            }
-            if deepstack_layers.len() >= expected_deepstack_layers {
-                continue;
-            }
-            let norm_w_name = format!("v.deepstack.{l}.norm.weight");
-            if find_gguf_tensor(&gguf, &norm_w_name).is_none() {
-                continue;
-            }
-
-            let norm_b_name = format!("v.deepstack.{l}.norm.bias");
-            let fc1_w_name = format!("v.deepstack.{l}.fc1.weight");
-            let fc1_b_name = format!("v.deepstack.{l}.fc1.bias");
-            let fc2_w_name = format!("v.deepstack.{l}.fc2.weight");
-            let fc2_b_name = format!("v.deepstack.{l}.fc2.bias");
-
-            let fc1_t = find_gguf_tensor(&gguf, &fc1_w_name)
-                .ok_or_else(|| format!("tensor not found: {fc1_w_name}"))?;
-            let (fc1_rows, fc1_cols) = tensor_matrix_shape(fc1_t, &fc1_w_name)?;
-            if fc1_cols != merged_dim {
-                return Err(format!(
-                    "deepstack fc1 shape mismatch at layer {l}: cols={} expected merged_dim={}",
-                    fc1_cols, merged_dim
-                ));
-            }
-
-            let fc2_t = find_gguf_tensor(&gguf, &fc2_w_name)
-                .ok_or_else(|| format!("tensor not found: {fc2_w_name}"))?;
-            let (fc2_rows, fc2_cols) = tensor_matrix_shape(fc2_t, &fc2_w_name)?;
-            if fc2_cols != fc1_rows {
-                return Err(format!(
-                    "deepstack fc2 shape mismatch at layer {l}: cols={} expected fc1_rows={}",
-                    fc2_cols, fc1_rows
-                ));
-            }
-            if fc2_rows != target_dim {
-                return Err(format!(
-                    "deepstack fc2 output dim mismatch at layer {l}: rows={} expected target_dim={}",
-                    fc2_rows, target_dim
-                ));
-            }
-
-            *ds_slot = Some(deepstack_layers.len());
-            deepstack_layers.push(DeepstackLayerWeights {
-                norm_w: load_tensor_float(&gguf, &norm_w_name, Some(merged_dim))?,
-                norm_b: load_tensor_float(&gguf, &norm_b_name, Some(merged_dim))?,
-                fc1_w: load_tensor_quantized(&gguf, &fc1_w_name, fc1_rows, fc1_cols)?,
-                fc1_b: load_tensor_float(&gguf, &fc1_b_name, Some(fc1_rows))?,
-                fc2_w: load_tensor_quantized(&gguf, &fc2_w_name, fc2_rows, fc2_cols)?,
-                fc2_b: load_tensor_float(&gguf, &fc2_b_name, Some(fc2_rows))?,
-            });
-        }
-        if deepstack_layers.len() != expected_deepstack_layers {
-            return Err(format!(
-                "mmproj/text deepstack mismatch: mmproj provides {} usable deepstack layer(s), but text model expects {}. hint: use an mmproj from the exact same Qwen3-VL checkpoint",
-                deepstack_layers.len(),
-                expected_deepstack_layers
-            ));
-        }
-
         Ok(Self {
             gguf,
             dim,
@@ -404,28 +333,30 @@ impl Qwen3VlVisionEncoder {
             eps,
             patch_size,
             base_image_size,
-            spatial_merge,
+            merge_factor,
             image_mean,
             image_std,
-            patch_embd_w0,
-            patch_embd_w1,
+            use_gelu,
+            patch_embd_w,
             patch_embd_b,
             position_embd,
             post_ln_w,
             post_ln_b,
-            mm0_w,
-            mm0_b,
-            mm2_w,
-            mm2_b,
+            mm_input_proj_w,
+            mm_input_proj_ne0,
+            mm_input_proj_ne1,
+            mm_soft_emb_norm_w,
             layers,
-            deepstack_layers,
-            deepstack_by_layer,
         })
     }
 
     fn gelu(x: f32) -> f32 {
-        // Approximation used widely in inference runtimes.
         0.5 * x * (1.0 + (0.7978846 * (x + 0.044715 * x * x * x)).tanh())
+    }
+
+    fn quick_gelu(x: f32) -> f32 {
+        let z = 1.702 * x;
+        x / (1.0 + (-z).exp())
     }
 
     fn layer_norm(&self, dst: &mut [f32], src: &[f32], w: &[f32], b: &[f32]) {
@@ -447,6 +378,18 @@ impl Qwen3VlVisionEncoder {
         }
     }
 
+    fn rms_norm_mul_weight(&self, dst: &mut [f32], src: &[f32], w: &[f32]) {
+        let mut mean_sq = 0.0f32;
+        for &v in src {
+            mean_sq += v * v;
+        }
+        mean_sq /= src.len() as f32;
+        let inv = 1.0f32 / (mean_sq + self.eps).sqrt();
+        for i in 0..src.len() {
+            dst[i] = src[i] * inv * w[i];
+        }
+    }
+
     fn add_bias(v: &mut [f32], b: &[f32]) {
         for i in 0..v.len() {
             v[i] += b[i];
@@ -460,8 +403,22 @@ impl Qwen3VlVisionEncoder {
         out_h: usize,
         out_w: usize,
         dst: &mut [f32],
-    ) {
+    ) -> Result<(), String> {
         let base_grid = self.base_image_size / self.patch_size;
+        let expected = base_grid
+            .checked_mul(base_grid)
+            .and_then(|v| v.checked_mul(self.dim))
+            .ok_or_else(|| "position embedding shape overflow".to_string())?;
+        if self.position_embd.len() != expected {
+            return Err(format!(
+                "invalid gemma3 position embedding tensor size: got {}, expected {} (grid={} dim={})",
+                self.position_embd.len(),
+                expected,
+                base_grid,
+                self.dim
+            ));
+        }
+
         let fy = if out_h <= 1 {
             0.0
         } else {
@@ -493,12 +450,13 @@ impl Qwen3VlVisionEncoder {
             let bot = v10 * (1.0 - wx) + v11 * wx;
             *d += top * (1.0 - wy) + bot * wy;
         }
+        Ok(())
     }
 
-    fn patch_embed_and_reorder(
+    fn patch_embed_and_add_position(
         &self,
         image: &PreparedImageTensor,
-    ) -> Result<PatchTokenGrid, String> {
+    ) -> Result<(Vec<f32>, usize, usize), String> {
         if !image.width.is_multiple_of(self.patch_size)
             || !image.height.is_multiple_of(self.patch_size)
         {
@@ -507,6 +465,7 @@ impl Qwen3VlVisionEncoder {
                 image.path, image.width, image.height, self.patch_size
             ));
         }
+
         let pw = image.width / self.patch_size;
         let ph = image.height / self.patch_size;
         if pw == 0 || ph == 0 {
@@ -515,22 +474,19 @@ impl Qwen3VlVisionEncoder {
                 image.path, pw, ph
             ));
         }
-        if !pw.is_multiple_of(self.spatial_merge) || !ph.is_multiple_of(self.spatial_merge) {
-            return Err(format!(
-                "image '{}' patch grid {}x{} is not divisible by spatial_merge {}",
-                image.path, pw, ph, self.spatial_merge
-            ));
-        }
 
-        let patch_count = pw * ph;
-        let mut row_major = vec![0.0f32; patch_count * self.dim];
+        let patch_count = pw
+            .checked_mul(ph)
+            .ok_or_else(|| "patch grid overflow".to_string())?;
+
+        let mut tokens = vec![0.0f32; patch_count * self.dim];
         let chw = &image.data_chw;
         let image_plane = image.width * image.height;
 
         for py in 0..ph {
             for px in 0..pw {
                 let patch_idx = py * pw + px;
-                let out = &mut row_major[patch_idx * self.dim..(patch_idx + 1) * self.dim];
+                let out = &mut tokens[patch_idx * self.dim..(patch_idx + 1) * self.dim];
                 out.copy_from_slice(&self.patch_embd_b);
                 for (oc, outv) in out.iter_mut().enumerate().take(self.dim) {
                     let mut acc = *outv;
@@ -542,7 +498,7 @@ impl Qwen3VlVisionEncoder {
                                 let pix = chw[ch * image_plane + iy * image.width + ix];
                                 let widx =
                                     ((oc * 3 + ch) * self.patch_size + ky) * self.patch_size + kx;
-                                acc += pix * (self.patch_embd_w0[widx] + self.patch_embd_w1[widx]);
+                                acc += pix * self.patch_embd_w[widx];
                             }
                         }
                     }
@@ -551,74 +507,61 @@ impl Qwen3VlVisionEncoder {
             }
         }
 
-        // Match Qwen-VL grouping order: iterate 2x2 merged cells, emit dy/dx within each cell.
-        let mut tokens = Vec::with_capacity(row_major.len());
-        let mut positions = Vec::with_capacity(patch_count);
-        for y in (0..ph).step_by(self.spatial_merge) {
-            for x in (0..pw).step_by(self.spatial_merge) {
-                for dy in 0..self.spatial_merge {
-                    for dx in 0..self.spatial_merge {
-                        let yy = y + dy;
-                        let xx = x + dx;
-                        let src = (yy * pw + xx) * self.dim;
-                        tokens.extend_from_slice(&row_major[src..src + self.dim]);
-                        positions.push((yy, xx));
-                    }
-                }
+        for py in 0..ph {
+            for px in 0..pw {
+                let tok = py * pw + px;
+                let tok_off = tok * self.dim;
+                let dst = &mut tokens[tok_off..tok_off + self.dim];
+                self.position_embedding_interp(py, px, ph, pw, dst)?;
             }
         }
 
-        let n_tokens = tokens.len() / self.dim;
-        for (tok, (yy, xx)) in positions.iter().enumerate().take(n_tokens) {
-            let dst = &mut tokens[tok * self.dim..(tok + 1) * self.dim];
-            self.position_embedding_interp(*yy, *xx, ph, pw, dst);
-        }
-
-        Ok((tokens, positions, pw, ph))
+        Ok((tokens, pw, ph))
     }
 
-    fn apply_vision_rope(&self, q: &mut [f32], k: &mut [f32], positions: &[(usize, usize)]) {
-        // Qwen3-VL vision M-RoPE (GGML_ROPE_TYPE_VISION with sections [d/4, d/4, d/4, d/4]).
-        // Pairs are (ic, ic + head_dim/2) for ic in [0, head_dim/2) — "neox" style across the
-        // full half-head, not within each quarter section.
-        // Section 0: ic in [0, head_dim/4) → y-position, local freq index = ic.
-        // Section 1: ic in [head_dim/4, head_dim/2) → x-position, local freq index = ic - head_dim/4.
-        // Frequency within each section resets independently:
-        //   freq = 1 / 10000^(2 * local_ic / head_dim)
-        let half_head = self.head_dim / 2;
-        let quarter_head = self.head_dim / 4;
-        if half_head == 0 || quarter_head == 0 {
-            return;
+    fn pool_patch_grid(
+        &self,
+        tokens: &[f32],
+        patch_w: usize,
+        patch_h: usize,
+    ) -> Result<Vec<f32>, String> {
+        if !patch_w.is_multiple_of(self.merge_factor) || !patch_h.is_multiple_of(self.merge_factor)
+        {
+            return Err(format!(
+                "gemma3 pooling requires patch grid divisible by merge factor {} (got {}x{})",
+                self.merge_factor, patch_w, patch_h
+            ));
         }
-        for (t, &(py, px)) in positions.iter().enumerate() {
-            let base_t = t * self.dim;
-            for h in 0..self.head_count {
-                let head_off = base_t + h * self.head_dim;
-                for ic in 0..half_head {
-                    let a = head_off + ic;
-                    let b = head_off + ic + half_head;
-                    let (pos_val, local_ic) = if ic < quarter_head {
-                        (py as f32, ic)
-                    } else {
-                        (px as f32, ic - quarter_head)
-                    };
-                    let freq = 1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / self.head_dim as f32);
-                    let theta = pos_val * freq;
-                    let c = theta.cos();
-                    let s = theta.sin();
+        let out_w = patch_w / self.merge_factor;
+        let out_h = patch_h / self.merge_factor;
+        let out_tokens = out_w
+            .checked_mul(out_h)
+            .ok_or_else(|| "pooled token count overflow".to_string())?;
+        let mut pooled = vec![0.0f32; out_tokens * self.dim];
+        let inv = 1.0f32 / (self.merge_factor * self.merge_factor) as f32;
 
-                    let q0 = q[a];
-                    let q1 = q[b];
-                    q[a] = q0 * c - q1 * s;
-                    q[b] = q0 * s + q1 * c;
-
-                    let k0 = k[a];
-                    let k1 = k[b];
-                    k[a] = k0 * c - k1 * s;
-                    k[b] = k0 * s + k1 * c;
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                let out_idx = oy * out_w + ox;
+                let dst = &mut pooled[out_idx * self.dim..(out_idx + 1) * self.dim];
+                for my in 0..self.merge_factor {
+                    for mx in 0..self.merge_factor {
+                        let iy = oy * self.merge_factor + my;
+                        let ix = ox * self.merge_factor + mx;
+                        let in_idx = iy * patch_w + ix;
+                        let src = &tokens[in_idx * self.dim..(in_idx + 1) * self.dim];
+                        for c in 0..self.dim {
+                            dst[c] += src[c];
+                        }
+                    }
+                }
+                for v in dst.iter_mut() {
+                    *v *= inv;
                 }
             }
         }
+
+        Ok(pooled)
     }
 
     fn encode_single_image(
@@ -626,20 +569,19 @@ impl Qwen3VlVisionEncoder {
         image: &PreparedImageTensor,
     ) -> Result<ImageEmbeddingSequence, String> {
         let mapped = self.gguf.mapped.as_slice();
-        let (mut x, positions, pw, ph) = self.patch_embed_and_reorder(image)?;
-        let n_tokens = x.len() / self.dim;
-        let merge = self.spatial_merge * self.spatial_merge;
-        let n_out = (pw / self.spatial_merge) * (ph / self.spatial_merge);
-        if n_tokens != n_out * merge {
-            return Err(format!(
-                "unexpected qwen3vl token layout: n_tokens={} n_out={} merge={}",
-                n_tokens, n_out, merge
-            ));
+        let (mut x, patch_w, patch_h) = self.patch_embed_and_add_position(image)?;
+        let mut pre_pooled_for_speed = false;
+        let mut n_tokens = x.len() / self.dim;
+
+        // Optional speed mode: pre-pool before ViT to reduce attention cost.
+        // This is disabled by default because it noticeably reduces vision quality.
+        if n_tokens > Self::FAST_PRE_ATTENTION_POOL_THRESHOLD && Self::fast_pooling_enabled() {
+            x = self.pool_patch_grid(&x, patch_w, patch_h)?;
+            n_tokens = x.len() / self.dim;
+            pre_pooled_for_speed = true;
         }
-        let merged_dim = self.dim * merge;
 
         let mut x_norm = vec![0.0f32; n_tokens * self.dim];
-        let mut qkv = vec![0.0f32; n_tokens * self.dim * 3];
         let mut q = vec![0.0f32; n_tokens * self.dim];
         let mut k = vec![0.0f32; n_tokens * self.dim];
         let mut v = vec![0.0f32; n_tokens * self.dim];
@@ -649,16 +591,6 @@ impl Qwen3VlVisionEncoder {
         let mut proj_out = vec![0.0f32; n_tokens * self.dim];
         let mut ffn_up = vec![0.0f32; self.ff_dim];
         let mut ffn_down = vec![0.0f32; self.dim];
-        let token_dim = self.mm2_b.len();
-        let mut deepstack_tokens = if self.deepstack_layers.is_empty() {
-            Vec::new()
-        } else {
-            vec![0.0f32; n_out * self.deepstack_layers.len() * token_dim]
-        };
-        let mut deepstack_merged = vec![0.0f32; merged_dim];
-        let mut deepstack_normed = vec![0.0f32; merged_dim];
-        let mut deepstack_hidden = Vec::new();
-        let mut deepstack_out = Vec::new();
 
         for l in 0..self.n_layers {
             let layer = &self.layers[l];
@@ -671,19 +603,20 @@ impl Qwen3VlVisionEncoder {
 
             for t in 0..n_tokens {
                 let src = &x_norm[t * self.dim..(t + 1) * self.dim];
-                let dst = &mut qkv[t * self.dim * 3..(t + 1) * self.dim * 3];
-                matmul_quantized(dst, src, &layer.attn_qkv_w, mapped)?;
-                Self::add_bias(dst, &layer.attn_qkv_b);
 
                 let q_dst = &mut q[t * self.dim..(t + 1) * self.dim];
+                matmul_quantized(q_dst, src, &layer.attn_q_w, mapped)?;
+                Self::add_bias(q_dst, &layer.attn_q_b);
+
                 let k_dst = &mut k[t * self.dim..(t + 1) * self.dim];
+                matmul_quantized(k_dst, src, &layer.attn_k_w, mapped)?;
+                Self::add_bias(k_dst, &layer.attn_k_b);
+
                 let v_dst = &mut v[t * self.dim..(t + 1) * self.dim];
-                q_dst.copy_from_slice(&dst[..self.dim]);
-                k_dst.copy_from_slice(&dst[self.dim..2 * self.dim]);
-                v_dst.copy_from_slice(&dst[2 * self.dim..3 * self.dim]);
+                matmul_quantized(v_dst, src, &layer.attn_v_w, mapped)?;
+                Self::add_bias(v_dst, &layer.attn_v_b);
             }
 
-            self.apply_vision_rope(&mut q, &mut k, &positions);
             let inv_scale = 1.0 / (self.head_dim as f32).sqrt();
             let dim = self.dim;
             let head_dim = self.head_dim;
@@ -743,56 +676,17 @@ impl Qwen3VlVisionEncoder {
                 matmul_quantized(&mut ffn_up, src, &layer.ffn_up_w, mapped)?;
                 Self::add_bias(&mut ffn_up, &layer.ffn_up_b);
                 for v in &mut ffn_up {
-                    *v = Self::gelu(*v);
+                    *v = if self.use_gelu {
+                        Self::gelu(*v)
+                    } else {
+                        Self::quick_gelu(*v)
+                    };
                 }
                 matmul_quantized(&mut ffn_down, &ffn_up, &layer.ffn_down_w, mapped)?;
                 Self::add_bias(&mut ffn_down, &layer.ffn_down_b);
                 let dst = &mut x[t * self.dim..(t + 1) * self.dim];
                 for i in 0..self.dim {
                     dst[i] += ffn_down[i];
-                }
-            }
-
-            if let Some(ds_idx) = self.deepstack_by_layer[l] {
-                let deepstack = &self.deepstack_layers[ds_idx];
-                deepstack_hidden.resize(deepstack.fc1_b.len(), 0.0);
-                deepstack_out.resize(deepstack.fc2_b.len(), 0.0);
-                for out_idx in 0..n_out {
-                    for m in 0..merge {
-                        let src = &x[(out_idx * merge + m) * self.dim
-                            ..(out_idx * merge + m + 1) * self.dim];
-                        let dst = &mut deepstack_merged[m * self.dim..(m + 1) * self.dim];
-                        dst.copy_from_slice(src);
-                    }
-
-                    self.layer_norm(
-                        &mut deepstack_normed,
-                        &deepstack_merged,
-                        &deepstack.norm_w,
-                        &deepstack.norm_b,
-                    );
-
-                    matmul_quantized(
-                        &mut deepstack_hidden,
-                        &deepstack_normed,
-                        &deepstack.fc1_w,
-                        mapped,
-                    )?;
-                    Self::add_bias(&mut deepstack_hidden, &deepstack.fc1_b);
-                    for v in &mut deepstack_hidden {
-                        *v = Self::gelu(*v);
-                    }
-
-                    matmul_quantized(
-                        &mut deepstack_out,
-                        &deepstack_hidden,
-                        &deepstack.fc2_w,
-                        mapped,
-                    )?;
-                    Self::add_bias(&mut deepstack_out, &deepstack.fc2_b);
-                    let ds_offset = (out_idx * self.deepstack_layers.len() + ds_idx) * token_dim;
-                    let dst = &mut deepstack_tokens[ds_offset..ds_offset + token_dim];
-                    dst.copy_from_slice(&deepstack_out[..token_dim]);
                 }
             }
         }
@@ -803,37 +697,36 @@ impl Qwen3VlVisionEncoder {
             self.layer_norm(dst, &src, &self.post_ln_w, &self.post_ln_b);
         }
 
-        let mut merged = vec![0.0f32; merged_dim];
-        let mut hidden = vec![0.0f32; merged_dim];
-        let mut out = vec![0.0f32; token_dim];
-        let mut tokens = Vec::with_capacity(n_out);
+        let pooled = if pre_pooled_for_speed {
+            x
+        } else {
+            self.pool_patch_grid(&x, patch_w, patch_h)?
+        };
+        let n_out = pooled.len() / self.dim;
+        let out_dim = self.mm_input_proj_ne0;
+        if self.mm_input_proj_ne1 != self.dim {
+            return Err(format!(
+                "mm.input_projection.weight shape mismatch at runtime: ne1={} dim={}",
+                self.mm_input_proj_ne1, self.dim
+            ));
+        }
+        let mut normed = vec![0.0f32; self.dim];
+        let mut projected = vec![0.0f32; out_dim];
+        let mut tokens: Vec<Vec<f32>> = Vec::with_capacity(n_out);
 
         for out_idx in 0..n_out {
-            for m in 0..merge {
-                let src =
-                    &x[(out_idx * merge + m) * self.dim..(out_idx * merge + m + 1) * self.dim];
-                let dst = &mut merged[m * self.dim..(m + 1) * self.dim];
-                dst.copy_from_slice(src);
-            }
-
-            matmul_quantized(&mut hidden, &merged, &self.mm0_w, mapped)?;
-            Self::add_bias(&mut hidden, &self.mm0_b);
-            for v in &mut hidden {
-                *v = Self::gelu(*v);
-            }
-
-            matmul_quantized(&mut out, &hidden, &self.mm2_w, mapped)?;
-            Self::add_bias(&mut out, &self.mm2_b);
-            let mut token = Vec::with_capacity(token_dim * (1 + self.deepstack_layers.len()));
-            token.extend_from_slice(&out);
-            if !deepstack_tokens.is_empty() {
-                let base = out_idx * self.deepstack_layers.len() * token_dim;
-                for ds_idx in 0..self.deepstack_layers.len() {
-                    let ds_off = base + ds_idx * token_dim;
-                    token.extend_from_slice(&deepstack_tokens[ds_off..ds_off + token_dim]);
+            let src = &pooled[out_idx * self.dim..(out_idx + 1) * self.dim];
+            self.rms_norm_mul_weight(&mut normed, src, &self.mm_soft_emb_norm_w);
+            // Match llama.cpp gemma3 path:
+            // projected = transpose(mm.input_projection.weight) * normed
+            for (out, dst) in projected.iter_mut().enumerate().take(out_dim) {
+                let mut acc = 0.0f32;
+                for (inp, &v) in normed.iter().enumerate() {
+                    acc += v * self.mm_input_proj_w[out + self.mm_input_proj_ne0 * inp];
                 }
+                *dst = acc;
             }
-            tokens.push(token);
+            tokens.push(projected.clone());
         }
 
         Ok(ImageEmbeddingSequence { tokens })

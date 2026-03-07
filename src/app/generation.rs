@@ -1630,6 +1630,7 @@ impl ModelRuntime {
         let mut think_tail = String::new();
         let mut hidden_visible_tail = String::new();
         let mut hidden_think_token_count = 0usize;
+        let mut terminal_recovery_used = false;
 
         // Think mode state: track whether we're currently inside a <think>...</think> block.
         // The prompt already ends with "<think>\n" for Yes/Hidden modes, so generation starts
@@ -1642,10 +1643,14 @@ impl ModelRuntime {
             println!("<think>");
             let _ = io::stdout().flush();
         }
-        let stop_token_ids = decode_policy
+        let stop_tokens = decode_policy
             .stop_token_literals
             .iter()
-            .filter_map(|literal| self.tokenizer.find_special_token(literal))
+            .filter_map(|literal| {
+                self.tokenizer
+                    .find_special_token(literal)
+                    .map(|id| (id, *literal))
+            })
             .collect::<Vec<_>>();
 
         let total_limit = prompt_tokens
@@ -1799,6 +1804,9 @@ impl ModelRuntime {
 
                 if temperature == 0.0 {
                     next = argmax(&state.logits[..self.config.vocab_size]) as i32;
+                } else if top_k == 1 {
+                    // temperature scaling is monotonic for temperature>0, so k=1 equals argmax.
+                    next = argmax(&state.logits[..self.config.vocab_size]) as i32;
                 } else if top_k > 0 {
                     next = topk_sampler.sample_top_k_top_p(
                         &state.logits[..self.config.vocab_size],
@@ -1866,7 +1874,7 @@ impl ModelRuntime {
                             is_thinking = false;
                             think_tail.clear();
                             pending_newline = false;
-                            if debug_mode || show_tokens {
+                            if debug_mode {
                                 eprintln!(
                                     "\nNote: forced exit from hidden thinking block after {} tokens without </think>",
                                     hidden_think_cap
@@ -1875,7 +1883,7 @@ impl ModelRuntime {
                         }
                     }
                     if generated_tokens.len() >= hidden_total_cap {
-                        if debug_mode || show_tokens {
+                        if debug_mode {
                             eprintln!(
                                 "\nStopping hidden mode after {} generated tokens to avoid unbounded run",
                                 hidden_total_cap
@@ -1897,7 +1905,7 @@ impl ModelRuntime {
                                 &mut pending_newline,
                                 stream_stdout,
                             );
-                            if debug_mode || show_tokens {
+                            if debug_mode {
                                 eprintln!(
                                     "\nNote: forced close of visible thinking block after {} tokens without </think>",
                                     visible_think_cap
@@ -1907,16 +1915,70 @@ impl ModelRuntime {
                     }
                 }
                 if token == self.tokenizer.eos_token || token == self.tokenizer.eot_token {
+                    if decode_policy.parse_think_tags
+                        && think_mode != ThinkMode::No
+                        && is_thinking
+                        && !terminal_recovery_used
+                    {
+                        terminal_recovery_used = true;
+                        is_thinking = false;
+                        think_tail.clear();
+                        if think_mode == ThinkMode::Yes {
+                            append_visible_text(
+                                THINK_CLOSE_TAG,
+                                &mut output,
+                                &mut pending_newline,
+                                stream_stdout,
+                            );
+                        } else {
+                            pending_newline = false;
+                        }
+                        if debug_mode {
+                            eprintln!(
+                                "\nNote: forced close of thinking block on terminal token id={token}; retrying decode once"
+                            );
+                        }
+                        continue;
+                    }
+                    if debug_mode {
+                        eprintln!("\nStopping on terminal token id={token}");
+                    }
                     break;
                 }
-                if stop_token_ids.contains(&token) {
-                    break;
+                if let Some((_, literal)) = stop_tokens.iter().find(|(id, _)| *id == token) {
+                    if decode_policy.parse_think_tags && think_mode != ThinkMode::No && is_thinking
+                    {
+                        is_thinking = false;
+                        think_tail.clear();
+                        if think_mode == ThinkMode::Yes {
+                            append_visible_text(
+                                THINK_CLOSE_TAG,
+                                &mut output,
+                                &mut pending_newline,
+                                stream_stdout,
+                            );
+                        } else {
+                            pending_newline = false;
+                        }
+                        if debug_mode {
+                            eprintln!(
+                                "\nNote: forced close of thinking block on stop token '{}' (id={token})",
+                                literal
+                            );
+                        }
+                        continue;
+                    } else {
+                        if debug_mode {
+                            eprintln!("\nStopping on vendor stop token '{}' (id={token})", literal);
+                        }
+                        break;
+                    }
                 }
                 if self.settings.vendor_decode_policy.deterministic_loop_guard
                     && generated_tokens.len() % 16 == 0
                 {
                     if let Some(len) = repeated_text_suffix_bytes(&output) {
-                        if debug_mode || show_tokens {
+                        if debug_mode {
                             eprintln!(
                                 "\nStopping due to repeated output suffix block (len={len} bytes)"
                             );
@@ -1924,7 +1986,7 @@ impl ModelRuntime {
                         break;
                     }
                     if let Some((line, repeats)) = repeated_long_line(&output) {
-                        if debug_mode || show_tokens {
+                        if debug_mode {
                             eprintln!(
                                 "\nStopping due to repeated output line (repeats={repeats}): {line}"
                             );
@@ -1933,7 +1995,7 @@ impl ModelRuntime {
                     }
                     if temperature == 0.0 {
                         if let Some(period) = repeated_cycle_period(&generated_tokens) {
-                            if debug_mode || show_tokens {
+                            if debug_mode {
                                 eprintln!(
                                     "\nStopping due to repeated token cycle (window={period}, repeated suffix)"
                                 );
@@ -1980,7 +2042,7 @@ impl ModelRuntime {
                 &mut pending_newline,
                 stream_stdout,
             );
-            if debug_mode || show_tokens {
+            if debug_mode {
                 eprintln!("\nNote: auto-closed missing </think> at end of generation");
             }
         }
@@ -1999,7 +2061,7 @@ impl ModelRuntime {
                     let _ = io::stdout().flush();
                 }
                 output = promoted;
-                if debug_mode || show_tokens {
+                if debug_mode {
                     eprintln!("\nNote: promoted think-only content to final response text");
                 }
             }
@@ -2017,7 +2079,7 @@ impl ModelRuntime {
         }
 
         if hidden_retry_enabled && output.trim().is_empty() {
-            if debug_mode || show_tokens {
+            if debug_mode {
                 eprintln!(
                     "\nNote: hidden think mode produced no visible output; retrying with think=no"
                 );

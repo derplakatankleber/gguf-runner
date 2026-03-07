@@ -1,12 +1,17 @@
 use std::sync::atomic::AtomicU8;
 use std::sync::OnceLock;
 
+#[inline]
+fn available_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn par_matmul_min_rows_default() -> usize {
-    let n_threads = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let n_threads = available_threads();
     if n_threads <= 4 {
         192
     } else {
@@ -17,15 +22,24 @@ fn par_matmul_min_rows_default() -> usize {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn par_matmul_min_rows_default() -> usize {
-    256
+    let n_threads = available_threads();
+    if n_threads <= 2 {
+        128
+    } else if n_threads <= 4 {
+        192
+    } else if n_threads <= 8 {
+        256
+    } else if n_threads <= 12 {
+        320
+    } else {
+        384
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn par_matmul_chunk_rows_default() -> usize {
-    let n_threads = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let n_threads = available_threads();
     if n_threads <= 4 {
         32
     } else {
@@ -36,20 +50,38 @@ fn par_matmul_chunk_rows_default() -> usize {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn par_matmul_chunk_rows_default() -> usize {
-    32
+    let n_threads = available_threads();
+    if n_threads <= 2 {
+        16
+    } else if n_threads <= 4 {
+        24
+    } else if n_threads <= 8 {
+        32
+    } else if n_threads <= 12 {
+        48
+    } else {
+        64
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn aarch64_matmul_prefetch_rows_default() -> usize {
-    6
+    let n_threads = available_threads();
+    if n_threads <= 4 {
+        4
+    } else if n_threads <= 8 {
+        6
+    } else if n_threads <= 12 {
+        8
+    } else {
+        10
+    }
 }
 
 #[inline]
 fn par_attn_min_heads_default() -> usize {
-    let n_threads = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let n_threads = available_threads();
     if n_threads <= 4 {
         4
     } else {
@@ -59,9 +91,7 @@ fn par_attn_min_heads_default() -> usize {
 
 #[inline]
 fn par_qwen3next_min_heads_default() -> usize {
-    let n_threads = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
+    let n_threads = available_threads();
     if n_threads <= 4 {
         4
     } else {

@@ -40,6 +40,11 @@ fn decode_sentencepiece(s: &str) -> String {
 }
 
 fn decode_tiktoken_internal(s: &str) -> String {
+    let out = decode_tiktoken_bytes(s);
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn decode_tiktoken_bytes(s: &str) -> Vec<u8> {
     let map = tiktoken_decode_map();
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
 
@@ -57,7 +62,7 @@ fn decode_tiktoken_internal(s: &str) -> String {
         out.extend_from_slice(encoded.as_bytes());
     }
 
-    String::from_utf8_lossy(&out).to_string()
+    out
 }
 
 fn text_to_tiktoken(text: &str) -> String {
@@ -393,6 +398,18 @@ impl Tokenizer {
             Some(decode_sentencepiece(raw))
         } else {
             Some(decode_tiktoken_internal(raw))
+        }
+    }
+
+    pub(crate) fn decode_token_bytes(&self, token_id: i32) -> Option<Vec<u8>> {
+        if token_id < 0 || token_id as usize >= self.vocab.len() {
+            return None;
+        }
+        let raw = &self.vocab[token_id as usize];
+        if self.use_sentencepiece {
+            Some(decode_sentencepiece(raw).into_bytes())
+        } else {
+            Some(decode_tiktoken_bytes(raw))
         }
     }
 }

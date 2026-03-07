@@ -92,6 +92,244 @@ fn repeated_text_suffix_bytes(output: &str) -> Option<usize> {
     None
 }
 
+const THINK_CLOSE_TAG: &str = "</think>";
+
+fn append_visible_text(
+    decoded: &str,
+    output: &mut String,
+    pending_newline: &mut bool,
+    stream_stdout: bool,
+) {
+    if decoded.is_empty() {
+        return;
+    }
+    let decoded = if output.is_empty() {
+        decoded.trim_start_matches(['\n', '\r'])
+    } else {
+        decoded
+    };
+    if decoded.is_empty() {
+        return;
+    }
+    if decoded == "\n" {
+        *pending_newline = true;
+        return;
+    }
+    if *pending_newline {
+        if !output.is_empty() {
+            output.push('\n');
+            if stream_stdout {
+                println!();
+            }
+        }
+        *pending_newline = false;
+    }
+    output.push_str(decoded);
+    if stream_stdout {
+        print!("{decoded}");
+        let _ = io::stdout().flush();
+    }
+}
+
+fn decode_utf8_streaming(pending: &mut Vec<u8>, piece: &[u8]) -> String {
+    pending.extend_from_slice(piece);
+    let mut out = String::new();
+
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(valid) => {
+                out.push_str(valid);
+                pending.clear();
+                break;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&pending[..valid_up_to]).unwrap_or_default();
+                    out.push_str(valid);
+                    pending.drain(..valid_up_to);
+                }
+                if err.error_len().is_none() {
+                    // Incomplete UTF-8 sequence at the end; wait for more token bytes.
+                    break;
+                }
+                // Invalid UTF-8 sequence: emit replacement and advance one byte.
+                out.push('\u{FFFD}');
+                if !pending.is_empty() {
+                    pending.drain(..1);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn flush_utf8_pending_lossy(pending: &mut Vec<u8>) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let s = String::from_utf8_lossy(pending).to_string();
+    pending.clear();
+    s
+}
+
+fn has_post_think_response_text(output: &str) -> bool {
+    if let Some(idx) = output.rfind(THINK_CLOSE_TAG) {
+        let rest = &output[idx + THINK_CLOSE_TAG.len()..];
+        return !rest.trim().is_empty();
+    }
+    false
+}
+
+fn split_at_char_boundary(s: &str, byte_idx: usize) -> (&str, &str) {
+    let mut i = byte_idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    s.split_at(i)
+}
+
+fn hidden_strip_visible_chunk(decoded: &str, tail: &mut String) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut combined = String::new();
+    if !tail.is_empty() {
+        combined.push_str(tail);
+        tail.clear();
+    }
+    combined.push_str(decoded);
+
+    let mut keep_len = 0usize;
+    for tag in [OPEN, CLOSE] {
+        let max_prefix = tag.len().saturating_sub(1);
+        for k in 1..=max_prefix {
+            if combined.ends_with(&tag[..k]) {
+                keep_len = keep_len.max(k);
+            }
+        }
+    }
+    let split_at = combined.len().saturating_sub(keep_len);
+    let (emit_part, tail_part) = split_at_char_boundary(&combined, split_at);
+    tail.push_str(tail_part);
+    emit_part.replace(OPEN, "").replace(CLOSE, "")
+}
+
+fn hidden_finalize_tail(tail: &mut String) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    if tail.is_empty() {
+        return String::new();
+    }
+    let raw = std::mem::take(tail);
+    if OPEN.starts_with(&raw) || CLOSE.starts_with(&raw) {
+        return String::new();
+    }
+    raw.replace(OPEN, "").replace(CLOSE, "")
+}
+
+fn trim_leading_line_breaks_for_first_visible<'a>(text: &'a str, output: &str) -> &'a str {
+    if output.is_empty() {
+        text.trim_start_matches(['\n', '\r'])
+    } else {
+        text
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_decoded_with_think(
+    decoded: &str,
+    parse_think_tags: bool,
+    think_mode: ThinkMode,
+    is_thinking: &mut bool,
+    think_tail: &mut String,
+    hidden_visible_tail: &mut String,
+    output: &mut String,
+    pending_newline: &mut bool,
+    stream_stdout: bool,
+) {
+    if decoded.is_empty() {
+        return;
+    }
+
+    if think_mode == ThinkMode::No {
+        if parse_think_tags {
+            let cleaned = hidden_strip_visible_chunk(decoded, hidden_visible_tail);
+            let cleaned = trim_leading_line_breaks_for_first_visible(&cleaned, output);
+            append_visible_text(cleaned, output, pending_newline, stream_stdout);
+        } else {
+            append_visible_text(decoded, output, pending_newline, stream_stdout);
+        }
+        return;
+    }
+    if !parse_think_tags {
+        append_visible_text(decoded, output, pending_newline, stream_stdout);
+        return;
+    }
+
+    let mut combined = String::new();
+    if !think_tail.is_empty() {
+        combined.push_str(think_tail);
+        think_tail.clear();
+    }
+    combined.push_str(decoded);
+
+    if !*is_thinking {
+        if think_mode == ThinkMode::Hidden {
+            let cleaned = hidden_strip_visible_chunk(&combined, hidden_visible_tail);
+            let cleaned = trim_leading_line_breaks_for_first_visible(&cleaned, output);
+            append_visible_text(cleaned, output, pending_newline, stream_stdout);
+        } else {
+            append_visible_text(&combined, output, pending_newline, stream_stdout);
+        }
+        return;
+    }
+
+    if let Some(close_idx) = combined.find(THINK_CLOSE_TAG) {
+        if think_mode == ThinkMode::Yes {
+            let end = close_idx + THINK_CLOSE_TAG.len();
+            append_visible_text(&combined[..end], output, pending_newline, stream_stdout);
+        } else {
+            *pending_newline = false;
+        }
+        *is_thinking = false;
+        let rest = &combined[close_idx + THINK_CLOSE_TAG.len()..];
+        if !rest.is_empty() {
+            if think_mode == ThinkMode::Hidden || think_mode == ThinkMode::No {
+                let cleaned = hidden_strip_visible_chunk(rest, hidden_visible_tail);
+                let cleaned = trim_leading_line_breaks_for_first_visible(&cleaned, output);
+                append_visible_text(cleaned, output, pending_newline, stream_stdout);
+            } else {
+                append_visible_text(rest, output, pending_newline, stream_stdout);
+            }
+        }
+        return;
+    }
+
+    let keep = THINK_CLOSE_TAG.len().saturating_sub(1);
+    if think_mode == ThinkMode::Yes {
+        if combined.len() > keep {
+            let emit_len = combined.len() - keep;
+            let (emit_part, tail_part) = split_at_char_boundary(&combined, emit_len);
+            append_visible_text(emit_part, output, pending_newline, stream_stdout);
+            think_tail.push_str(tail_part);
+        } else {
+            think_tail.push_str(&combined);
+        }
+    } else {
+        *pending_newline = false;
+        if combined.len() > keep {
+            let split_at = combined.len().saturating_sub(keep);
+            let (_, tail_part) = split_at_char_boundary(&combined, split_at);
+            think_tail.push_str(tail_part);
+        } else {
+            think_tail.push_str(&combined);
+        }
+    }
+}
+
 pub(crate) struct GenerationSettings {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -1230,6 +1468,18 @@ impl ModelRuntime {
         prefill_injected_embeddings: HashMap<usize, Vec<f32>>,
         stream_stdout: bool,
     ) -> Result<String, String> {
+        let hidden_retry_enabled = self.settings.think_mode == ThinkMode::Hidden;
+        let retry_prompt_tokens = if hidden_retry_enabled {
+            Some(prompt_tokens.clone())
+        } else {
+            None
+        };
+        let retry_prefill_embeddings = if hidden_retry_enabled {
+            Some(prefill_injected_embeddings.clone())
+        } else {
+            None
+        };
+
         let temperature = self.settings.temperature;
         let top_k = self.settings.top_k;
         let top_p = self.settings.top_p;
@@ -1273,6 +1523,10 @@ impl ModelRuntime {
         let mut pending_newline = false;
         let mut output = String::new();
         let mut generated_tokens = Vec::new();
+        let mut utf8_pending: Vec<u8> = Vec::new();
+        let mut think_tail = String::new();
+        let mut hidden_visible_tail = String::new();
+        let mut hidden_think_token_count = 0usize;
 
         // Think mode state: track whether we're currently inside a <think>...</think> block.
         // The prompt already ends with "<think>\n" for Yes/Hidden modes, so generation starts
@@ -1295,6 +1549,68 @@ impl ModelRuntime {
             .len()
             .saturating_add(max_new_tokens)
             .min(self.config.seq_len);
+        let hidden_mode_caps = if decode_policy.parse_think_tags && think_mode == ThinkMode::Hidden
+        {
+            let new_budget = total_limit.saturating_sub(prompt_tokens.len());
+            let vendor_base = if self.config.is_qwen35 || self.config.is_qwen3next {
+                384usize
+            } else if self.config.is_qwen3vl {
+                320usize
+            } else {
+                256usize
+            };
+            let layer_mult = if self.config.n_layers >= 64 {
+                3usize
+            } else if self.config.n_layers >= 32 {
+                2usize
+            } else {
+                1usize
+            };
+            let ctx_mult = if self.config.seq_len >= 262_144 {
+                2usize
+            } else {
+                1usize
+            };
+            let hard_think_cap_max = if self.config.n_layers >= 48 || self.config.seq_len >= 262_144
+            {
+                1536usize
+            } else {
+                1024usize
+            };
+            let hard_total_cap_max = hard_think_cap_max.saturating_mul(4);
+            let mut think_cap = vendor_base
+                .saturating_mul(layer_mult)
+                .saturating_mul(ctx_mult);
+            if new_budget > 0 {
+                let max_cap = hard_think_cap_max.min(new_budget.max(96));
+                think_cap = think_cap.clamp(96, max_cap);
+            } else {
+                think_cap = 64;
+            }
+            let mut total_cap = think_cap.saturating_mul(4).min(hard_total_cap_max);
+            if new_budget > 0 {
+                total_cap = total_cap.min(new_budget);
+                let min_total = (think_cap + 64).min(new_budget).max(think_cap + 1);
+                total_cap = total_cap.max(min_total);
+            } else {
+                total_cap = think_cap + 64;
+            }
+            Some((think_cap, total_cap))
+        } else {
+            None
+        };
+        if let Some((think_cap, total_cap)) = hidden_mode_caps {
+            if debug_mode {
+                eprintln!(
+                    "Hidden-think policy: think_cap={} total_cap={} (n_layers={} seq_len={} budget={})",
+                    think_cap,
+                    total_cap,
+                    self.config.n_layers,
+                    self.config.seq_len,
+                    total_limit.saturating_sub(prompt_tokens.len())
+                );
+            }
+        }
         while pos < total_limit {
             if token < 0 || token as usize >= self.config.vocab_size {
                 return Err(format!("token id out of bounds: {token}"));
@@ -1405,51 +1721,19 @@ impl ModelRuntime {
                 && next != self.tokenizer.eot_token
                 && next != self.tokenizer.eos_token
             {
-                if let Some(decoded) = self.tokenizer.decode_token(next) {
-                    // Detect transition out of a thinking block.
-                    if is_thinking && decoded.contains("</think>") {
-                        is_thinking = false;
-                        if think_mode == ThinkMode::Hidden {
-                            pending_newline = false;
-                            // Show a placeholder so the user knows thinking happened.
-                            if stream_stdout {
-                                print!("(thinking...)\n\n");
-                                let _ = io::stdout().flush();
-                            }
-                        } else {
-                            // Yes mode: print </think> normally.
-                            if pending_newline {
-                                output.push('\n');
-                                if stream_stdout {
-                                    println!();
-                                }
-                                pending_newline = false;
-                            }
-                            output.push_str(&decoded);
-                            if stream_stdout {
-                                print!("{decoded}");
-                                let _ = io::stdout().flush();
-                            }
-                        }
-                    } else if is_thinking && think_mode == ThinkMode::Hidden {
-                        // Suppress thinking content in hidden mode.
-                        pending_newline = false;
-                    } else if decoded == "\n" {
-                        pending_newline = true;
-                    } else {
-                        if pending_newline {
-                            output.push('\n');
-                            if stream_stdout {
-                                println!();
-                            }
-                            pending_newline = false;
-                        }
-                        output.push_str(&decoded);
-                        if stream_stdout {
-                            print!("{decoded}");
-                            let _ = io::stdout().flush();
-                        }
-                    }
+                if let Some(bytes) = self.tokenizer.decode_token_bytes(next) {
+                    let decoded = decode_utf8_streaming(&mut utf8_pending, &bytes);
+                    process_decoded_with_think(
+                        &decoded,
+                        decode_policy.parse_think_tags,
+                        think_mode,
+                        &mut is_thinking,
+                        &mut think_tail,
+                        &mut hidden_visible_tail,
+                        &mut output,
+                        &mut pending_newline,
+                        stream_stdout,
+                    );
                 }
             }
 
@@ -1462,15 +1746,39 @@ impl ModelRuntime {
 
             if pos >= prompt_tokens.len().saturating_sub(1) {
                 generated_tokens.push(token);
+                if let Some((hidden_think_cap, hidden_total_cap)) = hidden_mode_caps {
+                    if is_thinking {
+                        hidden_think_token_count = hidden_think_token_count.saturating_add(1);
+                        if hidden_think_token_count >= hidden_think_cap {
+                            is_thinking = false;
+                            think_tail.clear();
+                            pending_newline = false;
+                            if debug_mode || show_tokens {
+                                eprintln!(
+                                    "\nNote: forced exit from hidden thinking block after {} tokens without </think>",
+                                    hidden_think_cap
+                                );
+                            }
+                        }
+                    }
+                    if generated_tokens.len() >= hidden_total_cap {
+                        if debug_mode || show_tokens {
+                            eprintln!(
+                                "\nStopping hidden mode after {} generated tokens to avoid unbounded run",
+                                hidden_total_cap
+                            );
+                        }
+                        break;
+                    }
+                }
                 if token == self.tokenizer.eos_token || token == self.tokenizer.eot_token {
                     break;
                 }
                 if stop_token_ids.contains(&token) {
                     break;
                 }
-                if temperature == 0.0
-                    && self.settings.vendor_decode_policy.deterministic_loop_guard
-                    && generated_tokens.len() % 8 == 0
+                if self.settings.vendor_decode_policy.deterministic_loop_guard
+                    && generated_tokens.len() % 16 == 0
                 {
                     if let Some(len) = repeated_text_suffix_bytes(&output) {
                         if debug_mode || show_tokens {
@@ -1488,14 +1796,76 @@ impl ModelRuntime {
                         }
                         break;
                     }
-                    if let Some(period) = repeated_cycle_period(&generated_tokens) {
-                        if debug_mode || show_tokens {
-                            eprintln!(
-                                "\nStopping due to repeated token cycle (window={period}, repeated suffix)"
-                            );
+                    if temperature == 0.0 {
+                        if let Some(period) = repeated_cycle_period(&generated_tokens) {
+                            if debug_mode || show_tokens {
+                                eprintln!(
+                                    "\nStopping due to repeated token cycle (window={period}, repeated suffix)"
+                                );
+                            }
+                            break;
                         }
-                        break;
                     }
+                }
+            }
+        }
+
+        let pending_decoded = flush_utf8_pending_lossy(&mut utf8_pending);
+        process_decoded_with_think(
+            &pending_decoded,
+            decode_policy.parse_think_tags,
+            think_mode,
+            &mut is_thinking,
+            &mut think_tail,
+            &mut hidden_visible_tail,
+            &mut output,
+            &mut pending_newline,
+            stream_stdout,
+        );
+        if !think_tail.is_empty() {
+            if think_mode == ThinkMode::Yes {
+                append_visible_text(
+                    &think_tail,
+                    &mut output,
+                    &mut pending_newline,
+                    stream_stdout,
+                );
+            }
+            think_tail.clear();
+        }
+        if think_mode == ThinkMode::Hidden || think_mode == ThinkMode::No {
+            let trailing = hidden_finalize_tail(&mut hidden_visible_tail);
+            let trailing = trim_leading_line_breaks_for_first_visible(&trailing, &output);
+            append_visible_text(trailing, &mut output, &mut pending_newline, stream_stdout);
+        }
+        if decode_policy.parse_think_tags && think_mode == ThinkMode::Yes && is_thinking {
+            append_visible_text(
+                THINK_CLOSE_TAG,
+                &mut output,
+                &mut pending_newline,
+                stream_stdout,
+            );
+            if debug_mode || show_tokens {
+                eprintln!("\nNote: auto-closed missing </think> at end of generation");
+            }
+        }
+        if decode_policy.parse_think_tags
+            && think_mode == ThinkMode::Yes
+            && !has_post_think_response_text(&output)
+        {
+            let mut promoted = output.trim().to_string();
+            if let Some(prefix) = promoted.strip_suffix(THINK_CLOSE_TAG) {
+                promoted = prefix.trim().to_string();
+            }
+            if !promoted.is_empty() {
+                if stream_stdout {
+                    println!();
+                    print!("{promoted}");
+                    let _ = io::stdout().flush();
+                }
+                output = promoted;
+                if debug_mode || show_tokens {
+                    eprintln!("\nNote: promoted think-only content to final response text");
                 }
             }
         }
@@ -1507,8 +1877,29 @@ impl ModelRuntime {
                 "\nachieved tok/s: {:.3}",
                 (pos - 1) as f64 / elapsed_ms * 1000.0
             );
-        } else if stream_stdout {
+        } else if stream_stdout && !output.is_empty() {
             println!();
+        }
+
+        if hidden_retry_enabled && output.trim().is_empty() {
+            if debug_mode || show_tokens {
+                eprintln!(
+                    "\nNote: hidden think mode produced no visible output; retrying with think=no"
+                );
+            }
+            if let (Some(retry_prompt_tokens), Some(retry_prefill_embeddings)) =
+                (retry_prompt_tokens, retry_prefill_embeddings)
+            {
+                let original_think_mode = self.settings.think_mode;
+                self.settings.think_mode = ThinkMode::No;
+                let retry_result = self.generate_from_prefill(
+                    retry_prompt_tokens,
+                    retry_prefill_embeddings,
+                    stream_stdout,
+                );
+                self.settings.think_mode = original_think_mode;
+                return retry_result;
+            }
         }
 
         Ok(output)

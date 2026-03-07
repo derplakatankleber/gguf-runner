@@ -555,17 +555,28 @@ mod tests {
 
     #[test]
     fn video_preprocess_returns_no_external_dependency_error() {
+        let temp = TempDir::new().unwrap();
+        let video_path = temp.path().join("dummy.mp4");
+        std::fs::write(&video_path, b"not-a-real-video").unwrap();
         let profile = ImagePreprocessProfile::new(64, 64, ImageNormalization::UnitRange);
-        let err =
-            prepare_videos_for_multimodal(&["docs/IMG_0189.MP4".to_string()], profile, 1, 4, 2)
-                .expect_err("expected unsupported decoder error");
+        let err = prepare_videos_for_multimodal(
+            &[video_path.to_string_lossy().into_owned()],
+            profile,
+            1,
+            4,
+            2,
+        )
+        .expect_err("expected unsupported decoder error");
         assert!(err.contains("no-external-dependency mode"));
     }
 
     #[test]
     fn audio_preprocess_returns_no_external_dependency_error() {
+        let temp = TempDir::new().unwrap();
+        let audio_path = temp.path().join("dummy.mp4");
+        std::fs::write(&audio_path, b"not-a-real-audio").unwrap();
         let err = prepare_audios_for_multimodal(
-            &["docs/IMG_0189.MP4".to_string()],
+            &[audio_path.to_string_lossy().into_owned()],
             16_000,
             64_000,
             16_000,

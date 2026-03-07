@@ -4,3 +4,4 @@ target/
 *.crdownload
 .gguf-runner/
 .cargo/
+llama.cpp/

@@ -8,8 +8,44 @@ use crate::engine::io::{
 };
 use crate::engine::types::{
     Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, ModelCapabilities,
-    MultimodalBackend, ThinkMode, Tokenizer,
+    MultimodalBackend, ThinkMode, Tokenizer, VendorTokenizerPolicy,
 };
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VendorDecodePolicy {
+    pub(crate) parse_think_tags: bool,
+    pub(crate) stop_token_literals: &'static [&'static str],
+    pub(crate) deterministic_loop_guard: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VendorRuntimeDebugPolicy {
+    pub(crate) native_context_label: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MmprojFilenameScoreHint {
+    pub(crate) token: &'static str,
+    pub(crate) backend: MultimodalBackend,
+    pub(crate) match_score: i32,
+    pub(crate) mismatch_score: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VendorDetailCropPolicy {
+    pub(crate) enabled: bool,
+    pub(crate) max_layers: usize,
+    pub(crate) note_text: &'static str,
+    pub(crate) temp_file_prefix: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VendorMultimodalPolicy {
+    pub(crate) image_prompt_suffix: &'static str,
+    pub(crate) detail_crop: VendorDetailCropPolicy,
+    pub(crate) mmproj_filename_score_hints: &'static [MmprojFilenameScoreHint],
+    pub(crate) missing_sidecar_hint: &'static str,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelFamily {
@@ -440,4 +476,59 @@ pub(crate) fn encode_generation_request(
         llama::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
     };
     EncodedPrompt::from_token_ids(token_ids)
+}
+
+pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
+    if config.is_qwen2
+        || config.is_qwen3moe
+        || config.is_qwen3next
+        || config.is_qwen3vl
+        || config.is_qwen35
+    {
+        qwen::decode_policy(config)
+    } else if config.is_gemma3 {
+        gemma::decode_policy()
+    } else {
+        llama::decode_policy()
+    }
+}
+
+pub(crate) fn tokenizer_policy(config: &Config) -> VendorTokenizerPolicy {
+    if config.is_qwen2
+        || config.is_qwen3vl
+        || config.is_qwen3moe
+        || config.is_qwen3next
+        || config.is_qwen35
+    {
+        qwen::tokenizer_policy()
+    } else if config.is_gemma3 {
+        gemma::tokenizer_policy()
+    } else {
+        llama::tokenizer_policy()
+    }
+}
+
+pub(crate) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
+    if config.is_qwen2
+        || config.is_qwen3moe
+        || config.is_qwen3next
+        || config.is_qwen3vl
+        || config.is_qwen35
+    {
+        qwen::multimodal_policy(config)
+    } else if config.is_gemma3 {
+        gemma::multimodal_policy()
+    } else {
+        llama::multimodal_policy()
+    }
+}
+
+pub(crate) fn runtime_debug_policy(config: &Config) -> VendorRuntimeDebugPolicy {
+    if config.is_qwen3vl || config.is_qwen3moe || config.is_qwen3next {
+        qwen::runtime_debug_policy()
+    } else if config.is_gemma3 {
+        gemma::runtime_debug_policy()
+    } else {
+        llama::runtime_debug_policy()
+    }
 }

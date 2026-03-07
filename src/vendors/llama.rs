@@ -1,9 +1,31 @@
+use super::{VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy};
 use crate::engine::types::{
-    Tokenizer, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOT, LLAMA3_START_HEADER,
+    Tokenizer, VendorTokenizerPolicy, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOT,
+    LLAMA3_START_HEADER,
 };
 
 pub(super) fn default_rope_theta() -> f32 {
     500_000.0
+}
+
+pub(super) fn decode_policy() -> VendorDecodePolicy {
+    VendorDecodePolicy {
+        parse_think_tags: false,
+        stop_token_literals: &[],
+        deterministic_loop_guard: false,
+    }
+}
+
+pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
+    VendorTokenizerPolicy::default()
+}
+
+pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
+    VendorMultimodalPolicy::default()
+}
+
+pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
+    VendorRuntimeDebugPolicy::default()
 }
 
 pub(super) fn encode_chat_prompt(

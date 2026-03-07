@@ -1,7 +1,7 @@
 use crate::engine::io::get_gguf_int_from_map;
 use crate::engine::types::{
-    Config, GGUFFile, GgufValue, Tokenizer, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN,
-    LLAMA3_EOT, LLAMA3_START_HEADER,
+    Config, GGUFFile, GgufValue, Tokenizer, VendorTokenizerPolicy, LLAMA3_BOS_TOKEN,
+    LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT, LLAMA3_START_HEADER,
 };
 use std::collections::HashMap;
 
@@ -400,6 +400,7 @@ impl Tokenizer {
 pub(crate) fn init_tokenizer_from_gguf(
     gguf: &GGUFFile,
     config: &mut Config,
+    policy: VendorTokenizerPolicy,
     debug_mode: bool,
 ) -> Result<Tokenizer, String> {
     if gguf.vocab_tokens.is_empty() {
@@ -419,12 +420,11 @@ pub(crate) fn init_tokenizer_from_gguf(
     ) as i32;
     tokenizer.start_header_token = LLAMA3_START_HEADER;
     tokenizer.end_header_token = LLAMA3_END_HEADER;
-    // Look up the actual end-of-turn token from the vocabulary. For Qwen models this is
-    // <|im_end|>; for Llama3 models <|eot_id|> maps to the LLAMA3_EOT constant (128009).
-    tokenizer.eot_token = gguf
-        .vocab_tokens
+    // Resolve end-of-turn token via vendor policy first, then fallback to Llama-style `<|eot_id|>`.
+    tokenizer.eot_token = policy
+        .end_turn_token_literals
         .iter()
-        .position(|s| s == "<|im_end|>")
+        .find_map(|token| gguf.vocab_tokens.iter().position(|s| s == *token))
         .map(|i| i as i32)
         .or_else(|| {
             gguf.vocab_tokens
@@ -450,7 +450,7 @@ pub(crate) fn init_tokenizer_from_gguf(
     };
     tokenizer.merges = gguf.vocab_merges.clone();
     if tokenizer.bos_token < 0 {
-        if config.is_qwen2 || config.is_qwen3vl || config.is_qwen3moe || config.is_qwen3next {
+        if policy.disable_bos_fallback {
             tokenizer.bos_token = -1;
         } else {
             tokenizer.bos_token = tokenizer

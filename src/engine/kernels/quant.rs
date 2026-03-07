@@ -1344,6 +1344,7 @@ unsafe fn vec_dot_q8_0_x86_avx512vnni(x: &[f32], w: &[u8], n: usize) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot_i8_32_dotprod(a: *const i8, b: *const i8) -> i32 {
     // Uses SDOT (ARMv8.2 dotprod) via inline asm to avoid unstable stdarch_neon_dotprod gate.
     // Caller must ensure dotprod is available at runtime.
@@ -1370,6 +1371,7 @@ unsafe fn dot_i8_32_dotprod(a: *const i8, b: *const i8) -> i32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
 unsafe fn vec_dot_q8_0_dotprod(x: &[f32], w: &[u8], n: usize) -> f32 {
     let nb = n / QK8_0;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
@@ -1409,6 +1411,7 @@ unsafe fn vec_dot_q8_0_dotprod(x: &[f32], w: &[u8], n: usize) -> f32 {
 /// Caller must ensure i8mm is available at runtime.
 #[cfg(target_arch = "aarch64")]
 #[inline]
+#[target_feature(enable = "i8mm")]
 unsafe fn dot2_q8_32_i8mm(xq: *const i8, w0: *const i8, w1: *const i8) -> (i32, i32) {
     // Uses SMMLA (ARMv8.6 i8mm) via inline asm to avoid unstable stdarch_neon_i8mm gate.
     let dot0: i32;
@@ -1461,6 +1464,7 @@ unsafe fn dot2_q8_32_i8mm(xq: *const i8, w0: *const i8, w1: *const i8) -> (i32, 
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "i8mm")]
 unsafe fn vec_dot_q8_0_2rows_i8mm(x: &[f32], w0: &[u8], w1: &[u8], n: usize) -> (f32, f32) {
     let nb = n / QK8_0;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
@@ -1612,7 +1616,7 @@ pub(crate) fn try_matmul_q8_mr2(
     if !use_aarch64_i8mm_q8() {
         return false;
     }
-    if n < QK8_0 || n % QK8_0 != 0 {
+    if n < QK8_0 || !n.is_multiple_of(QK8_0) {
         return false;
     }
     let d = xout.len();

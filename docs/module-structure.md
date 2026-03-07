@@ -81,6 +81,7 @@ src/
   - GGUF parse/load
   - llama-style local `mmproj*.gguf` sidecar discovery/probe for multimodal models (no extra CLI switch)
   - sidecar probe enforces checkpoint variant token matching (for example `2b`, `35b`, `a3b`) to prevent silent cross-size pairing
+  - applies vendor multimodal/runtime debug policies to sidecar scoring, request shaping, and context-length debug logging
   - vendor config + tokenizer + weights initialization
   - multimodal weight-group probe/initialization for multimodal backends
   - context/thread overrides
@@ -169,6 +170,8 @@ src/
     - `MediaRef`
     - `EncodedPrompt`
     - `PlaceholderSpan`
+  - Vendor tokenizer policy type used by tokenizer init:
+    - `VendorTokenizerPolicy` (`disable_bos_fallback`, `end_turn_token_literals`)
   - Model multimodal capability metadata:
     - `MultimodalBackend`
     - `ModelCapabilities`
@@ -228,6 +231,7 @@ src/
 
 - Tokenizer initialization and encode/decode logic.
 - Handles sentencepiece/tiktoken-ish paths and special token resolution.
+- Applies vendor-provided tokenizer policy for BOS fallback and end-of-turn token lookup.
 - Exposes `init_tokenizer_from_gguf(...)`.
 
 ### `src/engine/weights.rs`
@@ -263,7 +267,7 @@ src/
   - `configure_rayon_threads(...)`
 - `runtime/mod.rs`:
   - Re-exports runtime helpers.
-  - `apply_context_size_overrides(...)`.
+  - `apply_context_size_overrides(...)` (applies explicit `--context-size` override only).
 
 ### `src/engine/switches.rs`
 
@@ -295,9 +299,14 @@ src/
   - Builds `Config` from family-specific key conventions.
   - Detects `qwen35` explicitly and maps it onto the Qwen3Next-style runtime path.
   - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `qwen3vl` and `qwen35`.
+  - Dispatches vendor policies used by app/tokenizer decode paths:
+    - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`)
+    - `tokenizer_policy(...)` returning `VendorTokenizerPolicy`
+    - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
+    - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
   - Routes both simple chat prompt encoding and structured `GenerationRequest` encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
-  - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling and Qwen image/video/audio placeholder-span mapping).
+  - Family-specific defaults, validations, prompt rendering, and family-owned policy constructors (including Qwen MoE routing defaults/scaling and Qwen image/video/audio placeholder-span mapping).
 
 ## Runtime Data Flow
 
@@ -306,14 +315,15 @@ src/
 3. `app::run()` builds `RuntimeSwitchConfig` and calls `engine::switches::init_runtime_config(...)`.
 4. GGUF parsed via `engine::io::parse_gguf_file(...)`.
 5. Vendor config built with `vendors::build_config_from_gguf(...)`.
-6. Tokenizer initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
-7. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`).
+6. Vendor tokenizer, multimodal, and runtime debug policies are built (`vendors::{tokenizer_policy,multimodal_policy,runtime_debug_policy}(...)`) and tokenizer is initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
+7. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`), with vendor runtime-context debug logging handled in app.
 8. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
 9. Standard mode:
   - CLI media inputs are normalized into `engine::types::GenerationRequest` with `ContentPart` items.
   - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths.
   - runtime validates prompt/media alignment before starting preprocessing.
   - if native multimodal tensors are unavailable, runtime fails with a qualified native-capability error that includes architecture/token/tensor probe details.
+  - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, stop-token matching, and deterministic loop-guard behavior.
   - token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`); native media embedding injection remains in progress.
 10. Agent mode:
   - tool transcript prompt encoded per turn

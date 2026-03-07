@@ -60,6 +60,43 @@ Run with custom settings:
   --kv-cache-mode q4
 ```
 
+## Model Filtering (`--include-regex` / `--exclude-regex`)
+
+Filtering is applied to the model filename (for example `Qwen3.5-2B-Q4_K_M.gguf`) in this order:
+
+1. `--include-regex`: keep only matching models (if set)
+2. `--exclude-regex`: remove matching models (if set)
+3. `manifests/skip-models.txt`: remove explicit skip-list entries
+
+Notes:
+- Regex is evaluated with `rg` against the model name.
+- Matching is case-sensitive by default.
+- Use `^...$` anchors for an exact single-model match.
+
+Run a single exact model:
+
+```bash
+./regression/run.sh full \
+  --include-regex '^Qwen3\.5-35B-A3B-UD-Q4_K_M\.gguf$'
+```
+
+Run a single model quickly (no warmup, one measured run):
+
+```bash
+./regression/run.sh full \
+  --include-regex '^Qwen3\.5-35B-A3B-UD-Q4_K_M\.gguf$' \
+  --warmups 0 \
+  --runs 1
+```
+
+Include a family but exclude one variant:
+
+```bash
+./regression/run.sh full \
+  --include-regex '^Qwen3\.5-.*\.gguf$' \
+  --exclude-regex '35B'
+```
+
 ## Baseline Workflow
 
 Create/update a baseline from a run:

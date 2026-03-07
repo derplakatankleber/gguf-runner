@@ -1,5 +1,6 @@
+use super::{VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy};
 use crate::engine::types::{
-    Config, Tokenizer, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
+    Config, Tokenizer, VendorTokenizerPolicy, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
 };
 
 pub(super) fn default_rope_theta() -> f32 {
@@ -11,6 +12,29 @@ pub(super) fn print_config_debug(config: &Config) {
         "Gemma3: rms_norm_eps={}, final_logit_softcapping={}",
         config.rms_norm_eps, config.final_logit_softcapping
     );
+}
+
+pub(super) fn decode_policy() -> VendorDecodePolicy {
+    VendorDecodePolicy {
+        parse_think_tags: false,
+        stop_token_literals: &["<end_of_turn>"],
+        deterministic_loop_guard: false,
+    }
+}
+
+pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
+    VendorTokenizerPolicy {
+        disable_bos_fallback: false,
+        end_turn_token_literals: &["<end_of_turn>"],
+    }
+}
+
+pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
+    VendorMultimodalPolicy::default()
+}
+
+pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
+    VendorRuntimeDebugPolicy::default()
 }
 
 pub(super) fn encode_chat_prompt(

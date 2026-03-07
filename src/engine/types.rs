@@ -73,6 +73,21 @@ pub(crate) enum ThinkMode {
     Hidden,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VendorTokenizerPolicy {
+    pub(crate) disable_bos_fallback: bool,
+    pub(crate) end_turn_token_literals: &'static [&'static str],
+}
+
+impl Default for VendorTokenizerPolicy {
+    fn default() -> Self {
+        Self {
+            disable_bos_fallback: false,
+            end_turn_token_literals: &["<|eot_id|>"],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MediaRef {
     pub(crate) path: String,

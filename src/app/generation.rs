@@ -9,7 +9,7 @@ use crate::engine::profiling::{prof_end, prof_start, record_forward_pass, PROF_T
 use crate::engine::types::{
     Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, LazyModelLoader, MediaRef,
     MultimodalBackend, MultimodalWeights, PlaceholderSpan, ThinkMode, Tokenizer,
-    TransformerWeights, XorShiftRng, GEMMA3_END_TURN,
+    TransformerWeights, XorShiftRng,
 };
 use crate::engine::vision::{
     load_audio_chunk_samples, load_video_chunk_tensors, prepare_audios_for_multimodal,
@@ -32,6 +32,68 @@ fn time_in_ms() -> i64 {
     (now.as_secs() * 1000 + (now.subsec_nanos() as u64 / 1_000_000)) as i64
 }
 
+fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
+    // Detect degenerate decode loops by checking whether the current token suffix
+    // reappears several times in a recent lookback window (alignment-agnostic).
+    const WINDOWS: &[usize] = &[8, 12, 16, 24, 32, 48, 64, 96, 128];
+    for &window in WINDOWS {
+        let need = window * 3;
+        if tokens.len() < need {
+            continue;
+        }
+        let n = tokens.len();
+        let suffix = &tokens[n - window..n];
+        let search_start = n.saturating_sub(window * 6);
+        let search_end = n - window;
+        let mut hits = 0usize;
+        for start in search_start..=search_end {
+            if &tokens[start..start + window] == suffix {
+                hits += 1;
+                if hits >= 2 {
+                    return Some(window);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn repeated_long_line(output: &str) -> Option<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in output.lines().rev().take(96) {
+        let normalized = line.trim();
+        if normalized.len() < 24 {
+            continue;
+        }
+        if normalized.chars().all(|c| c.is_ascii_punctuation()) {
+            continue;
+        }
+        let entry = counts.entry(normalized.to_string()).or_insert(0);
+        *entry += 1;
+        if *entry >= 2 {
+            return Some((normalized.to_string(), *entry));
+        }
+    }
+    None
+}
+
+fn repeated_text_suffix_bytes(output: &str) -> Option<usize> {
+    let bytes = output.as_bytes();
+    const LENGTHS: &[usize] = &[64, 96, 128, 160, 192, 256];
+    for &len in LENGTHS {
+        if bytes.len() < len * 2 {
+            continue;
+        }
+        let n = bytes.len();
+        let a = &bytes[n - len..n];
+        let b = &bytes[n - 2 * len..n - len];
+        if a == b {
+            return Some(len);
+        }
+    }
+    None
+}
+
 pub(crate) struct GenerationSettings {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -43,6 +105,8 @@ pub(crate) struct GenerationSettings {
     pub(crate) show_tokens: bool,
     pub(crate) debug_mode: bool,
     pub(crate) think_mode: ThinkMode,
+    pub(crate) vendor_decode_policy: crate::vendors::VendorDecodePolicy,
+    pub(crate) vendor_multimodal_policy: crate::vendors::VendorMultimodalPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +419,7 @@ impl ModelRuntime {
         path: &Path,
         normalized_model_key: &str,
         backend: MultimodalBackend,
+        policy: crate::vendors::VendorMultimodalPolicy,
     ) -> i32 {
         let file_name = path
             .file_name()
@@ -365,18 +430,13 @@ impl ModelRuntime {
         if !normalized_model_key.is_empty() && normalized_file.contains(normalized_model_key) {
             score += 1_000;
         }
-        if normalized_file.contains("qwen3vl") {
-            if backend == MultimodalBackend::Qwen3Vl {
-                score += 100;
-            } else {
-                score -= 100;
-            }
-        }
-        if normalized_file.contains("qwen35") {
-            if backend == MultimodalBackend::Qwen35 {
-                score += 100;
-            } else {
-                score -= 100;
+        for hint in policy.mmproj_filename_score_hints {
+            if normalized_file.contains(hint.token) {
+                if backend == hint.backend {
+                    score += hint.match_score;
+                } else {
+                    score += hint.mismatch_score;
+                }
             }
         }
         if normalized_file.contains("mmproj") {
@@ -402,15 +462,24 @@ impl ModelRuntime {
         let model_key = Self::normalize_alnum_lower(&Self::strip_quant_suffix(
             model_stem.to_lowercase().as_str(),
         ));
+        let multimodal_policy = crate::vendors::multimodal_policy(cfg);
         let mut existing_candidates = candidates
             .into_iter()
             .filter(|path| path.is_file())
             .collect::<Vec<_>>();
         existing_candidates.sort_by(|a, b| {
-            let sa =
-                Self::score_mmproj_candidate(a, &model_key, cfg.capabilities.multimodal_backend);
-            let sb =
-                Self::score_mmproj_candidate(b, &model_key, cfg.capabilities.multimodal_backend);
+            let sa = Self::score_mmproj_candidate(
+                a,
+                &model_key,
+                cfg.capabilities.multimodal_backend,
+                multimodal_policy,
+            );
+            let sb = Self::score_mmproj_candidate(
+                b,
+                &model_key,
+                cfg.capabilities.multimodal_backend,
+                multimodal_policy,
+            );
             sb.cmp(&sa)
                 .then_with(|| a.to_string_lossy().cmp(&b.to_string_lossy()))
         });
@@ -511,11 +580,14 @@ impl ModelRuntime {
         } else {
             ""
         };
-        let qwen35_sidecar_hint = if self.config.capabilities.multimodal_backend
-            == MultimodalBackend::Qwen35
-            && self.mmproj_sidecar.is_none()
+        let sidecar_hint = if self.mmproj_sidecar.is_none()
+            && !self
+                .settings
+                .vendor_multimodal_policy
+                .missing_sidecar_hint
+                .is_empty()
         {
-            " hint: Qwen3.5 image/video inputs require a compatible Qwen3.5 mmproj sidecar from the same checkpoint family."
+            self.settings.vendor_multimodal_policy.missing_sidecar_hint
         } else {
             ""
         };
@@ -538,7 +610,7 @@ impl ModelRuntime {
             self.mmproj_summary(),
             top_prefixes,
             text_only_hint,
-            qwen35_sidecar_hint,
+            sidecar_hint,
         )
     }
 
@@ -643,7 +715,10 @@ impl ModelRuntime {
         }
     }
 
-    fn create_center_square_crop_file(image_path: &str) -> Result<Option<String>, String> {
+    fn create_center_square_crop_file(
+        image_path: &str,
+        temp_file_prefix: &str,
+    ) -> Result<Option<String>, String> {
         let reader = ImageReader::open(image_path)
             .map_err(|e| format!("cannot open image '{image_path}' for detail crop: {e}"))?;
         let decoded = reader
@@ -673,7 +748,12 @@ impl ModelRuntime {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let file_name = format!("gguf-runner-qwen35-detail-{}-{now}.png", std::process::id());
+        let file_prefix = if temp_file_prefix.is_empty() {
+            "gguf-runner-detail"
+        } else {
+            temp_file_prefix
+        };
+        let file_name = format!("{file_prefix}-{}-{now}.png", std::process::id());
         let out_path = std::env::temp_dir().join(file_name);
         cropped
             .save_with_format(&out_path, ImageFormat::Png)
@@ -686,15 +766,16 @@ impl ModelRuntime {
         Ok(Some(out_path.to_string_lossy().into_owned()))
     }
 
-    fn expand_request_for_qwen35_detail_crop(
+    fn expand_request_for_vendor_detail_crop(
         &self,
         request: &GenerationRequest,
     ) -> Result<GenerationRequest, String> {
-        if self.config.capabilities.multimodal_backend != MultimodalBackend::Qwen35 {
+        let detail_crop_policy = self.settings.vendor_multimodal_policy.detail_crop;
+        if !detail_crop_policy.enabled {
             return Ok(request.clone());
         }
-        if self.config.n_layers > 24 {
-            // Keep large qwen35 variants on single-image path unless explicitly requested otherwise.
+        if self.config.n_layers > detail_crop_policy.max_layers {
+            // Keep large variants on single-image path unless explicitly requested otherwise.
             return Ok(request.clone());
         }
         if request
@@ -719,7 +800,9 @@ impl ModelRuntime {
             return Ok(request.clone());
         }
         let (image_part_idx, image_path) = &image_indices[0];
-        let Some(crop_path) = Self::create_center_square_crop_file(image_path)? else {
+        let Some(crop_path) =
+            Self::create_center_square_crop_file(image_path, detail_crop_policy.temp_file_prefix)?
+        else {
             return Ok(request.clone());
         };
 
@@ -727,9 +810,9 @@ impl ModelRuntime {
         for (idx, part) in request.parts.iter().enumerate() {
             parts.push(part.clone());
             if idx == *image_part_idx {
-                parts.push(ContentPart::Text(
-                    "\n(Second image: centered close-up crop of the same source.)\n".to_string(),
-                ));
+                if !detail_crop_policy.note_text.is_empty() {
+                    parts.push(ContentPart::Text(detail_crop_policy.note_text.to_string()));
+                }
                 parts.push(ContentPart::Image(MediaRef {
                     path: crop_path.clone(),
                 }));
@@ -826,8 +909,15 @@ impl ModelRuntime {
         }
 
         let mut config = crate::vendors::build_config_from_gguf(&gguf, debug_mode)?;
-        let mut tokenizer =
-            crate::engine::tokenizer::init_tokenizer_from_gguf(&gguf, &mut config, debug_mode)?;
+        let tokenizer_policy = crate::vendors::tokenizer_policy(&config);
+        let vendor_multimodal_policy = crate::vendors::multimodal_policy(&config);
+        let vendor_runtime_debug_policy = crate::vendors::runtime_debug_policy(&config);
+        let mut tokenizer = crate::engine::tokenizer::init_tokenizer_from_gguf(
+            &gguf,
+            &mut config,
+            tokenizer_policy,
+            debug_mode,
+        )?;
         tokenizer.use_sentencepiece = config.is_gemma3;
         let media_requested =
             !cli.images.is_empty() || !cli.videos.is_empty() || !cli.audios.is_empty();
@@ -880,6 +970,14 @@ impl ModelRuntime {
             cli.context_size,
             debug_mode,
         );
+        if cli.context_size == 0 && debug_mode {
+            if let Some(label) = vendor_runtime_debug_policy.native_context_label {
+                eprintln!(
+                    "Using {label} native context length {} (model may require a large workspace)",
+                    config.seq_len
+                );
+            }
+        }
         if max_tokens == 0 || max_tokens > config.seq_len {
             max_tokens = config.seq_len;
         }
@@ -891,6 +989,7 @@ impl ModelRuntime {
         let weights = crate::engine::weights::init_weights_from_gguf(&gguf, &config, debug_mode)?;
         let multimodal_weights =
             crate::engine::weights::init_multimodal_weights_from_gguf(&gguf, &config, debug_mode)?;
+        let vendor_decode_policy = crate::vendors::decode_policy(&config);
         let settings = GenerationSettings {
             temperature: cli.temperature,
             top_k: cli.top_k,
@@ -902,6 +1001,8 @@ impl ModelRuntime {
             show_tokens: cli.show_tokens,
             debug_mode,
             think_mode: cli.think_mode,
+            vendor_decode_policy,
+            vendor_multimodal_policy,
         };
 
         Ok(Self {
@@ -934,7 +1035,7 @@ impl ModelRuntime {
         request: &GenerationRequest,
         stream_stdout: bool,
     ) -> Result<String, String> {
-        let effective_request = self.expand_request_for_qwen35_detail_crop(request)?;
+        let effective_request = self.expand_request_for_vendor_detail_crop(request)?;
         let mut prompt_parts: Vec<&str> = Vec::new();
         let mut images: Vec<String> = Vec::new();
         let mut videos: Vec<String> = Vec::new();
@@ -1183,38 +1284,24 @@ impl ModelRuntime {
         };
         let mut pending_newline = false;
         let mut output = String::new();
+        let mut generated_tokens = Vec::new();
 
         // Think mode state: track whether we're currently inside a <think>...</think> block.
         // The prompt already ends with "<think>\n" for Yes/Hidden modes, so generation starts
         // inside the thinking block. For No mode the prompt closes it immediately.
         let think_mode = self.settings.think_mode;
-        let model_has_thinking =
-            self.config.is_qwen3next || self.config.is_qwen3vl || self.config.is_qwen35;
-        let thinking_active = model_has_thinking && think_mode != ThinkMode::No;
+        let decode_policy = self.settings.vendor_decode_policy;
+        let thinking_active = decode_policy.parse_think_tags && think_mode != ThinkMode::No;
         let mut is_thinking = thinking_active;
         if thinking_active && think_mode == ThinkMode::Yes && stream_stdout {
-            print!("<think>\n");
+            println!("<think>");
             let _ = io::stdout().flush();
         }
-
-        let gemma3_end_turn = if self.config.is_gemma3 {
-            self.tokenizer
-                .find_special_token("<end_of_turn>")
-                .unwrap_or(GEMMA3_END_TURN)
-        } else {
-            -1
-        };
-        let qwen_im_end = if self.config.is_qwen2
-            || self.config.is_qwen3moe
-            || self.config.is_qwen3next
-            || self.config.is_qwen3vl
-        {
-            self.tokenizer
-                .find_special_token("<|im_end|>")
-                .unwrap_or(-1)
-        } else {
-            -1
-        };
+        let stop_token_ids = decode_policy
+            .stop_token_literals
+            .iter()
+            .filter_map(|literal| self.tokenizer.find_special_token(literal))
+            .collect::<Vec<_>>();
 
         let total_limit = prompt_tokens
             .len()
@@ -1396,20 +1483,41 @@ impl ModelRuntime {
             }
 
             if pos >= prompt_tokens.len().saturating_sub(1) {
+                generated_tokens.push(token);
                 if token == self.tokenizer.eos_token || token == self.tokenizer.eot_token {
                     break;
                 }
-                if self.config.is_gemma3 && token == gemma3_end_turn {
+                if stop_token_ids.contains(&token) {
                     break;
                 }
-                if (self.config.is_qwen2
-                    || self.config.is_qwen3moe
-                    || self.config.is_qwen3next
-                    || self.config.is_qwen3vl)
-                    && qwen_im_end >= 0
-                    && token == qwen_im_end
+                if temperature == 0.0
+                    && self.settings.vendor_decode_policy.deterministic_loop_guard
+                    && generated_tokens.len() % 8 == 0
                 {
-                    break;
+                    if let Some(len) = repeated_text_suffix_bytes(&output) {
+                        if debug_mode || show_tokens {
+                            eprintln!(
+                                "\nStopping due to repeated output suffix block (len={len} bytes)"
+                            );
+                        }
+                        break;
+                    }
+                    if let Some((line, repeats)) = repeated_long_line(&output) {
+                        if debug_mode || show_tokens {
+                            eprintln!(
+                                "\nStopping due to repeated output line (repeats={repeats}): {line}"
+                            );
+                        }
+                        break;
+                    }
+                    if let Some(period) = repeated_cycle_period(&generated_tokens) {
+                        if debug_mode || show_tokens {
+                            eprintln!(
+                                "\nStopping due to repeated token cycle (window={period}, repeated suffix)"
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1437,17 +1545,21 @@ impl ModelRuntime {
     ) -> Result<String, String> {
         if !images.is_empty() {
             let mut parts = Vec::with_capacity(1 + images.len());
-            // Qwen-style multimodal prompts are more stable when image placeholders precede text instructions.
+            // Keep image placeholders ahead of text so multimodal templates can bind media spans first.
             for image in images {
                 parts.push(ContentPart::Image(crate::engine::types::MediaRef {
                     path: image.clone(),
                 }));
             }
             let mut effective_prompt = prompt.to_string();
-            if self.config.capabilities.multimodal_backend == MultimodalBackend::Qwen35 {
-                effective_prompt.push_str(
-                    "\nPlease avoid guessing uncertain details. If text is unclear, explicitly say it is unreadable.",
-                );
+            if !self
+                .settings
+                .vendor_multimodal_policy
+                .image_prompt_suffix
+                .is_empty()
+            {
+                effective_prompt
+                    .push_str(self.settings.vendor_multimodal_policy.image_prompt_suffix);
             }
             if !prompt.trim().is_empty() {
                 parts.push(ContentPart::Text(effective_prompt));

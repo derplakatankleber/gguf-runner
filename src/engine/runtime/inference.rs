@@ -36,6 +36,7 @@ fn bf16_le_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(u << 16)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_bf16_projection_rows(
     p: &Config,
     pos: usize,
@@ -84,9 +85,9 @@ fn validate_bf16_projection_rows(
         }
         let row = &mapped[row_off..row_end];
         let mut ref_dot = 0.0f32;
-        for i in 0..qw.cols {
+        for (i, &xv) in x.iter().enumerate().take(qw.cols) {
             let b = i * 2;
-            ref_dot += x[i] * bf16_le_to_f32(row[b], row[b + 1]);
+            ref_dot += xv * bf16_le_to_f32(row[b], row[b + 1]);
         }
         let diff = (got[r] - ref_dot).abs();
         if diff > max_abs {
@@ -224,7 +225,6 @@ fn quantize_row_q8(src: &[f32], dst: &mut [i8], scale_out: &mut f32) {
                 i += 1;
             }
         }
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

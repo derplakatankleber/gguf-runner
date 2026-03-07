@@ -1,7 +1,26 @@
-use crate::engine::types::{
-    Config, ContentPart, EncodedPrompt, GenerationRequest, MediaRef, PlaceholderSpan, ThinkMode,
-    Tokenizer,
+use super::{
+    MmprojFilenameScoreHint, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
+    VendorRuntimeDebugPolicy,
 };
+use crate::engine::types::{
+    Config, ContentPart, EncodedPrompt, GenerationRequest, MediaRef, MultimodalBackend,
+    PlaceholderSpan, ThinkMode, Tokenizer, VendorTokenizerPolicy,
+};
+
+const QWEN_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
+    MmprojFilenameScoreHint {
+        token: "qwen3vl",
+        backend: MultimodalBackend::Qwen3Vl,
+        match_score: 100,
+        mismatch_score: -100,
+    },
+    MmprojFilenameScoreHint {
+        token: "qwen35",
+        backend: MultimodalBackend::Qwen35,
+        match_score: 100,
+        mismatch_score: -100,
+    },
+];
 
 pub(super) fn finalize_moe_config(config: &mut Config) -> Result<(), String> {
     if config.expert_hidden_dim == 0 || config.n_experts == 0 {
@@ -103,6 +122,49 @@ pub(super) fn print_qwen3next_debug(config: &Config) {
         config.ssm_conv_kernel,
         config.rms_norm_eps
     );
+}
+
+pub(super) fn decode_policy(config: &Config) -> VendorDecodePolicy {
+    VendorDecodePolicy {
+        parse_think_tags: config.is_qwen3next || config.is_qwen3vl || config.is_qwen35,
+        stop_token_literals: &["<|im_end|>"],
+        // Qwen3.5 family can enter deterministic repetition loops on temperature=0.
+        deterministic_loop_guard: config.is_qwen35,
+    }
+}
+
+pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
+    VendorTokenizerPolicy {
+        disable_bos_fallback: true,
+        end_turn_token_literals: &["<|im_end|>"],
+    }
+}
+
+pub(super) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
+    match config.capabilities.multimodal_backend {
+        MultimodalBackend::Qwen35 => VendorMultimodalPolicy {
+            image_prompt_suffix: "\nPlease avoid guessing uncertain details. If text is unclear, explicitly say it is unreadable.",
+            detail_crop: VendorDetailCropPolicy {
+                enabled: true,
+                max_layers: 24,
+                note_text: "\n(Second image: centered close-up crop of the same source.)\n",
+                temp_file_prefix: "gguf-runner-qwen35-detail",
+            },
+            mmproj_filename_score_hints: QWEN_MMPROJ_SCORE_HINTS,
+            missing_sidecar_hint: " hint: Qwen3.5 image/video inputs require a compatible Qwen3.5 mmproj sidecar from the same checkpoint family.",
+        },
+        MultimodalBackend::Qwen3Vl => VendorMultimodalPolicy {
+            mmproj_filename_score_hints: QWEN_MMPROJ_SCORE_HINTS,
+            ..VendorMultimodalPolicy::default()
+        },
+        MultimodalBackend::None => VendorMultimodalPolicy::default(),
+    }
+}
+
+pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
+    VendorRuntimeDebugPolicy {
+        native_context_label: Some("qwen3"),
+    }
 }
 
 pub(super) fn encode_qwen2_chat(

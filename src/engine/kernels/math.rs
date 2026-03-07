@@ -59,7 +59,6 @@ pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps
             o[j] = weight[j] * (vgetq_lane_f32(scale, 0) * x[j]);
             j += 1;
         }
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -121,7 +120,6 @@ pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f
             x[j] = weight[j] * (vgetq_lane_f32(scale, 0) * x[j]);
             j += 1;
         }
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -189,7 +187,7 @@ pub(crate) fn softmax(x: &mut [f32], size: usize) {
         // Pass 2: exp(x[i] - max), accumulate sum
         // Same degree-5 polynomial exp approximation as silu_and_mul_inplace
         let log2e = vdupq_n_f32(std::f32::consts::LOG2_E);
-        let ln2_hi = vdupq_n_f32(0.693_359_375_f32);
+        let ln2_hi = vdupq_n_f32(0.693_359_4_f32);
         let ln2_lo = vdupq_n_f32(-2.121_944_4e-4_f32);
         let one = vdupq_n_f32(1.0_f32);
         let c2 = vdupq_n_f32(0.5_f32);
@@ -271,7 +269,7 @@ pub(crate) fn silu_and_mul_inplace(hb: &mut [f32], hb2: &[f32]) {
         use std::arch::aarch64::*;
         // Range-reduction constants for exp(x): x = n*ln2 + r, |r| <= ln2/2
         let log2e = vdupq_n_f32(std::f32::consts::LOG2_E);
-        let ln2_hi = vdupq_n_f32(0.693_359_375_f32); // upper part of ln2
+        let ln2_hi = vdupq_n_f32(0.693_359_4_f32); // upper part of ln2
         let ln2_lo = vdupq_n_f32(-2.121_944_4e-4_f32); // lower part of ln2
         let one = vdupq_n_f32(1.0_f32);
         // Polynomial coefficients for exp(r), r in [-ln2/2, ln2/2]

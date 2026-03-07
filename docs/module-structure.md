@@ -178,11 +178,8 @@ src/
   - Extended model identity flags:
     - `Config::is_qwen35`
     - `Config::rope_sections` for Qwen3.5 M-RoPE section metadata
-  - Lazy loader implementation (`LazyModelLoader`)
   - Unix mmap wrapper (`MappedFile`) including Linux memory advice hints for model mappings
-  - Global lazy loader state:
-    - `LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>>`
-  - `ensure_model_range(...)` helper used by quantized matmul paths.
+  - `ensure_model_range(...)` helper used by quantized matmul paths (currently a no-op in local-file mode).
   - GGUF metadata value variants include integer arrays (`I64Array`) for keys such as `*.rope.dimension_sections`.
 
 ### `src/engine/io/*`

@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::c_void;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::fs::File;
+use std::io;
+#[cfg(not(unix))]
+use std::io::Read;
 #[cfg(not(unix))]
 use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 pub(crate) const GGUF_MAGIC: u32 = 0x4655_4747;
 
@@ -300,322 +298,10 @@ impl Drop for MappedFile {
     }
 }
 
-pub(crate) const LAZY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const LAZY_BOOTSTRAP_START_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const LAZY_BOOTSTRAP_MAX_BYTES: usize = 512 * 1024 * 1024;
-pub(crate) const LAZY_FETCH_RETRIES: usize = 3;
-
-pub(crate) static LAZY_MODEL_LOADER: OnceLock<Arc<LazyModelLoader>> = OnceLock::new();
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LazyChunkState {
-    Missing,
-    Fetching,
-    Ready,
-    Failed,
-}
-
-pub(crate) struct LazyModelLoader {
-    pub(crate) url: String,
-    pub(crate) file: File,
-    pub(crate) file_len: usize,
-    pub(crate) chunk_bytes: usize,
-    pub(crate) chunk_count: usize,
-    pub(crate) states: Mutex<Vec<LazyChunkState>>,
-    pub(crate) cv: Condvar,
-    pub(crate) debug_mode: bool,
-    pub(crate) ready_chunks: AtomicUsize,
-    pub(crate) fetch_attempts: AtomicUsize,
-    pub(crate) fetch_waits: AtomicUsize,
-    pub(crate) foreground_fetches: AtomicUsize,
-    pub(crate) background_fetches: AtomicUsize,
-}
-
-impl LazyModelLoader {
-    pub(crate) fn new(url: &str, model_path: &str, debug_mode: bool) -> Result<Self, String> {
-        let file_len = Self::probe_remote_len(url)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(model_path)
-            .map_err(|e| format!("cannot open local cache file {model_path}: {e}"))?;
-        file.set_len(file_len as u64)
-            .map_err(|e| format!("cannot size cache file {model_path}: {e}"))?;
-
-        let chunk_bytes = LAZY_CHUNK_BYTES;
-        let chunk_count = file_len.div_ceil(chunk_bytes);
-        let states = vec![LazyChunkState::Missing; chunk_count];
-
-        Ok(Self {
-            url: url.to_string(),
-            file,
-            file_len,
-            chunk_bytes,
-            chunk_count,
-            states: Mutex::new(states),
-            cv: Condvar::new(),
-            debug_mode,
-            ready_chunks: AtomicUsize::new(0),
-            fetch_attempts: AtomicUsize::new(0),
-            fetch_waits: AtomicUsize::new(0),
-            foreground_fetches: AtomicUsize::new(0),
-            background_fetches: AtomicUsize::new(0),
-        })
-    }
-
-    fn probe_remote_len(url: &str) -> Result<usize, String> {
-        if let Ok(resp) = ureq::head(url).call() {
-            if let Some(v) = resp
-                .headers()
-                .get("Content-Length")
-                .and_then(|v| v.to_str().ok())
-            {
-                if let Ok(n) = v.parse::<u64>() {
-                    if n > 0 {
-                        return Ok(n as usize);
-                    }
-                }
-            }
-        }
-
-        let resp = ureq::get(url)
-            .header("Range", "bytes=0-0")
-            .call()
-            .map_err(|e| format!("cannot query remote size from {url}: {e}"))?;
-        if let Some(cr) = resp
-            .headers()
-            .get("Content-Range")
-            .and_then(|v| v.to_str().ok())
-        {
-            return Self::parse_content_range_total(cr);
-        }
-        if let Some(v) = resp
-            .headers()
-            .get("Content-Length")
-            .and_then(|v| v.to_str().ok())
-        {
-            if let Ok(n) = v.parse::<u64>() {
-                if n > 0 {
-                    return Ok(n as usize);
-                }
-            }
-        }
-        Err(format!(
-            "cannot determine remote size for {url} (missing Content-Length/Content-Range)"
-        ))
-    }
-
-    fn parse_content_range_total(content_range: &str) -> Result<usize, String> {
-        let total = content_range
-            .rsplit('/')
-            .next()
-            .ok_or_else(|| format!("invalid Content-Range header: {content_range}"))?;
-        total
-            .parse::<u64>()
-            .map(|v| v as usize)
-            .map_err(|e| format!("invalid Content-Range total in {content_range}: {e}"))
-    }
-
-    fn chunk_bounds(&self, chunk_idx: usize) -> (usize, usize) {
-        let start = chunk_idx * self.chunk_bytes;
-        let end = (start + self.chunk_bytes).min(self.file_len);
-        (start, end)
-    }
-
-    fn fetch_chunk_into_cache(&self, chunk_idx: usize) -> Result<(), String> {
-        let (start, end) = self.chunk_bounds(chunk_idx);
-        let mut last_err: Option<String> = None;
-
-        for _ in 0..LAZY_FETCH_RETRIES {
-            match self.fetch_chunk_once(start, end) {
-                Ok(()) => return Ok(()),
-                Err(e) => last_err = Some(e),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| "unknown chunk fetch failure".to_string()))
-    }
-
-    fn fetch_chunk_once(&self, start: usize, end: usize) -> Result<(), String> {
-        let range = format!("bytes={start}-{}", end - 1);
-        let resp = ureq::get(&self.url)
-            .header("Range", &range)
-            .call()
-            .map_err(|e| format!("range request failed ({range}): {e}"))?;
-
-        let status = resp.status();
-        if status != 206 && !(status == 200 && start == 0 && end == self.file_len) {
-            return Err(format!(
-                "unexpected HTTP status {} for range {}",
-                status, range
-            ));
-        }
-
-        let mut body = Vec::with_capacity(end - start);
-        resp.into_body()
-            .into_reader()
-            .read_to_end(&mut body)
-            .map_err(|e| format!("failed reading HTTP body for range {range}: {e}"))?;
-        if body.len() != end - start {
-            return Err(format!(
-                "short read for range {range}: got {} bytes, expected {}",
-                body.len(),
-                end - start
-            ));
-        }
-
-        write_all_at(&self.file, &body, start as u64)
-            .map_err(|e| format!("failed writing cache bytes [{start}..{end}): {e}"))?;
-        Ok(())
-    }
-
-    fn ensure_chunk_ready(&self, chunk_idx: usize, is_background: bool) -> Result<(), String> {
-        let mut states = self
-            .states
-            .lock()
-            .map_err(|_| "lazy loader state lock poisoned".to_string())?;
-        loop {
-            match states[chunk_idx] {
-                LazyChunkState::Ready => return Ok(()),
-                LazyChunkState::Missing | LazyChunkState::Failed => {
-                    states[chunk_idx] = LazyChunkState::Fetching;
-                    self.fetch_attempts.fetch_add(1, AtomicOrdering::Relaxed);
-                    if is_background {
-                        self.background_fetches
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    } else {
-                        self.foreground_fetches
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    break;
-                }
-                LazyChunkState::Fetching => {
-                    self.fetch_waits.fetch_add(1, AtomicOrdering::Relaxed);
-                    states = self
-                        .cv
-                        .wait(states)
-                        .map_err(|_| "lazy loader state lock poisoned".to_string())?;
-                }
-            }
-        }
-        drop(states);
-
-        let result = self.fetch_chunk_into_cache(chunk_idx);
-        let mut states = self
-            .states
-            .lock()
-            .map_err(|_| "lazy loader state lock poisoned".to_string())?;
-        states[chunk_idx] = if result.is_ok() {
-            self.ready_chunks.fetch_add(1, AtomicOrdering::Relaxed);
-            LazyChunkState::Ready
-        } else {
-            LazyChunkState::Failed
-        };
-        self.cv.notify_all();
-        result
-    }
-
-    pub(crate) fn debug_stats_line(&self) -> String {
-        let ready = self.ready_chunks.load(AtomicOrdering::Relaxed);
-        let pct = if self.chunk_count == 0 {
-            100.0
-        } else {
-            100.0 * ready as f64 / self.chunk_count as f64
-        };
-        let attempts = self.fetch_attempts.load(AtomicOrdering::Relaxed);
-        let waits = self.fetch_waits.load(AtomicOrdering::Relaxed);
-        let fg = self.foreground_fetches.load(AtomicOrdering::Relaxed);
-        let bg = self.background_fetches.load(AtomicOrdering::Relaxed);
-        format!(
-            "Lazy model: ready={}/{} ({:.1}%), fetch_attempts={}, waits={}, fg_fetches={}, bg_fetches={}",
-            ready, self.chunk_count, pct, attempts, waits, fg, bg
-        )
-    }
-
-    pub(crate) fn ensure_range(&self, offset: usize, len: usize) -> Result<(), String> {
-        if len == 0 || self.chunk_count == 0 {
-            return Ok(());
-        }
-        if offset >= self.file_len {
-            return Err(format!(
-                "lazy ensure_range offset {} outside file size {}",
-                offset, self.file_len
-            ));
-        }
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| "lazy ensure_range overflow".to_string())?
-            .min(self.file_len);
-        let first = offset / self.chunk_bytes;
-        let last = (end - 1) / self.chunk_bytes;
-        for c in first..=last {
-            self.ensure_chunk_ready(c, false)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn start_background_download(self: &Arc<Self>) {
-        let this = Arc::clone(self);
-        std::thread::spawn(move || {
-            for chunk_idx in 0..this.chunk_count {
-                if let Err(e) = this.ensure_chunk_ready(chunk_idx, true) {
-                    if this.debug_mode {
-                        eprintln!(
-                            "Lazy model background download stopped at chunk {}: {}",
-                            chunk_idx, e
-                        );
-                    }
-                    return;
-                }
-                if this.debug_mode
-                    && (chunk_idx + 1 == this.chunk_count || (chunk_idx + 1) % 128 == 0)
-                {
-                    eprintln!("{}", this.debug_stats_line());
-                }
-            }
-            if this.debug_mode {
-                eprintln!("Lazy model background download finished");
-                eprintln!("{}", this.debug_stats_line());
-            }
-        });
-    }
-}
-
 pub(crate) fn ensure_model_range(offset: usize, len: usize) -> Result<(), String> {
-    if let Some(loader) = LAZY_MODEL_LOADER.get() {
-        loader.ensure_range(offset, len)?;
-    }
+    let _ = offset;
+    let _ = len;
     Ok(())
-}
-
-fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        while !buf.is_empty() {
-            let n = file.write_at(buf, offset)?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write model cache",
-                ));
-            }
-            buf = &buf[n..];
-            offset += n as u64;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        let _ = buf;
-        let _ = offset;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "lazy model cache writes require unix platform",
-        ))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -652,15 +338,11 @@ pub(crate) struct GGUFFile {
     pub(crate) vocab_scores: Vec<f32>,
     pub(crate) vocab_merges: Vec<String>,
     pub(crate) mapped: MappedFile,
-    pub(crate) lazy_loader: Option<Arc<LazyModelLoader>>,
 }
 
 impl GGUFFile {
     #[inline]
-    pub(crate) fn ensure_range(&self, offset: usize, len: usize) -> Result<(), String> {
-        if let Some(loader) = &self.lazy_loader {
-            loader.ensure_range(offset, len)?;
-        }
+    pub(crate) fn ensure_range(&self, _offset: usize, _len: usize) -> Result<(), String> {
         Ok(())
     }
 }

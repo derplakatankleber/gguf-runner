@@ -454,9 +454,6 @@ struct Cli {
     #[arg(long = "audio", value_name = "path")]
     audios: Vec<String>,
 
-    #[arg(long)]
-    url: Option<String>,
-
     #[arg(long, default_value_t = 0.9)]
     temperature: f32,
 
@@ -676,7 +673,6 @@ pub(crate) struct CliOptions {
     pub(crate) images: Vec<String>,
     pub(crate) videos: Vec<String>,
     pub(crate) audios: Vec<String>,
-    pub(crate) url: Option<String>,
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
     pub(crate) top_p: f32,
@@ -753,7 +749,6 @@ impl CliOptions {
             images: cli.images,
             videos: cli.videos,
             audios: cli.audios,
-            url: cli.url,
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,

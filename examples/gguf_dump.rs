@@ -13,7 +13,6 @@ use engine::types::{
 
 struct InspectOptions {
     model: String,
-    url: Option<String>,
     debug: bool,
     dump_kv: bool,
     dump_tensors: bool,
@@ -28,7 +27,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
-    let gguf = parse_gguf_file(&opts.model, opts.url.as_deref(), opts.debug)?;
+    let gguf = parse_gguf_file(&opts.model, opts.debug)?;
 
     if opts.dump_kv {
         dump_kv(&gguf);
@@ -42,7 +41,6 @@ fn run() -> Result<(), String> {
 fn parse_args() -> Result<InspectOptions, String> {
     let mut args = std::env::args().skip(1);
     let mut model: Option<String> = None;
-    let mut url: Option<String> = None;
     let mut debug = false;
     let mut dump_kv = false;
     let mut dump_tensors = false;
@@ -54,12 +52,6 @@ fn parse_args() -> Result<InspectOptions, String> {
                     .next()
                     .ok_or_else(|| "missing value for --model".to_string())?;
                 model = Some(v);
-            }
-            "--url" => {
-                let v = args
-                    .next()
-                    .ok_or_else(|| "missing value for --url".to_string())?;
-                url = Some(v);
             }
             "--dump-kv" => dump_kv = true,
             "--dump-tensors" => dump_tensors = true,
@@ -81,7 +73,6 @@ fn parse_args() -> Result<InspectOptions, String> {
 
     Ok(InspectOptions {
         model,
-        url,
         debug,
         dump_kv,
         dump_tensors,
@@ -90,7 +81,7 @@ fn parse_args() -> Result<InspectOptions, String> {
 
 fn print_help() {
     println!(
-        "Usage: cargo run --example gguf_dump -- --model <model.gguf> [--dump-kv] [--dump-tensors] [--url <model-url>] [--debug]"
+        "Usage: cargo run --example gguf_dump -- --model <model.gguf> [--dump-kv] [--dump-tensors] [--debug]"
     );
     println!();
     println!("Dumps GGUF metadata for model reverse-engineering.");

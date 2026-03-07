@@ -50,25 +50,25 @@ jobs:
           - name: linux-amd64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            target_cpu: x86-64
+            rustflags: -C target-cpu=x86-64
             artifact_name: gguf-runner-linux-amd64
             artifact_path: target/x86_64-unknown-linux-gnu/release/gguf-runner
           - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            target_cpu: generic
+            rustflags: -C target-cpu=generic
             artifact_name: gguf-runner-linux-arm64
             artifact_path: target/aarch64-unknown-linux-gnu/release/gguf-runner
           - name: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
-            target_cpu: generic
+            rustflags: ""
             artifact_name: gguf-runner-macos-arm64
             artifact_path: target/aarch64-apple-darwin/release/gguf-runner
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            target_cpu: x86-64
+            rustflags: -C target-cpu=x86-64
             artifact_name: gguf-runner-windows-amd64
             artifact_path: target/x86_64-pc-windows-msvc/release/gguf-runner.exe
     runs-on: ${{ matrix.os }}
@@ -88,9 +88,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: build-${{ matrix.target }}
-      - name: Build release binary
+      - name: Build release binary (custom rustflags)
+        if: matrix.rustflags != ''
         env:
-          RUSTFLAGS: -C target-cpu=${{ matrix.target_cpu }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Build release binary (default target flags)
+        if: matrix.rustflags == ''
         run: cargo build --release --target ${{ matrix.target }} --locked
       - name: Upload artifact
         uses: actions/upload-artifact@v7

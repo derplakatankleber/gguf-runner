@@ -7,9 +7,8 @@ use crate::engine::multimodal::{
 };
 use crate::engine::profiling::{prof_end, prof_start, record_forward_pass, PROF_TRANSFORMER_NS};
 use crate::engine::types::{
-    Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, LazyModelLoader, MediaRef,
-    MultimodalBackend, MultimodalWeights, PlaceholderSpan, ThinkMode, Tokenizer,
-    TransformerWeights, XorShiftRng,
+    Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, MediaRef, MultimodalBackend,
+    MultimodalWeights, PlaceholderSpan, ThinkMode, Tokenizer, TransformerWeights, XorShiftRng,
 };
 use crate::engine::vision::{
     load_audio_chunk_samples, load_video_chunk_tensors, prepare_audios_for_multimodal,
@@ -22,7 +21,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn time_in_ms() -> i64 {
@@ -128,8 +126,6 @@ pub(crate) struct ModelRuntime {
     mmproj_sidecar: Option<MmprojSidecarProbe>,
     mmproj_candidates: Vec<String>,
     vision_encoder: Option<VisionEncoder>,
-    lazy_debug_loader: Option<Arc<LazyModelLoader>>,
-    next_lazy_debug_ms: i64,
     kv_cache_format_logged: bool,
 }
 
@@ -485,7 +481,7 @@ impl ModelRuntime {
         });
         for path in existing_candidates {
             let sidecar_path = path.to_string_lossy().into_owned();
-            let sidecar = match parse_gguf_file(&sidecar_path, None, debug_mode) {
+            let sidecar = match parse_gguf_file(&sidecar_path, debug_mode) {
                 Ok(sidecar) => sidecar,
                 Err(e) => {
                     if debug_mode {
@@ -885,7 +881,6 @@ impl ModelRuntime {
         let mut max_tokens = cli.max_tokens;
         let debug_mode = cli.debug;
         let checkpoint = &cli.model;
-        let model_url = cli.url.as_deref();
         if debug_mode {
             eprintln!("Loading GGUF model: {checkpoint}");
             eprintln!(
@@ -894,18 +889,13 @@ impl ModelRuntime {
             );
         }
 
-        let gguf = parse_gguf_file(checkpoint, model_url, debug_mode)?;
-        let lazy_debug_loader = gguf.lazy_loader.as_ref().map(Arc::clone);
-        let next_lazy_debug_ms = time_in_ms() + 2_000;
+        let gguf = parse_gguf_file(checkpoint, debug_mode)?;
 
         if debug_mode {
             eprintln!(
                 "GGUF metadata: version={}, tensors={}, kv={}, tensor_data_start={} bytes",
                 gguf.version, gguf.n_tensors, gguf.n_kv, gguf.tensor_data_start
             );
-            if let Some(loader) = &lazy_debug_loader {
-                eprintln!("{}", loader.debug_stats_line());
-            }
         }
 
         let mut config = crate::vendors::build_config_from_gguf(&gguf, debug_mode)?;
@@ -951,7 +941,7 @@ impl ModelRuntime {
 
         let vision_encoder = if media_requested {
             if let Some(probe) = &mmproj_sidecar {
-                let mmproj = parse_gguf_file(&probe.path, None, debug_mode).map_err(|e| {
+                let mmproj = parse_gguf_file(&probe.path, debug_mode).map_err(|e| {
                     format!(
                         "failed to load llama-style mmproj sidecar '{}' for multimodal backend initialization: {e}",
                         probe.path
@@ -1015,8 +1005,6 @@ impl ModelRuntime {
             mmproj_sidecar,
             mmproj_candidates,
             vision_encoder,
-            lazy_debug_loader,
-            next_lazy_debug_ms,
             kv_cache_format_logged: false,
         })
     }
@@ -1335,16 +1323,6 @@ impl ModelRuntime {
             prof_end(&PROF_TRANSFORMER_NS, prof_t0);
             if profiling_mode {
                 record_forward_pass();
-            }
-
-            if debug_mode {
-                if let Some(loader) = &self.lazy_debug_loader {
-                    let now = time_in_ms();
-                    if now >= self.next_lazy_debug_ms {
-                        eprintln!("{}", loader.debug_stats_line());
-                        self.next_lazy_debug_ms = now + 2_000;
-                    }
-                }
             }
 
             if debug_mode

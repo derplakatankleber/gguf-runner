@@ -1,15 +1,13 @@
 use crate::engine::types::{
-    GGUFFile, GgmlType, GgufValue, Gguftensor, LazyModelLoader, MappedFile, GGUF_MAGIC,
-    GGUF_TYPE_ARRAY, GGUF_TYPE_BOOL, GGUF_TYPE_FLOAT32, GGUF_TYPE_FLOAT64, GGUF_TYPE_INT16,
-    GGUF_TYPE_INT32, GGUF_TYPE_INT64, GGUF_TYPE_INT8, GGUF_TYPE_STRING, GGUF_TYPE_UINT16,
-    GGUF_TYPE_UINT32, GGUF_TYPE_UINT64, GGUF_TYPE_UINT8, LAZY_BOOTSTRAP_MAX_BYTES,
-    LAZY_BOOTSTRAP_START_BYTES, LAZY_MODEL_LOADER,
+    GGUFFile, GgmlType, GgufValue, Gguftensor, MappedFile, GGUF_MAGIC, GGUF_TYPE_ARRAY,
+    GGUF_TYPE_BOOL, GGUF_TYPE_FLOAT32, GGUF_TYPE_FLOAT64, GGUF_TYPE_INT16, GGUF_TYPE_INT32,
+    GGUF_TYPE_INT64, GGUF_TYPE_INT8, GGUF_TYPE_STRING, GGUF_TYPE_UINT16, GGUF_TYPE_UINT32,
+    GGUF_TYPE_UINT64, GGUF_TYPE_UINT8,
 };
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::Path;
-use std::sync::Arc;
 
 pub(crate) fn read_u16_le(data: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([data[off], data[off + 1]])
@@ -371,94 +369,20 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
         vocab_scores,
         vocab_merges,
         mapped,
-        lazy_loader: None,
     })
 }
 
-pub(crate) fn parse_gguf_file(
-    filename: &str,
-    model_url: Option<&str>,
-    debug_mode: bool,
-) -> Result<GGUFFile, String> {
+pub(crate) fn parse_gguf_file(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
     let model_path = Path::new(filename);
-    let local_exists = model_path.exists();
-
-    if local_exists {
-        match parse_gguf_file_local(filename, debug_mode) {
-            Ok(gguf) => {
-                if debug_mode {
-                    eprintln!("Using local model file: {filename}");
-                }
-                return Ok(gguf);
-            }
-            Err(e) => {
-                if model_url.is_none() {
-                    return Err(e);
-                }
-                eprintln!(
-                    "Warning: local model file parse failed ({}). Falling back to remote lazy load.",
-                    e
-                );
-            }
-        }
-    } else if model_url.is_none() {
-        return Err(format!(
-            "model file not found: {} (provide -url to lazily fetch it)",
-            filename
-        ));
+    if !model_path.exists() {
+        return Err(format!("model file not found: {filename}"));
     }
 
-    let url = model_url.ok_or_else(|| "missing model url".to_string())?;
-    let loader = Arc::new(LazyModelLoader::new(url, filename, debug_mode)?);
-    let _ = LAZY_MODEL_LOADER.set(Arc::clone(&loader));
-
-    let mut bootstrap = LAZY_BOOTSTRAP_START_BYTES.min(loader.file_len.max(1));
-    let max_bootstrap = LAZY_BOOTSTRAP_MAX_BYTES.min(loader.file_len.max(1));
-
-    loop {
-        if debug_mode {
-            eprintln!(
-                "Lazy model bootstrap: ensuring first {} bytes of {}",
-                bootstrap, loader.file_len
-            );
-        }
-        loader.ensure_range(0, bootstrap)?;
-        match parse_gguf_file_local(filename, debug_mode) {
-            Ok(mut gguf) => {
-                gguf.lazy_loader = Some(Arc::clone(&loader));
-                loader.start_background_download();
-                if debug_mode {
-                    eprintln!(
-                        "Lazy model mode enabled: url={}, local_cache={}, bytes_bootstrapped={}",
-                        url, filename, bootstrap
-                    );
-                }
-                return Ok(gguf);
-            }
-            Err(e) => {
-                if bootstrap >= max_bootstrap {
-                    return Err(format!(
-                        "failed to parse GGUF metadata after bootstrapping {} bytes: {}",
-                        bootstrap, e
-                    ));
-                }
-                let next = (bootstrap.saturating_mul(2)).min(max_bootstrap);
-                if next == bootstrap {
-                    return Err(format!(
-                        "failed to parse GGUF metadata at {} bytes: {}",
-                        bootstrap, e
-                    ));
-                }
-                if debug_mode {
-                    eprintln!(
-                        "Lazy model bootstrap parse retry: {} -> {} bytes ({})",
-                        bootstrap, next, e
-                    );
-                }
-                bootstrap = next;
-            }
-        }
+    let gguf = parse_gguf_file_local(filename, debug_mode)?;
+    if debug_mode {
+        eprintln!("Using local model file: {filename}");
     }
+    Ok(gguf)
 }
 
 pub(crate) fn get_gguf_int_from_map(

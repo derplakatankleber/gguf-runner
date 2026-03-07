@@ -30,7 +30,6 @@ Supported tensor data paths include:
 
 - GGUF parsing from local files
 - Linux mmap memory-advice hints for mapped model pages (best-effort)
-- lazy model bootstrap/download flow with `--url`
 - tokenizer initialization from GGUF vocab/metadata
 - model-family-specific chat prompt rendering
 - multimodal request/model capability scaffolding for Qwen3-VL and Qwen3.5:

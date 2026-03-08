@@ -19,56 +19,64 @@ In practice, performance is often as good as your filesystem caching behavior al
 
 If you are new to the project, start with the quick steps below and you should get your first response in a few minutes.
 
-## Fastest Start (No Rust Needed)
+## Getting Started
 
-If you just want to try `gguf-runner`, download a prebuilt binary from
-[GitHub Releases](https://github.com/apimeister/gguf-runner/releases).
+1. Install `gguf-runner` (choose one):
 
-Release assets are packaged per platform (for example `linux-amd64`, `linux-arm64`, `macos-arm64`, `windows-amd64`).
-
-Example (Linux/macOS):
+Option A: prebuilt binary from [GitHub Releases](https://github.com/apimeister/gguf-runner/releases)
 
 ```bash
 tar -xzf gguf-runner-<tag>-linux-amd64.tar.gz
-./gguf-runner --help
 ```
 
-Example (Windows PowerShell):
+Option B: install from source with Cargo
 
-```powershell
-Expand-Archive .\gguf-runner-<tag>-windows-amd64.zip
-.\gguf-runner.exe --help
+```bash
+# default (portable)
+cargo install --git https://github.com/apimeister/gguf-runner
+
+# optimized for this machine (recommended)
+RUSTFLAGS="-C target-cpu=native" cargo install --git https://github.com/apimeister/gguf-runner
 ```
 
-## Getting Started: Qwen3.5 Text
+On AMD Ryzen 7 PRO 8700GE, `target-cpu=native` improved:
+- tok/s: `5.668` -> `6.848` (`+20.8%`)
+- runtime: `215.522s` -> `178.041s` (`-17.4%`)
 
-Download `Qwen3.5-0.8B` from Hugging Face:
+Note: `target-cpu=native` binaries are tuned for the build machine and are less portable across different CPUs.
+
+2. Verify installation and CPU feature detection:
+
+```bash
+gguf-runner --show-features
+```
+
+If you used a release archive and did not move the binary into your `PATH`, run:
+
+```bash
+./gguf-runner --show-features
+```
+
+3. Download `Qwen3.5-0.8B`:
 
 ```bash
 wget https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
 ```
 
-Run a first "hello" prompt:
+4. Run a first text prompt:
 
 ```bash
-./gguf-runner \
+gguf-runner \
   --model ./Qwen3.5-0.8B-Q4_K_M.gguf \
   --prompt "hello"
 ```
 
-## Getting Started: Qwen3.5 Vision (JPEG)
-
-For vision, download both the model and matching `mmproj` sidecar (same directory):
+5. (Optional) Run a vision prompt with Qwen3.5:
 
 ```bash
 wget https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf
 wget https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-Qwen3.5-2B-F16.gguf
-```
-
-Run a JPEG image prompt:
-
-```bash
-./gguf-runner \
+gguf-runner \
   --model ./Qwen3.5-2B-Q4_K_M.gguf \
   --image sample-image.jpg \
   --prompt "Describe that image."
@@ -76,28 +84,6 @@ Run a JPEG image prompt:
 
 More model download examples:
 - `docs/downloading-models.md`
-
-## 5-Minute Quick Start
-
-1. Build once:
-
-```bash
-cargo build --release
-```
-
-2. Run a model:
-
-```bash
-cargo run --release -- \
-  --model ./Meta-Llama-3-8B-Instruct-Q4_K_M.gguf \
-  --prompt "Explain what this project does."
-```
-
-3. Show all CLI options:
-
-```bash
-cargo run -- --help
-```
 
 ## Working Models
 
@@ -127,7 +113,7 @@ Known-good status from `docs/performance.md` (text benchmarks) and local model/m
 ## Basic Command Pattern
 
 ```bash
-cargo run --release -- \
+gguf-runner \
   --model ./your-model.gguf \
   --prompt "Your question"
 ```
@@ -148,7 +134,7 @@ Most common options (and what they do):
 For vision-capable models (for example Qwen3-VL / Qwen3.5 multimodal variants):
 
 ```bash
-cargo run --release -- \
+gguf-runner \
   --model ./Qwen3-VL-2B-Instruct-Q4_K_M.gguf \
   --image ./regression/IMG_0138.jpg \
   --prompt "Describe this image."
@@ -159,7 +145,7 @@ If required multimodal tensors/components are missing, the runner fails fast wit
 ## Agent Mode (Optional)
 
 ```bash
-cargo run --release -- \
+gguf-runner \
   --model ./Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf \
   --prompt "Review this Rust function for bugs." \
   --agent
@@ -168,15 +154,6 @@ cargo run --release -- \
 Useful agent options:
 - `--tool-root <path>`
 - `--max-tool-calls <int>`
-
-## Regression Testing
-
-There is a local regression harness in `regression/`:
-
-```bash
-./regression/run.sh smoke
-./regression/run.sh full
-```
 
 ## Project Scope
 
@@ -197,12 +174,4 @@ There is a local regression harness in `regression/`:
 cargo run --example gguf_dump -- --model ./model.gguf --dump-kv --dump-tensors
 ```
 
-## Contributing
-
-Before opening a PR, run:
-
-```bash
-cargo fmt --all --check
-cargo clippy --all-targets --all-features
-cargo check
-```
+Suggestions and PRs are welcome.

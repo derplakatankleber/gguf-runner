@@ -617,24 +617,6 @@ unsafe fn vec_dot_f16_f16c_prefix(x: *const f32, w: *const u8, n: usize) -> f32 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn vec_dot_bf16_avx2_prefix(x: *const f32, w: *const u8, n: usize) -> f32 {
-    let mut i = 0usize;
-    let mut acc = _mm256_setzero_ps();
-    while i + 8 <= n {
-        let xv = _mm256_loadu_ps(x.add(i));
-        let hv = _mm_loadu_si128(w.add(i * 2) as *const __m128i);
-        let wv_i32 = _mm256_slli_epi32(_mm256_cvtepu16_epi32(hv), 16);
-        let wv = _mm256_castsi256_ps(wv_i32);
-        acc = _mm256_fmadd_ps(xv, wv, acc);
-        i += 8;
-    }
-    let mut tmp = [0.0f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-    tmp.iter().copied().sum::<f32>()
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
 unsafe fn hsum256_ps(v: __m256) -> f32 {
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), v);
@@ -1244,6 +1226,7 @@ fn quantize_f32_block_i8_32(src: &[f32], dst: &mut [i8; QK8_0]) -> f32 {
 
 struct Q8ActivationPrequant {
     scales: Vec<f32>,
+    #[cfg(target_arch = "aarch64")]
     xq_i8: Vec<i8>,
     #[cfg(target_arch = "x86_64")]
     xq_u8: Vec<u8>,
@@ -1252,6 +1235,7 @@ struct Q8ActivationPrequant {
 fn prequantize_activation_q8(x: &[f32], n: usize) -> Q8ActivationPrequant {
     let nb = n / QK8_0;
     let mut scales = vec![0.0f32; nb];
+    #[cfg(target_arch = "aarch64")]
     let mut xq_i8 = vec![0i8; n];
     #[cfg(target_arch = "x86_64")]
     let mut xq_u8 = vec![0u8; n];
@@ -1260,6 +1244,7 @@ fn prequantize_activation_q8(x: &[f32], n: usize) -> Q8ActivationPrequant {
         let base = i * QK8_0;
         let scale = quantize_f32_block_i8_32(&x[base..base + QK8_0], &mut xq_block);
         scales[i] = scale;
+        #[cfg(target_arch = "aarch64")]
         xq_i8[base..base + QK8_0].copy_from_slice(&xq_block);
         #[cfg(target_arch = "x86_64")]
         for j in 0..QK8_0 {
@@ -1268,6 +1253,7 @@ fn prequantize_activation_q8(x: &[f32], n: usize) -> Q8ActivationPrequant {
     }
     Q8ActivationPrequant {
         scales,
+        #[cfg(target_arch = "aarch64")]
         xq_i8,
         #[cfg(target_arch = "x86_64")]
         xq_u8,

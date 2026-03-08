@@ -37,6 +37,7 @@ fn parse_positive_usize(raw: &str) -> Result<usize, String> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn parse_nonnegative_usize(raw: &str) -> Result<usize, String> {
     raw.parse::<usize>()
         .map_err(|e| format!("invalid value '{raw}': {e}"))

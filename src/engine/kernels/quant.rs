@@ -8,12 +8,12 @@ use crate::engine::switches::{
     AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS,
     AARCH64_Q8_0_MR2_STATUS,
 };
-use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
-    use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_avx_vnni, use_x86_f16c, use_x86_qk_mr4,
-    X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS,
+    is_x86_amd, use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_avx_vnni, use_x86_f16c,
+    use_x86_qk_mr4, X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS,
 };
+use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
     ensure_model_range, GgmlType, QuantizedTensor, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
     GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
@@ -2739,19 +2739,38 @@ pub(crate) fn vec_dot_q4_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
-    if use_x86_avx512_vnni_q8() {
-        unsafe {
-            return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+    if is_x86_amd() {
+        // AMD path: prefer stable AVX2/FMA implementation for QK MR4.
+        if use_x86_avx2_fma() {
+            unsafe {
+                return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+            }
         }
-    }
-    if use_x86_avx_vnni() {
-        unsafe {
-            return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+        if use_x86_avx_vnni() {
+            unsafe {
+                return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+            }
         }
-    }
-    if use_x86_avx2_fma() {
-        unsafe {
-            return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        if use_x86_avx512_vnni_q8() {
+            unsafe {
+                return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+            }
+        }
+    } else {
+        if use_x86_avx512_vnni_q8() {
+            unsafe {
+                return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+            }
+        }
+        if use_x86_avx_vnni() {
+            unsafe {
+                return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+            }
+        }
+        if use_x86_avx2_fma() {
+            unsafe {
+                return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+            }
         }
     }
 
@@ -2817,19 +2836,37 @@ pub(crate) fn vec_dot_q5_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
-    if use_x86_avx512_vnni_q8() {
-        unsafe {
-            return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+    if is_x86_amd() {
+        if use_x86_avx2_fma() {
+            unsafe {
+                return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+            }
         }
-    }
-    if use_x86_avx_vnni() {
-        unsafe {
-            return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+        if use_x86_avx_vnni() {
+            unsafe {
+                return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+            }
         }
-    }
-    if use_x86_avx2_fma() {
-        unsafe {
-            return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        if use_x86_avx512_vnni_q8() {
+            unsafe {
+                return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+            }
+        }
+    } else {
+        if use_x86_avx512_vnni_q8() {
+            unsafe {
+                return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+            }
+        }
+        if use_x86_avx_vnni() {
+            unsafe {
+                return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+            }
+        }
+        if use_x86_avx2_fma() {
+            unsafe {
+                return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+            }
         }
     }
 
@@ -2903,19 +2940,37 @@ pub(crate) fn vec_dot_q6_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
-    if use_x86_avx512_vnni_q8() {
-        unsafe {
-            return vec_dot_q6_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+    if is_x86_amd() {
+        if use_x86_avx2_fma() {
+            unsafe {
+                return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+            }
         }
-    }
-    if use_x86_avx_vnni() {
-        unsafe {
-            return vec_dot_q6_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+        if use_x86_avx_vnni() {
+            unsafe {
+                return vec_dot_q6_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+            }
         }
-    }
-    if use_x86_avx2_fma() {
-        unsafe {
-            return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        if use_x86_avx512_vnni_q8() {
+            unsafe {
+                return vec_dot_q6_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+            }
+        }
+    } else {
+        if use_x86_avx512_vnni_q8() {
+            unsafe {
+                return vec_dot_q6_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
+            }
+        }
+        if use_x86_avx_vnni() {
+            unsafe {
+                return vec_dot_q6_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
+            }
+        }
+        if use_x86_avx2_fma() {
+            unsafe {
+                return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+            }
         }
     }
 

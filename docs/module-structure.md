@@ -258,7 +258,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64 + x86 VNNI targets, x86 AVX-VNNI/AVX512-VNNI Q8 paths, and x86 Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, and architecture-specific matmul row prefetch helpers (x86 + aarch64).
+- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64 + x86 VNNI targets, x86 AVX-VNNI/AVX512-VNNI Q8 paths, and x86 Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), and architecture-specific matmul row prefetch helpers (x86 + aarch64).
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
 ### `src/engine/runtime/*`
@@ -293,6 +293,7 @@ src/
   - KV cache selection switch (`kv_cache_mode`: `auto` / `q8` / `q4`)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
     - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
+    - x86 includes a lightweight CPUID vendor probe (`AuthenticAMD`) used to steer selected kernel dispatch choices
   - Layer debug toggles
   - MR4 status atomics
   - `init_runtime_config(&RuntimeSwitchConfig)`.

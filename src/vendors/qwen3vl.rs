@@ -1,0 +1,53 @@
+use super::{
+    qwen_common, VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy,
+    VendorTokenizerPolicy,
+};
+use crate::engine::types::{EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
+
+pub(super) fn decode_policy() -> VendorDecodePolicy {
+    VendorDecodePolicy {
+        parse_think_tags: true,
+        stop_token_literals: qwen_common::QWEN_STOP_TOKEN_LITERALS,
+        deterministic_loop_guard: false,
+        deterministic_loop_guard_min_generated_tokens: 0,
+        recover_early_endoftext_once: false,
+        early_endoftext_recover_max_tokens: 0,
+        hidden_think_token_cap_base: 320,
+    }
+}
+
+pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
+    VendorTokenizerPolicy {
+        disable_bos_fallback: true,
+        end_turn_token_literals: qwen_common::QWEN_END_TURN_TOKEN_LITERALS,
+    }
+}
+
+pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
+    VendorMultimodalPolicy {
+        mmproj_filename_score_hints: qwen_common::QWEN_MMPROJ_SCORE_HINTS,
+        ..VendorMultimodalPolicy::default()
+    }
+}
+
+pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
+    qwen_common::runtime_debug_policy()
+}
+
+pub(super) fn encode_chat_prompt(
+    tokenizer: &mut Tokenizer,
+    prompt: &str,
+    system_prompt: &str,
+    image_count: usize,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    qwen_common::encode_qwen3_chat(tokenizer, prompt, system_prompt, image_count, think_mode)
+}
+
+pub(super) fn encode_generation_request(
+    tokenizer: &mut Tokenizer,
+    request: &GenerationRequest,
+    think_mode: ThinkMode,
+) -> EncodedPrompt {
+    qwen_common::encode_qwen3_request(tokenizer, request, think_mode)
+}

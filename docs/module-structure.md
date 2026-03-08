@@ -50,7 +50,12 @@ src/
     mod.rs
     llama.rs
     gemma.rs
-    qwen.rs
+    qwen2.rs
+    qwen3.rs
+    qwen35.rs
+    qwen3vl.rs
+    qwen3next.rs
+    qwen_common.rs
 ```
 
 ## Module Responsibilities
@@ -314,8 +319,15 @@ src/
     - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
     - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
   - Routes both simple chat prompt encoding and structured `GenerationRequest` encoding to family-specific implementation.
-- `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
-  - Family-specific defaults, validations, prompt rendering, and family-owned policy constructors (including Qwen MoE routing defaults/scaling, Qwen image/video/audio placeholder-span mapping, and Gemma image placeholder-span mapping via `<start_of_image>`/`<end_of_image>`).
+- `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen*.rs`:
+  - Family-specific defaults, validations, prompt rendering, and family-owned policy constructors.
+  - Qwen family is split by variant:
+    - `qwen2.rs`: Qwen2 chat template + baseline decode/tokenizer policies.
+    - `qwen3.rs`: Qwen3-MoE defaults/validation helpers and Qwen3 prompt wrappers.
+    - `qwen35.rs`: Qwen3.5 decode/tokenizer/multimodal policies (detail-crop opt-in and sidecar hints).
+    - `qwen3vl.rs`: Qwen3-VL decode/tokenizer/multimodal policies.
+    - `qwen3next.rs`: Qwen3-Next SSM validation/debug + decode/tokenizer policies.
+    - `qwen_common.rs`: shared Qwen stop-token constants, runtime debug policy, and Qwen3 structured prompt encoder with image/video/audio placeholder-span mapping.
 
 ## Runtime Data Flow
 

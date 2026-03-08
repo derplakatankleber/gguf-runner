@@ -13,6 +13,10 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         parse_think_tags: false,
         stop_token_literals: &[],
         deterministic_loop_guard: false,
+        deterministic_loop_guard_min_generated_tokens: 0,
+        recover_early_endoftext_once: false,
+        early_endoftext_recover_max_tokens: 0,
+        hidden_think_token_cap_base: 256,
     }
 }
 

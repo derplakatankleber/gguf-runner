@@ -49,9 +49,9 @@ gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg -
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-13600k-8g | png_to_jpeg_v1 | 3.109 | 124.928 |
 | 2026-02-15 | Meta-Llama-3-8B-Instruct-Q4_K_M.gguf | lnx-1340p-32g | png_to_jpeg_v1 | 3.292 | 111.207 | |
 | 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 0.409 | 2240.847 | |
-| 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 1.613 | 530.794 | |
 | 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-125h-32g | png_to_jpeg_v1 | 2.228 | 369.767 | |
 | 2026-02-15 | Qwen3-Coder-Next-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 4.932 | 186.182 | |
+| 2026-03-08 | Qwen3-Coder-Next-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 4.981 | 253.543 | |
 | 2026-02-16 | Qwen3-235B-A22B-Instruct-2507-Q4_K_M.gguf | lnx-9700-64g | png_to_jpeg_v1 | 0.652 | 1125.015 | |
 | 2026-03-07 | Qwen3.5-0.8B-Q4_K_M.gguf | lnx-n150-12g | png_to_jpeg_v1 | 4.456 | 110.072 | |
 | 2026-03-07 | Qwen3.5-0.8B-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 22.116 | 22.764 | |

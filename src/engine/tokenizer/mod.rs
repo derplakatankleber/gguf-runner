@@ -1,9 +1,11 @@
-use crate::engine::io::get_gguf_int_from_map;
+use crate::engine::io::{get_gguf_int_from_map, get_gguf_string_from_map};
 use crate::engine::types::{
-    Config, GGUFFile, GgufValue, Tokenizer, VendorTokenizerPolicy, LLAMA3_BOS_TOKEN,
-    LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT, LLAMA3_START_HEADER,
+    Config, GGUFFile, GgufValue, Tokenizer, TokenizerPreType, VendorTokenizerPolicy,
+    LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT, LLAMA3_START_HEADER,
 };
+use fancy_regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 fn tiktoken_decode_map() -> [i16; 512] {
     let mut map = [-1i16; 512];
@@ -257,6 +259,53 @@ fn split_gpt2_pieces(text: &str) -> Vec<String> {
     out
 }
 
+fn split_with_regex(text: &str, re: &Regex) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut covered = 0usize;
+    let mut had_match = false;
+    for m in re.find_iter(text) {
+        let m = match m {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        had_match = true;
+        if m.start() > covered {
+            out.push(text[covered..m.start()].to_string());
+        }
+        out.push(m.as_str().to_string());
+        covered = m.end();
+    }
+    if !had_match {
+        return Some(vec![text.to_string()]);
+    }
+    if covered < text.len() {
+        out.push(text[covered..].to_string());
+    }
+    Some(out)
+}
+
+fn split_qwen2_pieces(text: &str) -> Vec<String> {
+    static QWEN2_RE: OnceLock<Regex> = OnceLock::new();
+    let re = QWEN2_RE.get_or_init(|| {
+        Regex::new(
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        )
+        .expect("valid qwen2 pre-tokenizer regex")
+    });
+    split_with_regex(text, re).unwrap_or_else(|| split_gpt2_pieces(text))
+}
+
+fn split_qwen35_pieces(text: &str) -> Vec<String> {
+    static QWEN35_RE: OnceLock<Regex> = OnceLock::new();
+    let re = QWEN35_RE.get_or_init(|| {
+        Regex::new(
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        )
+        .expect("valid qwen35 pre-tokenizer regex")
+    });
+    split_with_regex(text, re).unwrap_or_else(|| split_gpt2_pieces(text))
+}
+
 impl Tokenizer {
     pub(crate) fn find_special_token(&self, token_str: &str) -> Option<i32> {
         self.vocab
@@ -342,7 +391,11 @@ impl Tokenizer {
         self.build_token_lookup();
         self.build_merge_ranks();
 
-        let pieces = split_gpt2_pieces(text);
+        let pieces = match self.pre_tokenizer {
+            TokenizerPreType::Qwen2 => split_qwen2_pieces(text),
+            TokenizerPreType::Qwen35 => split_qwen35_pieces(text),
+            TokenizerPreType::Gpt2 => split_gpt2_pieces(text),
+        };
         for piece in pieces {
             let encoded_text = text_to_tiktoken(&piece);
             let mut work: Vec<i32> = Vec::with_capacity(encoded_text.len());
@@ -425,6 +478,11 @@ pub(crate) fn init_tokenizer_from_gguf(
     }
 
     let mut tokenizer = Tokenizer::default();
+    tokenizer.pre_tokenizer = match get_gguf_string_from_map(&gguf.kv, "tokenizer.ggml.pre") {
+        Some("qwen2") | Some("megrez") => TokenizerPreType::Qwen2,
+        Some("qwen35") => TokenizerPreType::Qwen35,
+        _ => TokenizerPreType::Gpt2,
+    };
     tokenizer.bos_token = match gguf.kv.get("tokenizer.ggml.bos_token_id") {
         Some(GgufValue::UInt(v)) => *v as i32,
         Some(GgufValue::Int(v)) => *v as i32,
@@ -488,8 +546,8 @@ pub(crate) fn init_tokenizer_from_gguf(
 
     if debug_mode {
         eprintln!(
-            "Using vocabulary from GGUF file ({} tokens)",
-            tokenizer.vocab_size
+            "Using vocabulary from GGUF file ({} tokens), pre-tokenizer={:?}",
+            tokenizer.vocab_size, tokenizer.pre_tokenizer
         );
     }
 

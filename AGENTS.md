@@ -26,6 +26,12 @@ Dependency direction to keep:
 - Put inference/runtime kernels/state/loading in `src/engine/`.
 - Put family-specific config/prompt logic only in `src/vendors/`.
 
+## Vendor Boundary Rules
+
+- Do not add model-family branches in generic runtime flow (`src/app/*`, `src/engine/*`) such as checks on `config.is_*` or hardcoded vendor token literals.
+- Route vendor-specific runtime behavior through vendor policies (for example decode/tokenizer/multimodal policy structs in `src/vendors/mod.rs`) and consume those policies generically.
+- If a new family needs special decode behavior, add it as a policy field and set it in the relevant `src/vendors/*` module instead of branching in app/engine code.
+
 ## Import and Coupling Rules
 
 - Do not use `use crate::*`.

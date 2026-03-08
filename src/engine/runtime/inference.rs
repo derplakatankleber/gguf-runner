@@ -16,8 +16,6 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
 
-type MoeRoutedScratch = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
-
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -1821,6 +1819,8 @@ fn transformer_inner(
             let expert_hidden = p.expert_hidden_dim;
             let disable_routed = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_ROUTED_EXPERTS");
             let disable_shared = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_SHARED_EXPERT");
+            let force_serial_routed =
+                p.is_qwen3next && env_flag("GGUF_QWEN3NEXT_SERIAL_ROUTED_EXPERTS");
             s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
             matmul_quantized(
                 &mut s.moe_logits[..p.n_experts],
@@ -1853,26 +1853,20 @@ fn transformer_inner(
                     }
                 }
 
-                if routed_selected.len() >= 2 {
+                if routed_selected.len() >= 2 && !force_serial_routed {
                     let xb2 = &s.xb2[..dim];
                     let gate_exps = &w.moe_gate_exps[l];
                     let up_exps = &w.moe_up_exps[l];
                     let down_exps = &w.moe_down_exps[l];
 
-                    let (_, _, _, routed_acc) = routed_selected
+                    let per_expert = routed_selected
                         .par_iter()
-                        .try_fold(
-                            || {
-                                (
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; dim],
-                                    vec![0.0f32; dim],
-                                )
-                            },
-                            |(mut hb_local, mut hb2_local, mut moe_tmp_local, mut acc_local),
-                             &(expert_idx, route_weight)|
-                             -> Result<MoeRoutedScratch, String> {
+                        .enumerate()
+                        .map(
+                            |(order_idx, &(expert_idx, route_weight))| -> Result<(usize, Vec<f32>), String> {
+                                let mut hb_local = vec![0.0f32; expert_hidden];
+                                let mut hb2_local = vec![0.0f32; expert_hidden];
+                                let mut moe_tmp_local = vec![0.0f32; dim];
                                 let row_start_ffn = expert_idx * expert_hidden;
                                 matmul_quantized_rows(
                                     &mut hb_local[..expert_hidden],
@@ -1904,33 +1898,28 @@ fn transformer_inner(
                                     dim,
                                     mapped,
                                 )?;
-                                crate::engine::kernels::axpy_inplace(
-                                    &mut acc_local[..dim],
-                                    route_weight,
-                                    &moe_tmp_local[..dim],
-                                );
-                                Ok((hb_local, hb2_local, moe_tmp_local, acc_local))
+                                for v in &mut moe_tmp_local[..dim] {
+                                    *v *= route_weight;
+                                }
+                                Ok((order_idx, moe_tmp_local))
                             },
                         )
-                        .try_reduce(
-                            || {
-                                (
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; dim],
-                                    vec![0.0f32; dim],
-                                )
-                            },
-                            |(hb_a, hb2_a, tmp_a, mut acc_a), (_, _, _, acc_b)| {
-                                crate::engine::kernels::axpy_inplace(
-                                    &mut acc_a[..dim],
-                                    1.0,
-                                    &acc_b[..dim],
-                                );
-                                Ok((hb_a, hb2_a, tmp_a, acc_a))
-                            },
-                        )?;
-                    s.xb[..dim].copy_from_slice(&routed_acc[..dim]);
+                        .collect::<Vec<_>>();
+
+                    let mut contributions = Vec::with_capacity(per_expert.len());
+                    for item in per_expert {
+                        contributions.push(item?);
+                    }
+                    contributions.sort_by_key(|(order_idx, _)| *order_idx);
+
+                    s.xb[..dim].fill(0.0);
+                    for (_, contrib) in contributions {
+                        crate::engine::kernels::axpy_inplace(
+                            &mut s.xb[..dim],
+                            1.0,
+                            &contrib[..dim],
+                        );
+                    }
                 } else {
                     for &(expert_idx, route_weight) in &routed_selected {
                         let row_start_ffn = expert_idx * expert_hidden;

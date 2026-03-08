@@ -378,6 +378,8 @@ pub(crate) struct Config {
     pub(crate) is_qwen3vl: bool,
     pub(crate) is_qwen3moe: bool,
     pub(crate) is_qwen3next: bool,
+    pub(crate) qwen_chat_template_contains_think: bool,
+    pub(crate) qwen_chat_template_has_builtin_system: bool,
     pub(crate) capabilities: ModelCapabilities,
     pub(crate) final_logit_softcapping: f32,
     pub(crate) rms_norm_eps: f32,
@@ -506,10 +508,19 @@ pub(crate) struct Tokenizer {
     pub(crate) start_header_token: i32,
     pub(crate) end_header_token: i32,
     pub(crate) eot_token: i32,
+    pub(crate) pre_tokenizer: TokenizerPreType,
     pub(crate) use_sentencepiece: bool,
     pub(crate) token_to_id: HashMap<String, i32>,
     pub(crate) merges: Vec<String>,
     pub(crate) merge_ranks: HashMap<String, usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TokenizerPreType {
+    #[default]
+    Gpt2,
+    Qwen2,
+    Qwen35,
 }
 
 pub(crate) struct XorShiftRng {

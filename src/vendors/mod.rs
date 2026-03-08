@@ -1,6 +1,11 @@
 mod gemma;
 mod llama;
-mod qwen;
+mod qwen2;
+mod qwen3;
+mod qwen35;
+mod qwen3next;
+mod qwen3vl;
+mod qwen_common;
 
 use crate::engine::io::{
     get_gguf_float_from_map, get_gguf_i64_array_from_map, get_gguf_int_from_map,
@@ -16,6 +21,10 @@ pub(crate) struct VendorDecodePolicy {
     pub(crate) parse_think_tags: bool,
     pub(crate) stop_token_literals: &'static [&'static str],
     pub(crate) deterministic_loop_guard: bool,
+    pub(crate) deterministic_loop_guard_min_generated_tokens: usize,
+    pub(crate) recover_early_endoftext_once: bool,
+    pub(crate) early_endoftext_recover_max_tokens: usize,
+    pub(crate) hidden_think_token_cap_base: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -394,6 +403,10 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let key_ssm_time_step_rank = format!("{key_prefix}.ssm.time_step_rank");
     let key_ssm_group_count = format!("{key_prefix}.ssm.group_count");
 
+    let chat_template = get_gguf_string_from_map(&gguf.kv, "tokenizer.chat_template")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
     let mut config = Config {
         dim: get_gguf_int_from_map(&gguf.kv, &key_dim, 4096) as usize,
         input_embedding_dim: 0,
@@ -424,6 +437,8 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe || is_qwen3vlmoe_arch,
         is_qwen3next: identity.family == ModelFamily::Qwen3Next
             || identity.family == ModelFamily::Qwen35,
+        qwen_chat_template_contains_think: chat_template.contains("<think>"),
+        qwen_chat_template_has_builtin_system: chat_template.contains("you are qwen"),
         capabilities,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
@@ -446,13 +461,13 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         .ok_or_else(|| "input embedding dimension overflow".to_string())?;
 
     if config.is_qwen3moe || (config.is_qwen3next && config.n_experts > 0) {
-        qwen::finalize_moe_config(&mut config)?;
+        qwen3::finalize_moe_config(&mut config)?;
         if config.is_qwen3moe {
-            qwen::apply_qwen3moe_defaults(&mut config);
+            qwen3::apply_qwen3moe_defaults(&mut config);
         }
     }
     if config.is_qwen3next {
-        qwen::validate_qwen3next(&mut config)?;
+        qwen3next::validate_qwen3next(&mut config)?;
         if config.n_experts == 0 {
             config.moe_norm_topk_prob = false;
             config.moe_routed_scaling_factor = 1.0;
@@ -525,9 +540,14 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         if config.is_gemma3 {
             gemma::print_config_debug(&config);
         } else if config.is_qwen3moe {
-            qwen::print_qwen3moe_debug(&config);
+            qwen3::print_qwen3moe_debug(&config);
         } else if config.is_qwen3next {
-            qwen::print_qwen3next_debug(&config);
+            qwen3next::print_qwen3next_debug(&config);
+            eprintln!(
+                "Qwen template hints: contains_think={}, has_builtin_system={}",
+                config.qwen_chat_template_contains_think,
+                config.qwen_chat_template_has_builtin_system
+            );
         }
     }
 
@@ -544,10 +564,23 @@ pub(crate) fn encode_chat_prompt(
 ) -> Vec<i32> {
     if config.is_gemma3 {
         gemma::encode_chat_prompt(tokenizer, prompt, system_prompt)
-    } else if config.is_qwen3moe || config.is_qwen3next || config.is_qwen3vl || config.is_qwen35 {
-        qwen::encode_qwen3_chat(tokenizer, prompt, system_prompt, image_count, think_mode)
+    } else if config.is_qwen35 {
+        qwen35::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
+    } else if config.is_qwen3vl {
+        qwen3vl::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
+    } else if config.is_qwen3next {
+        qwen3next::encode_chat_prompt(
+            tokenizer,
+            config,
+            prompt,
+            system_prompt,
+            image_count,
+            think_mode,
+        )
+    } else if config.is_qwen3moe {
+        qwen3::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
     } else if config.is_qwen2 {
-        qwen::encode_qwen2_chat(tokenizer, prompt, system_prompt)
+        qwen2::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, prompt, system_prompt)
     }
@@ -572,13 +605,22 @@ pub(crate) fn encode_generation_request(
     if config.is_gemma3 {
         return gemma::encode_generation_request(tokenizer, request);
     }
-    if config.is_qwen3moe || config.is_qwen3next || config.is_qwen3vl || config.is_qwen35 {
-        return qwen::encode_qwen3_request(tokenizer, request, think_mode);
+    if config.is_qwen35 {
+        return qwen35::encode_generation_request(tokenizer, request, think_mode);
+    }
+    if config.is_qwen3vl {
+        return qwen3vl::encode_generation_request(tokenizer, request, think_mode);
+    }
+    if config.is_qwen3next {
+        return qwen3next::encode_generation_request(tokenizer, config, request, think_mode);
+    }
+    if config.is_qwen3moe {
+        return qwen3::encode_generation_request(tokenizer, request, think_mode);
     }
 
     let prompt = join_request_text(&request.parts);
     let token_ids = if config.is_qwen2 {
-        qwen::encode_qwen2_chat(tokenizer, &prompt, &request.system_prompt)
+        qwen2::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
     };
@@ -586,13 +628,16 @@ pub(crate) fn encode_generation_request(
 }
 
 pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
-    if config.is_qwen2
-        || config.is_qwen3moe
-        || config.is_qwen3next
-        || config.is_qwen3vl
-        || config.is_qwen35
-    {
-        qwen::decode_policy(config)
+    if config.is_qwen35 {
+        qwen35::decode_policy()
+    } else if config.is_qwen3vl {
+        qwen3vl::decode_policy()
+    } else if config.is_qwen3next {
+        qwen3next::decode_policy(config)
+    } else if config.is_qwen3moe {
+        qwen3::decode_policy()
+    } else if config.is_qwen2 {
+        qwen2::decode_policy()
     } else if config.is_gemma3 {
         gemma::decode_policy()
     } else {
@@ -601,13 +646,16 @@ pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
 }
 
 pub(crate) fn tokenizer_policy(config: &Config) -> VendorTokenizerPolicy {
-    if config.is_qwen2
-        || config.is_qwen3vl
-        || config.is_qwen3moe
-        || config.is_qwen3next
-        || config.is_qwen35
-    {
-        qwen::tokenizer_policy()
+    if config.is_qwen35 {
+        qwen35::tokenizer_policy()
+    } else if config.is_qwen3vl {
+        qwen3vl::tokenizer_policy()
+    } else if config.is_qwen3next {
+        qwen3next::tokenizer_policy()
+    } else if config.is_qwen3moe {
+        qwen3::tokenizer_policy()
+    } else if config.is_qwen2 {
+        qwen2::tokenizer_policy()
     } else if config.is_gemma3 {
         gemma::tokenizer_policy()
     } else {
@@ -616,13 +664,16 @@ pub(crate) fn tokenizer_policy(config: &Config) -> VendorTokenizerPolicy {
 }
 
 pub(crate) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
-    if config.is_qwen2
-        || config.is_qwen3moe
-        || config.is_qwen3next
-        || config.is_qwen3vl
-        || config.is_qwen35
-    {
-        qwen::multimodal_policy(config)
+    if config.is_qwen35 {
+        qwen35::multimodal_policy()
+    } else if config.is_qwen3vl {
+        qwen3vl::multimodal_policy()
+    } else if config.is_qwen3next {
+        qwen3next::multimodal_policy()
+    } else if config.is_qwen3moe {
+        qwen3::multimodal_policy()
+    } else if config.is_qwen2 {
+        qwen2::multimodal_policy()
     } else if config.is_gemma3 {
         gemma::multimodal_policy()
     } else {
@@ -631,8 +682,14 @@ pub(crate) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
 }
 
 pub(crate) fn runtime_debug_policy(config: &Config) -> VendorRuntimeDebugPolicy {
-    if config.is_qwen3vl || config.is_qwen3moe || config.is_qwen3next {
-        qwen::runtime_debug_policy()
+    if config.is_qwen35 {
+        qwen35::runtime_debug_policy()
+    } else if config.is_qwen3vl {
+        qwen3vl::runtime_debug_policy()
+    } else if config.is_qwen3next {
+        qwen3next::runtime_debug_policy()
+    } else if config.is_qwen3moe {
+        qwen_common::runtime_debug_policy()
     } else if config.is_gemma3 {
         gemma::runtime_debug_policy()
     } else {

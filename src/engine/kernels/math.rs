@@ -692,10 +692,11 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
     let k_off = n_k_heads * head_dim;
     let v_off = 2 * n_k_heads * head_dim;
     let inv_scale_q = 1.0 / (head_dim as f32).sqrt();
+    let heads_per_group = n_v_heads / n_k_heads;
     for h in 0..n_v_heads {
-        // Match ggml_repeat_4d semantics used by llama.cpp (tile full head blocks):
-        // destination head h maps to source head (h % n_k_heads).
-        let src_h = h % n_k_heads;
+        // Match ggml_repeat_4d + reshape_4d in llama.cpp:
+        // key heads are repeated in contiguous groups, e.g. [h0,h0,h1,h1,...].
+        let src_h = h / heads_per_group;
         let q_src = &s.ssm_conv[q_off + src_h * head_dim..q_off + (src_h + 1) * head_dim];
         let k_src = &s.ssm_conv[k_off + src_h * head_dim..k_off + (src_h + 1) * head_dim];
         let v_src = &s.ssm_conv[v_off + h * head_dim..v_off + (h + 1) * head_dim];
@@ -719,7 +720,6 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
         }
     }
 
-    let heads_per_group = n_v_heads / n_k_heads;
     let dt_base = l * n_v_heads;
     let a_base = l * n_v_heads;
     for h in 0..n_v_heads {

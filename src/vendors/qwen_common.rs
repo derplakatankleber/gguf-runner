@@ -1,13 +1,13 @@
-use super::{
-    MmprojFilenameScoreHint, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
-    VendorRuntimeDebugPolicy,
-};
+use super::{MmprojFilenameScoreHint, VendorRuntimeDebugPolicy};
 use crate::engine::types::{
-    Config, ContentPart, EncodedPrompt, GenerationRequest, MediaRef, MultimodalBackend,
-    PlaceholderSpan, ThinkMode, Tokenizer, VendorTokenizerPolicy,
+    ContentPart, EncodedPrompt, GenerationRequest, MediaRef, MultimodalBackend, PlaceholderSpan,
+    ThinkMode, Tokenizer,
 };
 
-const QWEN_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
+pub(crate) const QWEN_STOP_TOKEN_LITERALS: &[&str] =
+    &["<|im_end|>", "<|endoftext|>", "<|im_start|>"];
+pub(crate) const QWEN_END_TURN_TOKEN_LITERALS: &[&str] = &["<|im_end|>", "<|endoftext|>"];
+pub(crate) const QWEN_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
     MmprojFilenameScoreHint {
         token: "qwen3vl",
         backend: MultimodalBackend::Qwen3Vl,
@@ -22,218 +22,19 @@ const QWEN_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
     },
 ];
 
-fn qwen35_detail_crop_enabled() -> bool {
-    matches!(
-        std::env::var("GGUF_QWEN35_DETAIL_CROP"),
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-    )
-}
-
-pub(super) fn finalize_moe_config(config: &mut Config) -> Result<(), String> {
-    if config.expert_hidden_dim == 0 || config.n_experts == 0 {
-        return Err(
-            "qwen model is missing expert metadata (expert_count/expert_feed_forward_length)"
-                .to_string(),
-        );
-    }
-
-    if config.n_experts_used == 0 {
-        config.n_experts_used = 1;
-    }
-    if config.n_experts_used > config.n_experts {
-        config.n_experts_used = config.n_experts;
-    }
-
-    Ok(())
-}
-
-pub(super) fn apply_qwen3moe_defaults(config: &mut Config) {
-    // Qwen3 MoE routing defaults from official config.json.
-    config.moe_n_group = 8;
-    config.moe_topk_group = 4;
-    config.moe_norm_topk_prob = true;
-    config.moe_routed_scaling_factor = 1.0;
-}
-
-pub(super) fn validate_qwen3next(config: &mut Config) -> Result<(), String> {
-    // Qwen3Next uses normalized top-k expert weights with softmax gating.
-    config.moe_norm_topk_prob = true;
-    config.moe_routed_scaling_factor = 1.0;
-
-    if config.ssm_conv_kernel == 0
-        || config.ssm_inner_size == 0
-        || config.ssm_state_size == 0
-        || config.ssm_time_step_rank == 0
-        || config.ssm_group_count == 0
-    {
-        return Err(
-            "qwen3next model is missing SSM metadata (ssm.conv_kernel/inner_size/state_size/time_step_rank/group_count)"
-                .to_string(),
-        );
-    }
-
-    if !config
-        .ssm_inner_size
-        .is_multiple_of(config.ssm_time_step_rank)
-    {
-        return Err(format!(
-            "qwen3next invalid SSM metadata: inner_size {} not divisible by time_step_rank {}",
-            config.ssm_inner_size, config.ssm_time_step_rank
-        ));
-    }
-    if !config
-        .ssm_time_step_rank
-        .is_multiple_of(config.ssm_group_count)
-    {
-        return Err(format!(
-            "qwen3next invalid SSM metadata: time_step_rank {} not divisible by group_count {}",
-            config.ssm_time_step_rank, config.ssm_group_count
-        ));
-    }
-
-    let head_v_dim = config.ssm_inner_size / config.ssm_time_step_rank;
-    if head_v_dim != config.ssm_state_size {
-        return Err(format!(
-            "qwen3next unsupported SSM shape: state_size {} != inner_size/time_step_rank {}",
-            config.ssm_state_size, head_v_dim
-        ));
-    }
-
-    Ok(())
-}
-
-pub(super) fn print_qwen3moe_debug(config: &Config) {
-    eprintln!(
-        "Qwen3MoE: experts={}, experts_used={}, n_group={}, topk_group={}, norm_topk_prob={}, routed_scaling_factor={}, rms_norm_eps={}",
-        config.n_experts,
-        config.n_experts_used,
-        config.moe_n_group,
-        config.moe_topk_group,
-        config.moe_norm_topk_prob,
-        config.moe_routed_scaling_factor,
-        config.rms_norm_eps
-    );
-}
-
-pub(super) fn print_qwen3next_debug(config: &Config) {
-    eprintln!(
-        "Qwen3Next: experts={}, experts_used={}, expert_hidden_dim={}, shared_expert_hidden_dim={}, ssm_inner={}, ssm_state={}, ssm_heads={}, ssm_groups={}, ssm_conv_kernel={}, rms_norm_eps={}",
-        config.n_experts,
-        config.n_experts_used,
-        config.expert_hidden_dim,
-        config.shared_expert_hidden_dim,
-        config.ssm_inner_size,
-        config.ssm_state_size,
-        config.ssm_time_step_rank,
-        config.ssm_group_count,
-        config.ssm_conv_kernel,
-        config.rms_norm_eps
-    );
-}
-
-pub(super) fn decode_policy(config: &Config) -> VendorDecodePolicy {
-    VendorDecodePolicy {
-        parse_think_tags: config.is_qwen3next || config.is_qwen3vl || config.is_qwen35,
-        stop_token_literals: &["<|im_end|>"],
-        // Qwen3.5 family can enter deterministic repetition loops on temperature=0.
-        deterministic_loop_guard: config.is_qwen35,
-    }
-}
-
-pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
-    VendorTokenizerPolicy {
-        disable_bos_fallback: true,
-        end_turn_token_literals: &["<|im_end|>"],
-    }
-}
-
-pub(super) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
-    match config.capabilities.multimodal_backend {
-        MultimodalBackend::Qwen35 => VendorMultimodalPolicy {
-            image_prompt_suffix: "\nPlease avoid guessing uncertain details. If text is unclear, explicitly say it is unreadable.",
-            detail_crop: VendorDetailCropPolicy {
-                enabled: qwen35_detail_crop_enabled(),
-                max_layers: 24,
-                note_text: "\n(Second image: centered close-up crop of the same source.)\n",
-                temp_file_prefix: "gguf-runner-qwen35-detail",
-            },
-            mmproj_filename_score_hints: QWEN_MMPROJ_SCORE_HINTS,
-            missing_sidecar_hint: " hint: Qwen3.5 image/video inputs require a compatible Qwen3.5 mmproj sidecar from the same checkpoint family.",
-        },
-        MultimodalBackend::Qwen3Vl => VendorMultimodalPolicy {
-            mmproj_filename_score_hints: QWEN_MMPROJ_SCORE_HINTS,
-            ..VendorMultimodalPolicy::default()
-        },
-        MultimodalBackend::Gemma3 => VendorMultimodalPolicy::default(),
-        MultimodalBackend::None => VendorMultimodalPolicy::default(),
-    }
-}
-
 pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
     VendorRuntimeDebugPolicy {
         native_context_label: Some("qwen3"),
     }
 }
 
-pub(super) fn encode_qwen2_chat(
-    tokenizer: &mut Tokenizer,
-    prompt: &str,
-    system_prompt: &str,
-) -> Vec<i32> {
-    let mut tokens: Vec<i32> = Vec::with_capacity(8192);
-    let mut temp: Vec<i32> = Vec::with_capacity(8192);
-    let sys = if system_prompt.is_empty() {
-        "You are a helpful assistant."
-    } else {
-        system_prompt
-    };
-
-    let im_start = tokenizer.find_special_token("<|im_start|>");
-    let im_end = tokenizer.find_special_token("<|im_end|>");
-
-    if tokenizer.bos_token >= 0 {
-        tokens.push(tokenizer.bos_token);
-    }
-
-    if let (Some(start), Some(end)) = (im_start, im_end) {
-        tokens.push(start);
-        tokenizer.bpe_encode("system\n", &mut temp);
-        tokens.extend_from_slice(&temp);
-        tokenizer.bpe_encode(sys, &mut temp);
-        tokens.extend_from_slice(&temp);
-        tokens.push(end);
-        tokenizer.bpe_encode("\n", &mut temp);
-        tokens.extend_from_slice(&temp);
-
-        tokens.push(start);
-        tokenizer.bpe_encode("user\n", &mut temp);
-        tokens.extend_from_slice(&temp);
-        tokenizer.bpe_encode(prompt, &mut temp);
-        tokens.extend_from_slice(&temp);
-        tokens.push(end);
-        tokenizer.bpe_encode("\n", &mut temp);
-        tokens.extend_from_slice(&temp);
-
-        tokens.push(start);
-        tokenizer.bpe_encode("assistant\n", &mut temp);
-        tokens.extend_from_slice(&temp);
-        return tokens;
-    }
-
-    // Fallback: encode ChatML markers as plain text if special tokens are not mapped.
-    let rendered = format!(
-        "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-    );
-    tokenizer.bpe_encode(&rendered, &mut tokens);
-    tokens
-}
-
-pub(super) fn encode_qwen3_chat(
+fn encode_qwen3_chat_with_think_style(
     tokenizer: &mut Tokenizer,
     prompt: &str,
     system_prompt: &str,
     image_count: usize,
     think_mode: ThinkMode,
+    inject_forced_think_prompt: bool,
 ) -> Vec<i32> {
     let mut parts = Vec::with_capacity(1 + image_count);
     parts.push(ContentPart::Text(prompt.to_string()));
@@ -246,7 +47,47 @@ pub(super) fn encode_qwen3_chat(
         system_prompt: system_prompt.to_string(),
         parts,
     };
-    encode_qwen3_request(tokenizer, &request, think_mode).token_ids
+    encode_qwen3_request_with_think_style(
+        tokenizer,
+        &request,
+        think_mode,
+        inject_forced_think_prompt,
+    )
+    .token_ids
+}
+
+pub(super) fn encode_qwen3_chat(
+    tokenizer: &mut Tokenizer,
+    prompt: &str,
+    system_prompt: &str,
+    image_count: usize,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    encode_qwen3_chat_with_think_style(
+        tokenizer,
+        prompt,
+        system_prompt,
+        image_count,
+        think_mode,
+        true,
+    )
+}
+
+pub(super) fn encode_qwen3_chat_no_forced_think(
+    tokenizer: &mut Tokenizer,
+    prompt: &str,
+    system_prompt: &str,
+    image_count: usize,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    encode_qwen3_chat_with_think_style(
+        tokenizer,
+        prompt,
+        system_prompt,
+        image_count,
+        think_mode,
+        false,
+    )
 }
 
 fn append_encoded_literal(
@@ -305,10 +146,11 @@ fn append_audio_placeholder(
     append_encoded_literal(tokenizer, temp, tokens, "<|audio_pad|>")
 }
 
-pub(super) fn encode_qwen3_request(
+fn encode_qwen3_request_with_think_style(
     tokenizer: &mut Tokenizer,
     request: &GenerationRequest,
     think_mode: ThinkMode,
+    inject_forced_think_prompt: bool,
 ) -> EncodedPrompt {
     let mut tokens: Vec<i32> = Vec::with_capacity(8192);
     let mut temp: Vec<i32> = Vec::with_capacity(8192);
@@ -412,13 +254,15 @@ pub(super) fn encode_qwen3_request(
         tokens.push(start);
         tokenizer.bpe_encode("assistant\n", &mut temp);
         tokens.extend_from_slice(&temp);
-        let think_prefix = if think_mode == ThinkMode::No {
-            "<think>\n\n</think>\n\n"
-        } else {
-            "<think>\n"
-        };
-        tokenizer.bpe_encode(think_prefix, &mut temp);
-        tokens.extend_from_slice(&temp);
+        if inject_forced_think_prompt {
+            let think_prefix = if think_mode == ThinkMode::No {
+                "<think>\n\n</think>\n\n"
+            } else {
+                "<think>\n"
+            };
+            tokenizer.bpe_encode(think_prefix, &mut temp);
+            tokens.extend_from_slice(&temp);
+        }
 
         return EncodedPrompt {
             token_ids: tokens,
@@ -497,10 +341,9 @@ pub(super) fn encode_qwen3_request(
             }
         }
     }
-    // Choose the assistant turn opening based on think mode:
-    // - Yes/Hidden: open <think> block (model will generate thinking then </think> then answer)
-    // - No: immediately close <think></think> so the model skips thinking
-    let assistant_suffix = if think_mode == ThinkMode::No {
+    let assistant_suffix = if !inject_forced_think_prompt {
+        "<|im_end|>\n<|im_start|>assistant\n"
+    } else if think_mode == ThinkMode::No {
         "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     } else {
         "<|im_end|>\n<|im_start|>assistant\n<think>\n"
@@ -514,6 +357,22 @@ pub(super) fn encode_qwen3_request(
         video_spans,
         audio_spans,
     }
+}
+
+pub(super) fn encode_qwen3_request(
+    tokenizer: &mut Tokenizer,
+    request: &GenerationRequest,
+    think_mode: ThinkMode,
+) -> EncodedPrompt {
+    encode_qwen3_request_with_think_style(tokenizer, request, think_mode, true)
+}
+
+pub(super) fn encode_qwen3_request_no_forced_think(
+    tokenizer: &mut Tokenizer,
+    request: &GenerationRequest,
+    think_mode: ThinkMode,
+) -> EncodedPrompt {
+    encode_qwen3_request_with_think_style(tokenizer, request, think_mode, false)
 }
 
 #[cfg(test)]

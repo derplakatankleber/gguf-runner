@@ -32,7 +32,7 @@ fn time_in_ms() -> i64 {
 fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
     // Detect degenerate decode loops by checking whether the current token suffix
     // reappears several times in a recent lookback window (alignment-agnostic).
-    const WINDOWS: &[usize] = &[8, 12, 16, 24, 32, 48, 64, 96, 128];
+    const WINDOWS: &[usize] = &[16, 24, 32, 48, 64, 96, 128];
     for &window in WINDOWS {
         let need = window * 3;
         if tokens.len() < need {
@@ -43,13 +43,18 @@ fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
         let search_start = n.saturating_sub(window * 6);
         let search_end = n - window;
         let mut hits = 0usize;
-        for start in search_start..=search_end {
+        let mut start = search_start;
+        while start <= search_end {
             if &tokens[start..start + window] == suffix {
                 hits += 1;
-                if hits >= 2 {
+                if hits >= 3 {
                     return Some(window);
                 }
+                // Ignore overlapping matches to avoid false positives on local repetition.
+                start = start.saturating_add(window);
+                continue;
             }
+            start += 1;
         }
     }
     None
@@ -57,6 +62,7 @@ fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
 
 fn repeated_long_line(output: &str) -> Option<(String, usize)> {
     let mut counts: HashMap<String, usize> = HashMap::new();
+    const MIN_REPEAT_COUNT: usize = 3;
     for line in output.lines().rev().take(96) {
         let normalized = line.trim();
         if normalized.len() < 24 {
@@ -67,7 +73,7 @@ fn repeated_long_line(output: &str) -> Option<(String, usize)> {
         }
         let entry = counts.entry(normalized.to_string()).or_insert(0);
         *entry += 1;
-        if *entry >= 2 {
+        if *entry >= MIN_REPEAT_COUNT {
             return Some((normalized.to_string(), *entry));
         }
     }
@@ -1631,6 +1637,7 @@ impl ModelRuntime {
         let mut hidden_visible_tail = String::new();
         let mut hidden_think_token_count = 0usize;
         let mut terminal_recovery_used = false;
+        let mut early_terminal_recovery_used = false;
 
         // Think mode state: track whether we're currently inside a <think>...</think> block.
         // The prompt already ends with "<think>\n" for Yes/Hidden modes, so generation starts
@@ -1652,6 +1659,10 @@ impl ModelRuntime {
                     .map(|id| (id, *literal))
             })
             .collect::<Vec<_>>();
+        let stop_token_ids = stop_tokens
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
 
         let total_limit = prompt_tokens
             .len()
@@ -1659,13 +1670,7 @@ impl ModelRuntime {
             .min(self.config.seq_len);
         let think_caps = if decode_policy.parse_think_tags {
             let new_budget = total_limit.saturating_sub(prompt_tokens.len());
-            let vendor_base = if self.config.is_qwen35 || self.config.is_qwen3next {
-                384usize
-            } else if self.config.is_qwen3vl {
-                320usize
-            } else {
-                256usize
-            };
+            let vendor_base = decode_policy.hidden_think_token_cap_base.max(256usize);
             let layer_mult = if self.config.n_layers >= 64 {
                 3usize
             } else if self.config.n_layers >= 32 {
@@ -1838,9 +1843,102 @@ impl ModelRuntime {
                 }
             }
 
+            let is_vendor_stop_token = stop_token_ids.contains(&next);
+            let is_endoftext_stop = next == self.tokenizer.eos_token
+                || stop_tokens
+                    .iter()
+                    .any(|(id, literal)| *id == next && *literal == "<|endoftext|>");
+            let should_recover_early_terminal = decode_policy.recover_early_endoftext_once
+                && !early_terminal_recovery_used
+                && pos >= prompt_tokens.len().saturating_sub(1)
+                && generated_tokens.len() < decode_policy.early_endoftext_recover_max_tokens
+                && is_endoftext_stop;
+            if should_recover_early_terminal {
+                if debug_mode {
+                    let mut ranked: Vec<(usize, f32)> = state.logits[..self.config.vocab_size]
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .collect();
+                    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                    eprintln!(
+                        "\nNote: early terminal token id={} at generated_tokens={}; top alternatives:",
+                        next,
+                        generated_tokens.len()
+                    );
+                    let mut shown = 0usize;
+                    for (idx, logit) in ranked {
+                        let candidate = idx as i32;
+                        if candidate == self.tokenizer.eos_token
+                            || candidate == self.tokenizer.eot_token
+                            || stop_token_ids.contains(&candidate)
+                        {
+                            continue;
+                        }
+                        let decoded = self
+                            .tokenizer
+                            .decode_token(candidate)
+                            .unwrap_or_else(|| "?".to_string())
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r");
+                        eprintln!(
+                            "  cand id={} logit={:.3} tok=\"{}\"",
+                            candidate, logit, decoded
+                        );
+                        shown += 1;
+                        if shown >= 8 {
+                            break;
+                        }
+                    }
+                }
+                let mut alt_token: Option<i32> = None;
+                let mut alt_logit = f32::NEG_INFINITY;
+                let mut fallback_token: Option<i32> = None;
+                let mut fallback_logit = f32::NEG_INFINITY;
+                for (idx, &logit) in state.logits[..self.config.vocab_size].iter().enumerate() {
+                    let candidate = idx as i32;
+                    if candidate == next
+                        || candidate == self.tokenizer.eos_token
+                        || candidate == self.tokenizer.eot_token
+                        || stop_token_ids.contains(&candidate)
+                    {
+                        continue;
+                    }
+                    if logit > fallback_logit {
+                        fallback_logit = logit;
+                        fallback_token = Some(candidate);
+                    }
+                    let decoded = self.tokenizer.decode_token(candidate).unwrap_or_default();
+                    let trimmed = decoded.trim();
+                    let looks_like_short_language_marker = !trimmed.is_empty()
+                        && trimmed.len() <= 16
+                        && trimmed.chars().all(|c| c.is_ascii_alphabetic());
+                    if looks_like_short_language_marker {
+                        continue;
+                    }
+                    if logit > alt_logit {
+                        alt_logit = logit;
+                        alt_token = Some(candidate);
+                    }
+                }
+                if let Some(candidate) = alt_token.or(fallback_token) {
+                    early_terminal_recovery_used = true;
+                    if debug_mode {
+                        eprintln!(
+                            "\nNote: recovered once from early terminal token id={} at generated_tokens={}; using alternative token id={}",
+                            next,
+                            generated_tokens.len(),
+                            candidate
+                        );
+                    }
+                    next = candidate;
+                }
+            }
+
             if pos >= prompt_tokens.len().saturating_sub(1)
                 && next != self.tokenizer.eot_token
                 && next != self.tokenizer.eos_token
+                && !is_vendor_stop_token
             {
                 if let Some(bytes) = self.tokenizer.decode_token_bytes(next) {
                     let decoded = decode_utf8_streaming(&mut utf8_pending, &bytes);
@@ -1975,6 +2073,11 @@ impl ModelRuntime {
                     }
                 }
                 if self.settings.vendor_decode_policy.deterministic_loop_guard
+                    && generated_tokens.len()
+                        >= self
+                            .settings
+                            .vendor_decode_policy
+                            .deterministic_loop_guard_min_generated_tokens
                     && generated_tokens.len() % 16 == 0
                 {
                     if let Some(len) = repeated_text_suffix_bytes(&output) {

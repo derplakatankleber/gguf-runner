@@ -119,6 +119,10 @@ gguf-runner \
 ```
 
 Most common options (and what they do):
+- `--mode oneshot|repl`: `oneshot` runs one request and exits. `repl` keeps an interactive prompt loop until you type `/exit` or `/quit`.
+  - repl commands: `/help`, `/model`, `/exit`, `/quit` (tab-completion for slash commands, e.g. `/e<Tab>` => `/exit`)
+- `--allowed-tools <list>`: Comma-separated tool allowlist, or `all` / `none` (`none` disables all tools).
+  - defaults: `oneshot => none`, `repl => all`
 - `--max-tokens 256`: Maximum number of generated output tokens. Use lower values for short answers and faster test runs.
 - `--context-size 4096`: Sets how much conversation/history the model can keep in context.
 - `--temperature 0.7`: Controls randomness. Lower is more deterministic, higher is more creative/variable.

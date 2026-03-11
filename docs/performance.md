@@ -64,6 +64,7 @@ gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg -
 | 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m2-24g | png_to_jpeg_v1 | 10.774 | 47.773 | |
 | 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m4-32g | png_to_jpeg_v1 | 15.915 | 33.569 | |
 | 2026-03-07 | Qwen3.5-2B-Q4_K_M.gguf | mac-m4-32g | image_v1 | 16.418 | 62.619 | |
+| 2026-03-11 | Qwen3.5-35B-A3B-Q4_K_M.gguf | mac-m4-32g | image_v1 | 7.210 | 103.316 | |
 
 
 ### Benchmark Runs - Older Models
@@ -87,6 +88,8 @@ gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg -
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | mac-m4-32g | png_to_jpeg_v1 | 3.625 | 268.448 | |
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | lnx-125h-32g | png_to_jpeg_v1 | 5.010 | 256.944 | |
 | 2026-02-15 | Qwen3-30B-A3B-Instruct-2507-Q4_K_S.gguf | lnx-9700-64g | png_to_jpeg_v1 | 7.287 | 154.820 | |
+| 2026-03-11 | Qwen3-VL-2B-Instruct-Q4_K_M.gguf | mac-m4-32g | image_v1 | 15.784 | 71.829 | |
+| 2026-03-11 | Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf | mac-m4-32g | image_v1 | 6.952 | 228.771 | |
 
 ## Benchmark Caveats
 

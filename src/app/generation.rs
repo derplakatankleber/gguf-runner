@@ -15,6 +15,7 @@ use crate::engine::vision::{
     ImagePreprocessProfile, ImageResizeMode,
 };
 use image::{ImageFormat, ImageReader};
+use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -189,6 +190,492 @@ fn has_post_think_response_text(output: &str) -> bool {
     false
 }
 
+fn should_retry_without_think_for_output(
+    think_mode: ThinkMode,
+    decode_policy: crate::vendors::VendorDecodePolicy,
+    output: &str,
+) -> bool {
+    think_mode == ThinkMode::Yes
+        && decode_policy.retry_without_think_when_no_post_think_text
+        && decode_policy.parse_think_tags
+        && !has_post_think_response_text(output)
+}
+
+fn build_direct_answer_retry_system_prompt(system_prompt: &str) -> String {
+    let directive =
+        "Provide the final answer directly and briefly. Do not describe your reasoning or restate the user's question.";
+    if system_prompt.trim().is_empty() {
+        directive.to_string()
+    } else {
+        format!("{system_prompt}\n\n{directive}")
+    }
+}
+
+fn find_first_complete_json_object_span(text: &str) -> Option<(usize, usize)> {
+    for (idx, ch) in text.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        let mut stream = serde_json::Deserializer::from_str(&text[idx..]).into_iter::<Value>();
+        let Some(Ok(value)) = stream.next() else {
+            continue;
+        };
+        if !value.is_object() {
+            continue;
+        }
+        let consumed = stream.byte_offset();
+        if consumed == 0 {
+            continue;
+        }
+        return Some((idx, idx + consumed));
+    }
+    None
+}
+
+fn extract_first_complete_json_object(text: &str) -> Option<String> {
+    let (start, end) = find_first_complete_json_object_span(text)?;
+    Some(text[start..end].trim().to_string())
+}
+
+fn mask_blocked_logits(logits: &mut [f32], blocked_token_ids: &HashSet<i32>) {
+    for &token_id in blocked_token_ids {
+        if token_id >= 0 && (token_id as usize) < logits.len() {
+            logits[token_id as usize] = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn is_agent_json_safe_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    text.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                ' ' | '\n'
+                    | '\r'
+                    | '\t'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | ':'
+                    | ','
+                    | '.'
+                    | '_'
+                    | '-'
+                    | '/'
+                    | '\\'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '+'
+                    | '='
+                    | '*'
+                    | '?'
+                    | '&'
+                    | '<'
+                    | '>'
+                    | '!'
+                    | '@'
+                    | '#'
+                    | '$'
+                    | '%'
+                    | '^'
+                    | '|'
+                    | '~'
+                    | ';'
+            )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixMatch {
+    Complete,
+    Incomplete,
+    Invalid,
+}
+
+fn match_agent_response_prefix(text: &str) -> PrefixMatch {
+    let final_match = match_final_response_prefix(text);
+    if final_match != PrefixMatch::Invalid {
+        return final_match;
+    }
+    match_tool_call_response_prefix(text)
+}
+
+fn match_final_response_prefix(text: &str) -> PrefixMatch {
+    let mut rest = text;
+    rest = match strip_literal_prefix(rest, "{\"type\":\"") {
+        Some(rest) => rest,
+        None if "{\"type\":\"".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    rest = match strip_literal_prefix(rest, "final") {
+        Some(rest) => rest,
+        None if "final".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    rest = match strip_literal_prefix(rest, "\",\"content\":\"") {
+        Some(rest) => rest,
+        None if "\",\"content\":\"".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    match parse_json_string_prefix(rest) {
+        PrefixMatch::Complete => {
+            let quote_idx = find_json_string_end(rest).expect("json string end");
+            let rest = &rest[quote_idx + 1..];
+            if rest.is_empty() {
+                return PrefixMatch::Incomplete;
+            }
+            match strip_literal_prefix(rest, "}") {
+                Some("") => PrefixMatch::Complete,
+                None if "}".starts_with(rest) => PrefixMatch::Incomplete,
+                _ => PrefixMatch::Invalid,
+            }
+        }
+        PrefixMatch::Incomplete => PrefixMatch::Incomplete,
+        PrefixMatch::Invalid => PrefixMatch::Invalid,
+    }
+}
+
+fn match_tool_call_response_prefix(text: &str) -> PrefixMatch {
+    let mut rest = text;
+    rest = match strip_literal_prefix(rest, "{\"type\":\"") {
+        Some(rest) => rest,
+        None if "{\"type\":\"".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    rest = match strip_literal_prefix(rest, "tool_call") {
+        Some(rest) => rest,
+        None if "tool_call".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    rest = match strip_literal_prefix(rest, "\",\"tool\":\"") {
+        Some(rest) => rest,
+        None if "\",\"tool\":\"".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    rest = match parse_json_string_prefix(rest) {
+        PrefixMatch::Complete => {
+            let quote_idx = find_json_string_end(rest).expect("json string end");
+            &rest[quote_idx + 1..]
+        }
+        PrefixMatch::Incomplete => return PrefixMatch::Incomplete,
+        PrefixMatch::Invalid => return PrefixMatch::Invalid,
+    };
+    rest = match strip_literal_prefix(rest, ",\"args\":") {
+        Some(rest) => rest,
+        None if ",\"args\":".starts_with(rest) => return PrefixMatch::Incomplete,
+        None => return PrefixMatch::Invalid,
+    };
+    rest = match parse_json_object_prefix(rest) {
+        PrefixMatch::Complete => {
+            let len = find_json_object_end(rest).expect("json object end");
+            &rest[len..]
+        }
+        PrefixMatch::Incomplete => return PrefixMatch::Incomplete,
+        PrefixMatch::Invalid => return PrefixMatch::Invalid,
+    };
+    if rest.is_empty() {
+        return PrefixMatch::Incomplete;
+    }
+    match strip_literal_prefix(rest, "}") {
+        Some("") => PrefixMatch::Complete,
+        None if "}".starts_with(rest) => PrefixMatch::Incomplete,
+        _ => PrefixMatch::Invalid,
+    }
+}
+
+fn strip_literal_prefix<'a>(input: &'a str, literal: &str) -> Option<&'a str> {
+    input.strip_prefix(literal)
+}
+
+fn parse_json_string_prefix(input: &str) -> PrefixMatch {
+    if input.is_empty() {
+        return PrefixMatch::Incomplete;
+    }
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            if !matches!(ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
+                return PrefixMatch::Invalid;
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '"' => return PrefixMatch::Complete,
+            '\\' => escaped = true,
+            c if c.is_ascii() && !c.is_ascii_control() => {}
+            _ => return PrefixMatch::Invalid,
+        }
+    }
+    PrefixMatch::Incomplete
+}
+
+fn find_json_string_end(input: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_json_object_prefix(input: &str) -> PrefixMatch {
+    if input.is_empty() {
+        return PrefixMatch::Incomplete;
+    }
+    let Some(first) = input.chars().next() else {
+        return PrefixMatch::Incomplete;
+    };
+    if first != '{' {
+        return PrefixMatch::Invalid;
+    }
+    if find_json_object_end(input).is_some() {
+        PrefixMatch::Complete
+    } else if is_json_object_lexically_valid_prefix(input) {
+        PrefixMatch::Incomplete
+    } else {
+        PrefixMatch::Invalid
+    }
+}
+
+fn find_json_object_end(input: &str) -> Option<usize> {
+    let mut depth_brace = 0usize;
+    let mut depth_bracket = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                c if c.is_ascii() && !c.is_ascii_control() => {}
+                _ => return None,
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth_brace += 1,
+            '}' => {
+                if depth_brace == 0 {
+                    return None;
+                }
+                depth_brace -= 1;
+                if depth_brace == 0 && depth_bracket == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            '[' => depth_bracket += 1,
+            ']' => {
+                if depth_bracket == 0 {
+                    return None;
+                }
+                depth_bracket -= 1;
+            }
+            c if c.is_ascii_whitespace()
+                || matches!(
+                    c,
+                    ':' | ',' | '-' | '.' | 't' | 'r' | 'u' | 'e' | 'f' | 'a' | 'l' | 's' | 'n'
+                )
+                || c.is_ascii_alphanumeric() => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn is_json_object_lexically_valid_prefix(input: &str) -> bool {
+    let mut depth_brace = 0usize;
+    let mut depth_bracket = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                c if c.is_ascii() && !c.is_ascii_control() => {}
+                _ => return false,
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth_brace += 1,
+            '}' => {
+                if depth_brace == 0 {
+                    return false;
+                }
+                depth_brace -= 1;
+            }
+            '[' => depth_bracket += 1,
+            ']' => {
+                if depth_bracket == 0 {
+                    return false;
+                }
+                depth_bracket -= 1;
+            }
+            c if c.is_ascii_whitespace()
+                || matches!(
+                    c,
+                    ':' | ',' | '-' | '.' | 't' | 'r' | 'u' | 'e' | 'f' | 'a' | 'l' | 's' | 'n'
+                )
+                || c.is_ascii_alphanumeric() => {}
+            _ => return false,
+        }
+    }
+    depth_brace > 0 || depth_bracket > 0 || in_string
+}
+
+struct StructuredOutputSchema {
+    seed_literal: &'static str,
+    text_is_lexically_safe: fn(&str) -> bool,
+    accepts_prefix: fn(&str) -> bool,
+    extract_complete: fn(&str) -> Option<String>,
+}
+
+const AGENT_JSON_STRUCTURED_OUTPUT_SCHEMA: StructuredOutputSchema = StructuredOutputSchema {
+    seed_literal: "{\"type\":\"",
+    text_is_lexically_safe: is_agent_json_safe_text,
+    accepts_prefix: is_valid_agent_json_prefix,
+    extract_complete: extract_first_complete_json_object,
+};
+
+fn is_valid_agent_json_prefix(text: &str) -> bool {
+    matches!(
+        match_agent_response_prefix(text),
+        PrefixMatch::Complete | PrefixMatch::Incomplete
+    )
+}
+
+fn collect_structured_output_blocked_token_ids(
+    tokenizer: &Tokenizer,
+    stop_tokens: &[(i32, &str)],
+    schema: Option<&StructuredOutputSchema>,
+) -> HashSet<i32> {
+    let Some(schema) = schema else {
+        return HashSet::new();
+    };
+    let mut blocked = HashSet::new();
+    let token_literals = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|eot_id|>",
+        "<|begin_of_text|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<bos>",
+        "<eos>",
+        "<start_of_turn>",
+        "<end_of_turn>",
+    ];
+    for literal in token_literals {
+        if let Some(id) = tokenizer.find_special_token(literal) {
+            blocked.insert(id);
+        }
+    }
+    if tokenizer.eos_token >= 0 {
+        blocked.insert(tokenizer.eos_token);
+    }
+    if tokenizer.eot_token >= 0 {
+        blocked.insert(tokenizer.eot_token);
+    }
+    for (id, _) in stop_tokens {
+        blocked.insert(*id);
+    }
+    for token_id in 0..tokenizer.vocab_size.min(tokenizer.vocab.len()) {
+        let token_id = token_id as i32;
+        let Some(bytes) = tokenizer.decode_token_bytes(token_id) else {
+            blocked.insert(token_id);
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            blocked.insert(token_id);
+            continue;
+        };
+        if !(schema.text_is_lexically_safe)(text) {
+            blocked.insert(token_id);
+        }
+    }
+    blocked
+}
+
+fn build_structured_output_prefix_tokens(
+    tokenizer: &mut Tokenizer,
+    schema: Option<&StructuredOutputSchema>,
+) -> Vec<i32> {
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    tokenizer.bpe_encode(schema.seed_literal, &mut tokens);
+    if tokens.is_empty() {
+        tokenizer.bpe_encode("{", &mut tokens);
+    }
+    tokens
+}
+
+fn mask_invalid_structured_output_logits(
+    logits: &mut [f32],
+    blocked_token_ids: &HashSet<i32>,
+    tokenizer: &Tokenizer,
+    current_output: &str,
+    schema: &StructuredOutputSchema,
+) {
+    mask_blocked_logits(logits, blocked_token_ids);
+    for (token_id, logit) in logits.iter_mut().enumerate() {
+        if logit.is_infinite() && logit.is_sign_negative() {
+            continue;
+        }
+        let token_id_i32 = token_id as i32;
+        let Some(bytes) = tokenizer.decode_token_bytes(token_id_i32) else {
+            *logit = f32::NEG_INFINITY;
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            *logit = f32::NEG_INFINITY;
+            continue;
+        };
+        let mut candidate = String::with_capacity(current_output.len() + text.len());
+        candidate.push_str(current_output);
+        candidate.push_str(text);
+        if !(schema.text_is_lexically_safe)(text) || !(schema.accepts_prefix)(&candidate) {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn extract_first_complete_structured_output(
+    text: &str,
+    schema: Option<&StructuredOutputSchema>,
+) -> Option<String> {
+    let schema = schema?;
+    (schema.extract_complete)(text)
+}
+
 fn split_at_char_boundary(s: &str, byte_idx: usize) -> (&str, &str) {
     let mut i = byte_idx.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
@@ -346,8 +833,25 @@ pub(crate) struct GenerationSettings {
     pub(crate) show_tokens: bool,
     pub(crate) debug_mode: bool,
     pub(crate) think_mode: ThinkMode,
+    pub(crate) structured_output_mode: StructuredOutputMode,
     pub(crate) vendor_decode_policy: crate::vendors::VendorDecodePolicy,
     pub(crate) vendor_multimodal_policy: crate::vendors::VendorMultimodalPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StructuredOutputMode {
+    #[default]
+    None,
+    AgentJson,
+}
+
+impl StructuredOutputMode {
+    fn schema(self) -> Option<&'static StructuredOutputSchema> {
+        match self {
+            StructuredOutputMode::None => None,
+            StructuredOutputMode::AgentJson => Some(&AGENT_JSON_STRUCTURED_OUTPUT_SCHEMA),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1312,6 +1816,7 @@ impl ModelRuntime {
             show_tokens: cli.show_tokens,
             debug_mode,
             think_mode: cli.think_mode,
+            structured_output_mode: StructuredOutputMode::None,
             vendor_decode_policy,
             vendor_multimodal_policy,
         };
@@ -1337,6 +1842,63 @@ impl ModelRuntime {
         stream_stdout: bool,
     ) -> Result<String, String> {
         self.generate_text_with_images(prompt, system_prompt, &[], stream_stdout)
+    }
+
+    pub(crate) fn generate_text_for_agent(
+        &mut self,
+        prompt: &str,
+        system_prompt: &str,
+        stream_stdout: bool,
+    ) -> Result<String, String> {
+        let original_temperature = self.settings.temperature;
+        let original_top_k = self.settings.top_k;
+        let original_top_p = self.settings.top_p;
+        let original_max_tokens = self.settings.max_tokens;
+        let original_think_mode = self.settings.think_mode;
+        let original_show_tokens = self.settings.show_tokens;
+        let original_debug_mode = self.settings.debug_mode;
+        let original_structured_output_mode = self.settings.structured_output_mode;
+        let unstable_agent_model =
+            self.config.is_qwen3moe || (self.config.is_qwen35 && self.config.n_experts > 0);
+
+        // Agent protocol adherence is more stable with no think tags and a bounded
+        // decode budget. Pure argmax can degenerate on some models, so prefer a
+        // conservative low-temperature/top-k profile instead.
+        if unstable_agent_model {
+            // Qwen MoE variants are significantly more likely to emit protocol noise
+            // with sampled decoding in tool mode; keep agent turns deterministic.
+            self.settings.temperature = 0.0;
+            self.settings.top_k = 1;
+            self.settings.top_p = 1.0;
+            self.settings.max_tokens = original_max_tokens.clamp(96, 256);
+        } else {
+            self.settings.temperature = original_temperature.clamp(0.15, 0.35);
+            self.settings.top_k = if original_top_k == 0 {
+                40
+            } else {
+                original_top_k.clamp(8, 64)
+            };
+            self.settings.top_p = original_top_p.clamp(0.8, 0.95);
+            self.settings.max_tokens = original_max_tokens.clamp(128, 384);
+        }
+        self.settings.think_mode = ThinkMode::No;
+        self.settings.show_tokens = false;
+        self.settings.structured_output_mode = StructuredOutputMode::AgentJson;
+        // Keep REPL agent output readable: suppress per-token debug internals during turns.
+        self.settings.debug_mode = false;
+
+        let result = self.generate_text(prompt, system_prompt, stream_stdout);
+
+        self.settings.temperature = original_temperature;
+        self.settings.top_k = original_top_k;
+        self.settings.top_p = original_top_p;
+        self.settings.max_tokens = original_max_tokens;
+        self.settings.think_mode = original_think_mode;
+        self.settings.show_tokens = original_show_tokens;
+        self.settings.structured_output_mode = original_structured_output_mode;
+        self.settings.debug_mode = original_debug_mode;
+
+        result
     }
 
     pub(crate) fn generate_request(
@@ -1568,7 +2130,9 @@ impl ModelRuntime {
             prefill_embeddings.retain(|k, _| *k < self.config.seq_len);
         }
 
-        self.generate_from_prefill(prompt_tokens, prefill_embeddings, stream_stdout)
+        let output =
+            self.generate_from_prefill(prompt_tokens, prefill_embeddings, stream_stdout)?;
+        self.retry_without_think_for_request(output, &effective_request, stream_stdout)
     }
 
     fn generate_from_prefill(
@@ -1598,6 +2162,7 @@ impl ModelRuntime {
         let profiling_mode = self.settings.profiling_mode;
         let show_tokens = self.settings.show_tokens;
         let debug_mode = self.settings.debug_mode;
+        let structured_output_mode = self.settings.structured_output_mode;
 
         let mut token = prompt_tokens[0];
         let mut next: i32;
@@ -1663,6 +2228,15 @@ impl ModelRuntime {
             .iter()
             .map(|(id, _)| *id)
             .collect::<HashSet<_>>();
+        let structured_output_schema = structured_output_mode.schema();
+        let structured_output_blocked_token_ids = collect_structured_output_blocked_token_ids(
+            &self.tokenizer,
+            &stop_tokens,
+            structured_output_schema,
+        );
+        let mut structured_output_prefix_tokens =
+            build_structured_output_prefix_tokens(&mut self.tokenizer, structured_output_schema);
+        let mut structured_output_completed = false;
 
         let total_limit = prompt_tokens
             .len()
@@ -1717,7 +2291,24 @@ impl ModelRuntime {
             None
         };
         let visible_yes_think_cap = if think_mode == ThinkMode::Yes {
-            think_caps.map(|(think_cap, _)| think_cap)
+            think_caps.map(|(think_cap, _)| {
+                let new_budget = total_limit.saturating_sub(prompt_tokens.len());
+                if new_budget == 0 {
+                    return 0usize;
+                }
+                // Reserve some decode budget for the answer after </think>. Without this,
+                // short generations can spend the entire budget inside thinking and then
+                // require a second pass to produce the visible answer.
+                let answer_reserve = if new_budget >= 96 {
+                    48usize
+                } else if new_budget >= 48 {
+                    24usize
+                } else {
+                    (new_budget / 3).max(8usize)
+                };
+                let visible_cap = new_budget.saturating_sub(answer_reserve).max(8usize);
+                think_cap.min(visible_cap)
+            })
         } else {
             None
         };
@@ -1790,56 +2381,73 @@ impl ModelRuntime {
             if pos < prompt_tokens.len().saturating_sub(1) {
                 next = prompt_tokens[pos + 1];
             } else {
-                if use_repetition_penalty {
-                    unique_recent_tokens.clear();
-                    for &tok in &recent_tokens {
-                        unique_recent_tokens.insert(tok);
-                    }
-                    for tok in unique_recent_tokens.iter().copied() {
-                        if tok >= 0 && (tok as usize) < self.config.vocab_size {
-                            let idx = tok as usize;
-                            if state.logits[idx] > 0.0 {
-                                state.logits[idx] /= repetition_penalty;
-                            } else {
-                                state.logits[idx] *= repetition_penalty;
+                if structured_output_mode != StructuredOutputMode::None
+                    && output.trim().is_empty()
+                    && !structured_output_prefix_tokens.is_empty()
+                {
+                    next = structured_output_prefix_tokens.remove(0);
+                } else {
+                    if use_repetition_penalty {
+                        unique_recent_tokens.clear();
+                        for &tok in &recent_tokens {
+                            unique_recent_tokens.insert(tok);
+                        }
+                        for tok in unique_recent_tokens.iter().copied() {
+                            if tok >= 0 && (tok as usize) < self.config.vocab_size {
+                                let idx = tok as usize;
+                                if state.logits[idx] > 0.0 {
+                                    state.logits[idx] /= repetition_penalty;
+                                } else {
+                                    state.logits[idx] *= repetition_penalty;
+                                }
                             }
                         }
                     }
-                }
 
-                if temperature == 0.0 {
-                    next = argmax(&state.logits[..self.config.vocab_size]) as i32;
-                } else if top_k == 1 {
-                    // temperature scaling is monotonic for temperature>0, so k=1 equals argmax.
-                    next = argmax(&state.logits[..self.config.vocab_size]) as i32;
-                } else if top_k > 0 {
-                    next = topk_sampler.sample_top_k_top_p(
-                        &state.logits[..self.config.vocab_size],
-                        temperature,
-                        top_k,
-                        top_p,
-                        &mut rng,
-                    ) as i32;
-                } else {
-                    if top_p < 1.0 && debug_mode && !warned_top_p_without_top_k {
-                        eprintln!("Note: -top_p is ignored unless -top_k > 0");
-                        warned_top_p_without_top_k = true;
+                    if let Some(schema) = structured_output_schema {
+                        mask_invalid_structured_output_logits(
+                            &mut state.logits[..self.config.vocab_size],
+                            &structured_output_blocked_token_ids,
+                            &self.tokenizer,
+                            &output,
+                            schema,
+                        );
                     }
-                    for q in 0..self.config.vocab_size {
-                        state.logits[q] /= temperature;
-                    }
-                    softmax(
-                        &mut state.logits[..self.config.vocab_size],
-                        self.config.vocab_size,
-                    );
-                    next = sample(&state.logits[..self.config.vocab_size], &mut rng) as i32;
-                }
 
-                if use_repetition_penalty {
-                    if recent_tokens.len() == repeat_last_n {
-                        recent_tokens.pop_front();
+                    if temperature == 0.0 {
+                        next = argmax(&state.logits[..self.config.vocab_size]) as i32;
+                    } else if top_k == 1 {
+                        // temperature scaling is monotonic for temperature>0, so k=1 equals argmax.
+                        next = argmax(&state.logits[..self.config.vocab_size]) as i32;
+                    } else if top_k > 0 {
+                        next = topk_sampler.sample_top_k_top_p(
+                            &state.logits[..self.config.vocab_size],
+                            temperature,
+                            top_k,
+                            top_p,
+                            &mut rng,
+                        ) as i32;
+                    } else {
+                        if top_p < 1.0 && debug_mode && !warned_top_p_without_top_k {
+                            eprintln!("Note: -top_p is ignored unless -top_k > 0");
+                            warned_top_p_without_top_k = true;
+                        }
+                        for q in 0..self.config.vocab_size {
+                            state.logits[q] /= temperature;
+                        }
+                        softmax(
+                            &mut state.logits[..self.config.vocab_size],
+                            self.config.vocab_size,
+                        );
+                        next = sample(&state.logits[..self.config.vocab_size], &mut rng) as i32;
                     }
-                    recent_tokens.push_back(next);
+
+                    if use_repetition_penalty {
+                        if recent_tokens.len() == repeat_last_n {
+                            recent_tokens.pop_front();
+                        }
+                        recent_tokens.push_back(next);
+                    }
                 }
             }
 
@@ -1872,6 +2480,7 @@ impl ModelRuntime {
                         if candidate == self.tokenizer.eos_token
                             || candidate == self.tokenizer.eot_token
                             || stop_token_ids.contains(&candidate)
+                            || structured_output_blocked_token_ids.contains(&candidate)
                         {
                             continue;
                         }
@@ -1901,6 +2510,7 @@ impl ModelRuntime {
                         || candidate == self.tokenizer.eos_token
                         || candidate == self.tokenizer.eot_token
                         || stop_token_ids.contains(&candidate)
+                        || structured_output_blocked_token_ids.contains(&candidate)
                     {
                         continue;
                     }
@@ -1953,6 +2563,16 @@ impl ModelRuntime {
                         &mut pending_newline,
                         stream_stdout,
                     );
+                    if let Some(structured_output) =
+                        extract_first_complete_structured_output(&output, structured_output_schema)
+                    {
+                        output = structured_output;
+                        pending_newline = false;
+                        think_tail.clear();
+                        hidden_visible_tail.clear();
+                        utf8_pending.clear();
+                        structured_output_completed = true;
+                    }
                 }
             }
 
@@ -2011,6 +2631,12 @@ impl ModelRuntime {
                             }
                         }
                     }
+                }
+                if structured_output_completed {
+                    if debug_mode {
+                        eprintln!("\nStopping after first complete structured output object");
+                    }
+                    break;
                 }
                 if token == self.tokenizer.eos_token || token == self.tokenizer.eot_token {
                     if decode_policy.parse_think_tags
@@ -2122,6 +2748,11 @@ impl ModelRuntime {
             &mut pending_newline,
             stream_stdout,
         );
+        if let Some(structured_output) =
+            extract_first_complete_structured_output(&output, structured_output_schema)
+        {
+            output = structured_output;
+        }
         if !think_tail.is_empty() {
             if think_mode == ThinkMode::Yes {
                 append_visible_text(
@@ -2151,6 +2782,7 @@ impl ModelRuntime {
         }
         if decode_policy.parse_think_tags
             && think_mode == ThinkMode::Yes
+            && !decode_policy.retry_without_think_when_no_post_think_text
             && !has_post_think_response_text(&output)
         {
             let mut promoted = output.trim().to_string();
@@ -2168,6 +2800,11 @@ impl ModelRuntime {
                     eprintln!("\nNote: promoted think-only content to final response text");
                 }
             }
+        }
+        if let Some(structured_output) =
+            extract_first_complete_structured_output(&output, structured_output_schema)
+        {
+            output = structured_output;
         }
 
         let end = time_in_ms();
@@ -2203,6 +2840,70 @@ impl ModelRuntime {
         }
 
         Ok(output)
+    }
+
+    fn retry_without_think_for_request(
+        &mut self,
+        output: String,
+        request: &GenerationRequest,
+        stream_stdout: bool,
+    ) -> Result<String, String> {
+        if !should_retry_without_think_for_output(
+            self.settings.think_mode,
+            self.settings.vendor_decode_policy,
+            &output,
+        ) {
+            return Ok(output);
+        }
+
+        if self.settings.debug_mode {
+            eprintln!("\nNote: no post-think answer detected; retrying once with think=no");
+        }
+        if stream_stdout && !output.ends_with('\n') {
+            println!();
+        }
+
+        let mut retry_request = request.clone();
+        retry_request.system_prompt =
+            build_direct_answer_retry_system_prompt(&retry_request.system_prompt);
+
+        let original_think_mode = self.settings.think_mode;
+        let original_temperature = self.settings.temperature;
+        let original_top_k = self.settings.top_k;
+        let original_top_p = self.settings.top_p;
+
+        self.settings.think_mode = ThinkMode::No;
+        self.settings.temperature = 0.0;
+        self.settings.top_k = 1;
+        self.settings.top_p = 1.0;
+
+        let retry_result = self.generate_request(&retry_request, stream_stdout);
+
+        self.settings.think_mode = original_think_mode;
+        self.settings.temperature = original_temperature;
+        self.settings.top_k = original_top_k;
+        self.settings.top_p = original_top_p;
+
+        match retry_result {
+            Ok(retry_output) => {
+                let retry_output = retry_output.trim();
+                if retry_output.is_empty() {
+                    return Ok(output);
+                }
+                let mut combined = output.trim_end().to_string();
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(retry_output);
+                Ok(combined)
+            }
+            Err(err) => {
+                if self.settings.debug_mode {
+                    eprintln!("\nNote: think=no retry failed: {err}");
+                }
+                Ok(output)
+            }
+        }
     }
 
     pub(crate) fn generate_text_with_images(
@@ -2267,6 +2968,80 @@ impl ModelRuntime {
         }
 
         let prefill_injected_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
-        self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, stream_stdout)
+        let output =
+            self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, stream_stdout)?;
+        let request = GenerationRequest {
+            system_prompt: system_prompt.to_string(),
+            parts: vec![ContentPart::Text(prompt.to_string())],
+        };
+        self.retry_without_think_for_request(output, &request, stream_stdout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_first_complete_json_object, find_first_complete_json_object_span,
+        is_agent_json_safe_text, match_agent_response_prefix, PrefixMatch,
+    };
+
+    #[test]
+    fn finds_first_complete_json_object_after_prefix_junk() {
+        let text = "noise before {\"type\":\"final\",\"content\":\"ok\"} trailing";
+        let span = find_first_complete_json_object_span(text).expect("json span");
+        assert_eq!(
+            &text[span.0..span.1],
+            "{\"type\":\"final\",\"content\":\"ok\"}"
+        );
+    }
+
+    #[test]
+    fn extracts_first_complete_json_object_only() {
+        let text = "  {\"type\":\"tool_call\",\"tool\":\"read_file\",\"args\":{\"path\":\"Cargo.toml\"}} extra";
+        let extracted = extract_first_complete_json_object(text).expect("json object");
+        assert_eq!(
+            extracted,
+            "{\"type\":\"tool_call\",\"tool\":\"read_file\",\"args\":{\"path\":\"Cargo.toml\"}}"
+        );
+    }
+
+    #[test]
+    fn incomplete_json_object_is_not_reported_complete() {
+        let text = "{\"type\":\"final\",\"content\":\"unterminated\"";
+        assert!(find_first_complete_json_object_span(text).is_none());
+        assert!(extract_first_complete_json_object(text).is_none());
+    }
+
+    #[test]
+    fn agent_json_safe_text_rejects_non_ascii_gibberish() {
+        assert!(is_agent_json_safe_text("{\"type\":\"tool_call\"}"));
+        assert!(!is_agent_json_safe_text("った"));
+        assert!(!is_agent_json_safe_text("\u{0000}"));
+    }
+
+    #[test]
+    fn agent_json_prefix_accepts_partial_final_response() {
+        assert_eq!(
+            match_agent_response_prefix("{\"type\":\"final\",\"content\":\"Bei"),
+            PrefixMatch::Incomplete
+        );
+    }
+
+    #[test]
+    fn agent_json_prefix_accepts_complete_tool_call_response() {
+        assert_eq!(
+            match_agent_response_prefix(
+                "{\"type\":\"tool_call\",\"tool\":\"read_file\",\"args\":{\"path\":\"Cargo.toml\"}}"
+            ),
+            PrefixMatch::Complete
+        );
+    }
+
+    #[test]
+    fn agent_json_prefix_rejects_protocol_gibberish() {
+        assert_eq!(
+            match_agent_response_prefix("{\"type\":\"tool_call\" 0000"),
+            PrefixMatch::Invalid
+        );
     }
 }

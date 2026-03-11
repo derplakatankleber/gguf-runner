@@ -1,11 +1,13 @@
 use crate::cli::AgentToolEnablement;
-use serde::Deserialize;
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::{fmt, marker::PhantomData};
 
 const MAX_READ_BYTES: usize = 256 * 1024;
 const MAX_WRITE_BYTES: usize = 256 * 1024;
@@ -13,6 +15,99 @@ const MAX_LIST_ENTRIES: usize = 200;
 const MAX_SHELL_ARGS: usize = 64;
 const MAX_SHELL_ARG_BYTES: usize = 4096;
 const MAX_SHELL_OUTPUT_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Debug)]
+struct FlexiblePath(String);
+
+impl FlexiblePath {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for FlexiblePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FlexiblePathVisitor {
+            marker: PhantomData<fn() -> FlexiblePath>,
+        }
+
+        impl<'de> Visitor<'de> for FlexiblePathVisitor {
+            type Value = FlexiblePath;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string path or single-item array containing a string path")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(FlexiblePath(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(FlexiblePath(v))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let first: Option<String> = seq.next_element()?;
+                let Some(path) = first else {
+                    return Err(de::Error::invalid_length(0, &self));
+                };
+                if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(
+                        "path array must contain exactly one string element",
+                    ));
+                }
+                Ok(FlexiblePath(path))
+            }
+        }
+
+        deserializer.deserialize_any(FlexiblePathVisitor {
+            marker: PhantomData,
+        })
+    }
+}
+
+pub(crate) const READ_FILE: &str = "read_file";
+pub(crate) const LIST_DIR: &str = "list_dir";
+pub(crate) const WRITE_FILE: &str = "write_file";
+pub(crate) const MKDIR: &str = "mkdir";
+pub(crate) const RMDIR: &str = "rmdir";
+pub(crate) const SHELL_LIST_ALLOWED: &str = "shell_list_allowed";
+pub(crate) const SHELL_EXEC: &str = "shell_exec";
+pub(crate) const SHELL_REQUEST_ALLOWED: &str = "shell_request_allowed";
+
+pub(crate) const ALL_TOOL_NAMES: [&str; 8] = [
+    READ_FILE,
+    LIST_DIR,
+    WRITE_FILE,
+    MKDIR,
+    RMDIR,
+    SHELL_LIST_ALLOWED,
+    SHELL_EXEC,
+    SHELL_REQUEST_ALLOWED,
+];
+
+pub(crate) fn all_tool_name_set() -> BTreeSet<String> {
+    ALL_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+pub(crate) fn is_valid_tool_name(name: &str) -> bool {
+    ALL_TOOL_NAMES.contains(&name)
+}
 
 pub(crate) struct ToolExecutor {
     root: PathBuf,
@@ -79,32 +174,7 @@ impl ToolExecutor {
     }
 
     pub(crate) fn enabled_tool_names(&self) -> Vec<&'static str> {
-        let mut tools = Vec::new();
-        if self.tool_enablement.read_file {
-            tools.push("read_file");
-        }
-        if self.tool_enablement.write_file {
-            tools.push("write_file");
-        }
-        if self.tool_enablement.mkdir {
-            tools.push("mkdir");
-        }
-        if self.tool_enablement.rmdir {
-            tools.push("rmdir");
-        }
-        if self.tool_enablement.list_dir {
-            tools.push("list_dir");
-        }
-        if self.tool_enablement.shell_list_allowed {
-            tools.push("shell_list_allowed");
-        }
-        if self.tool_enablement.shell_exec {
-            tools.push("shell_exec");
-        }
-        if self.tool_enablement.shell_request_allowed {
-            tools.push("shell_request_allowed");
-        }
-        tools
+        self.tool_enablement.enabled_tool_names()
     }
 
     pub(crate) fn shell_allowed_commands(&self) -> &[String] {
@@ -113,7 +183,7 @@ impl ToolExecutor {
 
     pub(crate) fn execute(&self, tool: &str, args: &Value) -> Result<Value, String> {
         match tool {
-            "read_file" => {
+            READ_FILE => {
                 if !self.tool_enablement.read_file {
                     return Err(
                         "tool 'read_file' is disabled by config ([tools].read_file=false)"
@@ -122,7 +192,7 @@ impl ToolExecutor {
                 }
                 self.read_file(args)
             }
-            "write_file" => {
+            WRITE_FILE => {
                 if !self.tool_enablement.write_file {
                     return Err(
                         "tool 'write_file' is disabled by config ([tools].write_file=false)"
@@ -131,7 +201,7 @@ impl ToolExecutor {
                 }
                 self.write_file(args)
             }
-            "list_dir" => {
+            LIST_DIR => {
                 if !self.tool_enablement.list_dir {
                     return Err(
                         "tool 'list_dir' is disabled by config ([tools].list_dir=false)"
@@ -140,7 +210,7 @@ impl ToolExecutor {
                 }
                 self.list_dir(args)
             }
-            "mkdir" => {
+            MKDIR => {
                 if !self.tool_enablement.mkdir {
                     return Err(
                         "tool 'mkdir' is disabled by config ([tools].mkdir=false)".to_string()
@@ -148,7 +218,7 @@ impl ToolExecutor {
                 }
                 self.mkdir(args)
             }
-            "rmdir" => {
+            RMDIR => {
                 if !self.tool_enablement.rmdir {
                     return Err(
                         "tool 'rmdir' is disabled by config ([tools].rmdir=false)".to_string()
@@ -156,7 +226,7 @@ impl ToolExecutor {
                 }
                 self.rmdir(args)
             }
-            "shell_list_allowed" => {
+            SHELL_LIST_ALLOWED => {
                 if !self.tool_enablement.shell_list_allowed {
                     return Err(
                         "tool 'shell_list_allowed' is disabled by config ([tools].shell_list_allowed=false)"
@@ -165,7 +235,7 @@ impl ToolExecutor {
                 }
                 Ok(self.shell_list_allowed())
             }
-            "shell_exec" => {
+            SHELL_EXEC => {
                 if !self.tool_enablement.shell_exec {
                     return Err(
                         "tool 'shell_exec' is disabled by config ([tools].shell_exec=false)"
@@ -174,7 +244,7 @@ impl ToolExecutor {
                 }
                 self.shell_exec(args)
             }
-            "shell_request_allowed" => {
+            SHELL_REQUEST_ALLOWED => {
                 if !self.tool_enablement.shell_request_allowed {
                     return Err("tool 'shell_request_allowed' is disabled by config ([tools].shell_request_allowed=false)".to_string());
                 }
@@ -292,7 +362,7 @@ impl ToolExecutor {
     fn read_file(&self, args: &Value) -> Result<Value, String> {
         let args: ReadFileArgs = serde_json::from_value(args.clone())
             .map_err(|e| format!("invalid read_file args: {e}"))?;
-        let path = self.resolve_existing_path(&args.path)?;
+        let path = self.resolve_existing_path(args.path.as_str())?;
         if !path.is_file() {
             return Err(format!("not a regular file: {}", path.display()));
         }
@@ -322,7 +392,7 @@ impl ToolExecutor {
     fn write_file(&self, args: &Value) -> Result<Value, String> {
         let args: WriteFileArgs = serde_json::from_value(args.clone())
             .map_err(|e| format!("invalid write_file args: {e}"))?;
-        let path = self.resolve_write_path(&args.path)?;
+        let path = self.resolve_write_path(args.path.as_str())?;
         let bytes = args.content.as_bytes();
         if bytes.len() > MAX_WRITE_BYTES {
             return Err(format!(
@@ -359,8 +429,8 @@ impl ToolExecutor {
     fn list_dir(&self, args: &Value) -> Result<Value, String> {
         let args: ListDirArgs = serde_json::from_value(args.clone())
             .map_err(|e| format!("invalid list_dir args: {e}"))?;
-        let path = args.path.unwrap_or_else(|| ".".to_string());
-        let path = self.resolve_existing_path(&path)?;
+        let path = args.path.as_ref().map(FlexiblePath::as_str).unwrap_or(".");
+        let path = self.resolve_existing_path(path)?;
         if !path.is_dir() {
             return Err(format!("not a directory: {}", path.display()));
         }
@@ -406,7 +476,7 @@ impl ToolExecutor {
     fn mkdir(&self, args: &Value) -> Result<Value, String> {
         let args: MkdirArgs =
             serde_json::from_value(args.clone()).map_err(|e| format!("invalid mkdir args: {e}"))?;
-        let path = self.resolve_dir_create_path(&args.path)?;
+        let path = self.resolve_dir_create_path(args.path.as_str())?;
         let existed = path.exists();
         if existed {
             if !path.is_dir() {
@@ -431,14 +501,14 @@ impl ToolExecutor {
     fn rmdir(&self, args: &Value) -> Result<Value, String> {
         let args: RmdirArgs =
             serde_json::from_value(args.clone()).map_err(|e| format!("invalid rmdir args: {e}"))?;
-        let path = self.resolve_existing_path(&args.path)?;
+        let path = self.resolve_existing_path(args.path.as_str())?;
         if path == self.root {
             return Err("refusing to remove tool root".to_string());
         }
         if !path.is_dir() {
             return Err(format!("not a directory: {}", path.display()));
         }
-        let joined = self.join_tool_path(&args.path)?;
+        let joined = self.join_tool_path(args.path.as_str())?;
         let joined_md = fs::symlink_metadata(&joined)
             .map_err(|e| format!("cannot stat '{}': {e}", joined.display()))?;
         if joined_md.file_type().is_symlink() {
@@ -664,31 +734,37 @@ fn truncate_output(bytes: &[u8], limit: usize) -> (String, bool) {
 
 #[derive(Deserialize)]
 struct ReadFileArgs {
-    path: String,
+    #[serde(alias = "file", alias = "filepath", alias = "filename")]
+    path: FlexiblePath,
     max_bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct WriteFileArgs {
-    path: String,
+    #[serde(alias = "file", alias = "filepath", alias = "filename")]
+    path: FlexiblePath,
+    #[serde(alias = "text", alias = "data")]
     content: String,
     append: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct ListDirArgs {
-    path: Option<String>,
+    #[serde(alias = "dir", alias = "directory", alias = "folder")]
+    path: Option<FlexiblePath>,
     max_entries: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct MkdirArgs {
-    path: String,
+    #[serde(alias = "dir", alias = "directory", alias = "folder")]
+    path: FlexiblePath,
 }
 
 #[derive(Deserialize)]
 struct RmdirArgs {
-    path: String,
+    #[serde(alias = "dir", alias = "directory", alias = "folder")]
+    path: FlexiblePath,
 }
 
 #[derive(Deserialize)]
@@ -793,6 +869,54 @@ mod tests {
             .execute("rmdir", &json!({"path":"."}))
             .expect_err("rmdir root should fail");
         assert!(err.contains("refusing to remove tool root"));
+
+        fs::remove_dir_all(&root).expect("cleanup test root");
+    }
+
+    #[test]
+    fn read_file_accepts_single_item_path_array() {
+        let root = make_temp_tool_root();
+        let root_s = root.to_string_lossy().to_string();
+        let file_path = root.join("Cargo.toml");
+        fs::write(&file_path, "name = \"demo\"\n").expect("write fixture file");
+        let tool_exec = ToolExecutor::new(Some(&root_s), AgentToolEnablement::default(), &[])
+            .expect("tool executor");
+
+        let result = tool_exec
+            .execute(
+                "read_file",
+                &json!({
+                    "path": [file_path.to_string_lossy().to_string()]
+                }),
+            )
+            .expect("read_file should coerce single-item path array");
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert!(result
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .contains("name = \"demo\""));
+
+        fs::remove_dir_all(&root).expect("cleanup test root");
+    }
+
+    #[test]
+    fn read_file_accepts_file_alias_for_path() {
+        let root = make_temp_tool_root();
+        let root_s = root.to_string_lossy().to_string();
+        fs::write(root.join("Cargo.toml"), "name = \"demo\"\n").expect("write fixture file");
+        let tool_exec = ToolExecutor::new(Some(&root_s), AgentToolEnablement::default(), &[])
+            .expect("tool executor");
+
+        let result = tool_exec
+            .execute(
+                "read_file",
+                &json!({
+                    "file": "Cargo.toml"
+                }),
+            )
+            .expect("read_file should accept file alias");
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
 
         fs::remove_dir_all(&root).expect("cleanup test root");
     }

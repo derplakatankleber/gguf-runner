@@ -378,6 +378,7 @@ pub(crate) struct Config {
     pub(crate) is_qwen3vl: bool,
     pub(crate) is_qwen3moe: bool,
     pub(crate) is_qwen3next: bool,
+    pub(crate) online_attn_fusion: bool,
     pub(crate) qwen_chat_template_contains_think: bool,
     pub(crate) qwen_chat_template_has_builtin_system: bool,
     pub(crate) capabilities: ModelCapabilities,

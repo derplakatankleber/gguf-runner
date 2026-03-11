@@ -4,6 +4,40 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::tools;
+
+fn parse_allowed_tools(raw: &str) -> Result<BTreeSet<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "invalid value '': expected comma-separated tool names, or all/none".to_string(),
+        );
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(BTreeSet::new());
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(tools::all_tool_name_set());
+    }
+    let mut parsed = BTreeSet::new();
+    for entry in trimmed.split(',') {
+        let tool = entry.trim();
+        if tool.is_empty() {
+            return Err(format!(
+                "invalid value '{raw}': empty tool name in comma-separated list"
+            ));
+        }
+        if !tools::is_valid_tool_name(tool) {
+            return Err(format!(
+                "invalid tool '{tool}': expected one of {}",
+                tools::ALL_TOOL_NAMES.join(", ")
+            ));
+        }
+        parsed.insert(tool.to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_top_p(raw: &str) -> Result<f32, String> {
     let v = raw
         .parse::<f32>()
@@ -86,11 +120,33 @@ fn parse_kv_cache_mode(raw: &str) -> Result<CliKvCacheMode, String> {
     }
 }
 
+fn parse_operation_mode(raw: &str) -> Result<CliOperationMode, String> {
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("oneshot") || v.eq_ignore_ascii_case("single") {
+        Ok(CliOperationMode::Oneshot)
+    } else if v.eq_ignore_ascii_case("repl")
+        || v.eq_ignore_ascii_case("interactive")
+        || v.eq_ignore_ascii_case("shell")
+    {
+        Ok(CliOperationMode::Repl)
+    } else {
+        Err(format!(
+            "invalid value '{raw}': expected one of oneshot/repl"
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliKvCacheMode {
     Auto,
     Q8,
     Q4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliOperationMode {
+    Oneshot,
+    Repl,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +186,72 @@ impl Default for AgentToolEnablement {
             shell_exec: true,
             shell_request_allowed: true,
         }
+    }
+}
+
+impl AgentToolEnablement {
+    fn disabled() -> Self {
+        Self {
+            read_file: false,
+            list_dir: false,
+            write_file: false,
+            mkdir: false,
+            rmdir: false,
+            shell_list_allowed: false,
+            shell_exec: false,
+            shell_request_allowed: false,
+        }
+    }
+
+    fn apply_allowlist(&mut self, allowlist: &BTreeSet<String>) {
+        self.read_file &= allowlist.contains(tools::READ_FILE);
+        self.list_dir &= allowlist.contains(tools::LIST_DIR);
+        self.write_file &= allowlist.contains(tools::WRITE_FILE);
+        self.mkdir &= allowlist.contains(tools::MKDIR);
+        self.rmdir &= allowlist.contains(tools::RMDIR);
+        self.shell_list_allowed &= allowlist.contains(tools::SHELL_LIST_ALLOWED);
+        self.shell_exec &= allowlist.contains(tools::SHELL_EXEC);
+        self.shell_request_allowed &= allowlist.contains(tools::SHELL_REQUEST_ALLOWED);
+    }
+
+    fn has_any_enabled(&self) -> bool {
+        self.read_file
+            || self.list_dir
+            || self.write_file
+            || self.mkdir
+            || self.rmdir
+            || self.shell_list_allowed
+            || self.shell_exec
+            || self.shell_request_allowed
+    }
+
+    pub(crate) fn enabled_tool_names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.read_file {
+            names.push(tools::READ_FILE);
+        }
+        if self.list_dir {
+            names.push(tools::LIST_DIR);
+        }
+        if self.write_file {
+            names.push(tools::WRITE_FILE);
+        }
+        if self.mkdir {
+            names.push(tools::MKDIR);
+        }
+        if self.rmdir {
+            names.push(tools::RMDIR);
+        }
+        if self.shell_list_allowed {
+            names.push(tools::SHELL_LIST_ALLOWED);
+        }
+        if self.shell_exec {
+            names.push(tools::SHELL_EXEC);
+        }
+        if self.shell_request_allowed {
+            names.push(tools::SHELL_REQUEST_ALLOWED);
+        }
+        names
     }
 }
 
@@ -181,26 +303,26 @@ struct LoadedShellConfig {
 fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
     vec![
         ToolPromptSpec {
-            name: "read_file".to_string(),
+            name: tools::READ_FILE.to_string(),
             description: "Read UTF-8 file content under tool_root with a bounded byte limit."
                 .to_string(),
             when_to_use: "Use when you need the contents of a specific file before reasoning or editing."
                 .to_string(),
         },
         ToolPromptSpec {
-            name: "list_dir".to_string(),
+            name: tools::LIST_DIR.to_string(),
             description: "List directory entries under tool_root.".to_string(),
             when_to_use: "Use when you need to discover paths before reading or writing files."
                 .to_string(),
         },
         ToolPromptSpec {
-            name: "write_file".to_string(),
+            name: tools::WRITE_FILE.to_string(),
             description: "Write or append UTF-8 file content under tool_root.".to_string(),
             when_to_use: "Use only when the user explicitly requests file creation/modification."
                 .to_string(),
         },
         ToolPromptSpec {
-            name: "mkdir".to_string(),
+            name: tools::MKDIR.to_string(),
             description: "Create a directory under tool_root recursively (mkdir -p behavior)."
                 .to_string(),
             when_to_use:
@@ -208,7 +330,7 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
                     .to_string(),
         },
         ToolPromptSpec {
-            name: "rmdir".to_string(),
+            name: tools::RMDIR.to_string(),
             description:
                 "Remove a directory under tool_root recursively (including all children)."
                     .to_string(),
@@ -217,14 +339,14 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
                     .to_string(),
         },
         ToolPromptSpec {
-            name: "shell_list_allowed".to_string(),
+            name: tools::SHELL_LIST_ALLOWED.to_string(),
             description: "Return currently enabled tools and allowed shell commands.".to_string(),
             when_to_use:
                 "Use first when you are unsure which tool operations/commands are currently allowed."
                     .to_string(),
         },
         ToolPromptSpec {
-            name: "shell_exec".to_string(),
+            name: tools::SHELL_EXEC.to_string(),
             description:
                 "Run an allowed external command with explicit argv (no shell expression). Args schema: {\"command\":\"<allowed>\",\"args\":[...],\"cwd\":\"optional\",\"max_output_bytes\":131072}. Supports built-in helper command `cwd`."
                     .to_string(),
@@ -233,7 +355,7 @@ fn default_tool_prompt_specs() -> Vec<ToolPromptSpec> {
                     .to_string(),
         },
         ToolPromptSpec {
-            name: "shell_request_allowed".to_string(),
+            name: tools::SHELL_REQUEST_ALLOWED.to_string(),
             description:
                 "Request operator approval for a command that is not currently in allowed shell commands."
                     .to_string(),
@@ -437,7 +559,7 @@ struct Cli {
     )]
     model: String,
 
-    #[arg(long, required_unless_present = "show_features", default_value = "")]
+    #[arg(long, default_value = "")]
     prompt: String,
 
     #[arg(
@@ -494,7 +616,23 @@ struct Cli {
     #[arg(long = "system-prompt", default_value = "You are a helpful assistant.")]
     system_prompt: String,
 
-    #[arg(long)]
+    #[arg(
+        long = "mode",
+        value_parser = parse_operation_mode,
+        default_value = "oneshot",
+        help = "Operation mode: oneshot (single request) or repl (interactive loop)"
+    )]
+    mode: CliOperationMode,
+
+    #[arg(
+        long = "allowed-tools",
+        env = "GGUF_ALLOWED_TOOLS",
+        value_name = "list",
+        help = "Allowed tool names: comma-separated list, or all/none. Use none to disable all tools. Defaults: oneshot=none, repl=all"
+    )]
+    allowed_tools: Option<String>,
+
+    #[arg(long, hide = true)]
     agent: bool,
 
     #[arg(long = "tool-root", value_name = "path")]
@@ -683,7 +821,8 @@ pub(crate) struct CliOptions {
     pub(crate) context_size: usize,
     pub(crate) threads: Option<usize>,
     pub(crate) system_prompt: String,
-    pub(crate) agent: bool,
+    pub(crate) mode: CliOperationMode,
+    pub(crate) tools_enabled: bool,
     pub(crate) tool_root: Option<String>,
     pub(crate) tool_enablement: AgentToolEnablement,
     pub(crate) allow_shell_commands: Vec<String>,
@@ -726,22 +865,54 @@ pub(crate) struct CliOptions {
 impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
+        let mode = cli.mode;
+        let mut allowed_tools = match cli.allowed_tools.as_deref() {
+            Some(raw) => parse_allowed_tools(raw)?,
+            None => {
+                if matches!(mode, CliOperationMode::Repl) {
+                    tools::all_tool_name_set()
+                } else {
+                    BTreeSet::new()
+                }
+            }
+        };
+        if cli.agent {
+            if cli.allowed_tools.is_none() {
+                allowed_tools = tools::all_tool_name_set();
+            } else if allowed_tools.is_empty() {
+                return Err(
+                    "conflicting flags: --agent cannot be combined with --allowed-tools=none"
+                        .to_string(),
+                );
+            }
+        }
+        let requested_tools_enabled = !allowed_tools.is_empty();
+        if !cli.show_features
+            && matches!(mode, CliOperationMode::Oneshot)
+            && cli.prompt.trim().is_empty()
+        {
+            return Err("`--prompt` is required in oneshot mode".to_string());
+        }
         let tool_prompt_specs = default_tool_prompt_specs();
-        let loaded_shell = if cli.agent {
+        let loaded_shell = if requested_tools_enabled {
             load_shell_config_from_config()?
         } else {
             LoadedShellConfig::default()
         };
-        let tool_enablement = if cli.agent {
+        let mut tool_enablement = if requested_tools_enabled {
             load_tool_enablement_from_config()?
         } else {
-            AgentToolEnablement::default()
+            AgentToolEnablement::disabled()
         };
+        tool_enablement.apply_allowlist(&allowed_tools);
+        let tools_enabled = tool_enablement.has_any_enabled();
         let LoadedShellConfig {
             allowed_commands: mut allow_shell_commands,
             description_specs: shell_command_description_specs,
         } = loaded_shell;
-        allow_shell_commands.extend(cli.allow_shell_commands);
+        if requested_tools_enabled {
+            allow_shell_commands.extend(cli.allow_shell_commands);
+        }
         let allow_shell_commands = normalize_shell_command_values(allow_shell_commands);
 
         Ok(Self {
@@ -759,7 +930,8 @@ impl CliOptions {
             context_size: cli.context_size,
             threads: cli.threads,
             system_prompt: cli.system_prompt,
-            agent: cli.agent,
+            mode,
+            tools_enabled,
             tool_root: cli.tool_root,
             tool_enablement,
             allow_shell_commands,
@@ -798,5 +970,34 @@ impl CliOptions {
             layer_debug: cli.layer_debug,
             layer_debug_pos: cli.layer_debug_pos,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_mentions_allowed_tools_none() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help)
+            .expect("failed to render long help");
+        let help_text = String::from_utf8(help).expect("help output was not valid utf-8");
+        assert!(
+            help_text.contains("--allowed-tools <list>"),
+            "expected --allowed-tools to be present in help output"
+        );
+        assert!(
+            help_text.contains("Use none to disable all tools"),
+            "expected --allowed-tools help to mention that none disables all tools"
+        );
+    }
+
+    #[test]
+    fn parse_allowed_tools_none_disables_all_tools() {
+        let parsed = parse_allowed_tools("none").expect("failed to parse none");
+        assert!(parsed.is_empty(), "none should disable all tools");
     }
 }

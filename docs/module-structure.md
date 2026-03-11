@@ -16,8 +16,8 @@ src/
     mod.rs
     generation.rs
     agent.rs
-    tools.rs
   cli.rs
+  tools.rs
   engine/
     mod.rs
     types.rs
@@ -78,7 +78,15 @@ src/
     - `--image` (`png/jpg/jpeg/webp`)
     - `--video` (`mp4`)
     - `--audio` (extension-agnostic validation in current scaffold)
-  - route to standard generation mode or tool-agent mode
+  - route by operation mode:
+    - `oneshot`: single prompt execution
+    - `repl`: interactive question/answer loop with slash commands (`/help`, `/model`, `/exit`, `/quit`) and tab-completion for slash-command prefixes
+  - routes plain text-only non-agent turns through `generate_text(...)`; uses structured `GenerationRequest` execution only when media inputs are present
+  - tool-agent support is orthogonal to operation mode:
+    - default `allowed-tools=none` in `oneshot`
+    - default `allowed-tools=all` in `repl`
+    - when tools are enabled, requests are handled via `app::agent`
+    - when tools are disabled, requests are handled via standard generation
   - print profiling/timing summaries
 
 ### `src/app/generation.rs`
@@ -112,21 +120,29 @@ src/
       - Gemma3 sidecar path uses `<start_of_image>`/`<end_of_image>` prompt markers and SigLIP-style projector pooling
     - think-tag decode safeguards:
       - hidden-think mode enforces bounded think/total token caps
-      - visible-think mode enforces a bounded think phase and auto-closes missing `</think>` when exceeded
+      - visible-think mode reserves answer budget after `</think>`, enforces a bounded think phase, and auto-closes missing `</think>` when exceeded
+    - structured-output decode safeguards:
+      - generic structured-output mode selector in generation settings
+      - current `agent-json` mode seeds a compact JSON prefix for tool-agent turns
+      - lexical/schema-aware token masking for `tool_call` / `final` responses
+      - stop after first complete top-level JSON object
     - explicit current-state errors for unimplemented native video/audio embedding execution
   - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
 
 ### `src/app/agent.rs`
 
 - Tool-agent orchestration loop for multi-step runs.
+- Entrypoint accepts per-turn prompt text, so the same agent loop can be used from both `oneshot` and `repl` modes.
 - Builds turn prompt transcript, requests one model response per turn, and parses JSON outputs.
+- Agent replies are expected as compact single-object JSON with fixed key order; runtime constrains decode to the two supported schemas.
 - Builds system prompt with tool catalog metadata (description / when-to-use) and optional allowed-shell-command descriptions supplied by `cli`.
-- Executes tool calls through `app::tools::ToolExecutor` and appends tool results back into transcript.
+- Executes tool calls through `tools::ToolExecutor` and appends tool results back into transcript.
 - Terminates on `final` response or configured tool-call limit.
 
-### `src/app/tools.rs`
+### `src/tools.rs`
 
-- Host-side tool execution for agent mode.
+- Host-side tool execution + canonical tool-name catalog.
+- Defines stable tool-name constants and `ALL_TOOL_NAMES` used by both `cli` and tool dispatch.
 - Provides safe file tools:
   - `read_file`
   - `write_file`
@@ -151,8 +167,11 @@ src/
 - Supports single-source command metadata in `[shell.cmd]` (key=command, value=description); `[shell.md]` and older formats remain accepted for compatibility.
 - Supports optional tool config in `[tools]`:
   - internal tool toggles (all default enabled)
-- Includes agent-related switches:
-  - `--agent`
+- Includes operation/tool-mode switches:
+  - `--mode oneshot|repl`
+  - `--allowed-tools <list>` (comma-separated tool names, or `all` / `none`, validated against `tools::ALL_TOOL_NAMES`)
+  - hidden compatibility alias `--agent` (maps to tools-enabled behavior)
+- Includes agent/tool related switches:
   - `--tool-root`
   - `--allow-shell-command`
   - `--max-tool-calls`
@@ -189,6 +208,7 @@ src/
   - Extended model identity flags:
     - `Config::is_qwen35`
     - `Config::rope_sections` for Qwen3.5 M-RoPE section metadata
+    - `Config::online_attn_fusion` for vendor-selected dense-attention fast paths
   - Unix mmap wrapper (`MappedFile`) including Linux memory advice hints for model mappings
   - `ensure_model_range(...)` helper used by quantized matmul paths (currently a no-op in local-file mode).
   - GGUF metadata value variants include integer arrays (`I64Array`) for keys such as `*.rope.dimension_sections`.
@@ -312,10 +332,12 @@ src/
   - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
   - Builds `Config` from family-specific key conventions.
   - Detects `qwen35` explicitly and maps it onto the Qwen3Next-style runtime path.
+  - Keeps `qwen35*` checkpoints on `qwen35` vendor prompt/decode policies even when the runtime executes their recurrent/SSM layers through the Qwen3Next-style engine path.
+  - Sets generic runtime feature flags on `Config` from vendor/model metadata so engine code can consume runtime behavior without new family branches.
   - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `gemma3`, `qwen3vl`, and `qwen35`.
   - Performs vendor-specific mmproj sidecar compatibility checks (`validate_mmproj_for_backend(...)`) including projector type, projection dim matching, and Qwen family/deepstack guards.
   - Dispatches vendor policies used by app/tokenizer decode paths:
-    - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`)
+    - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`, think-recovery toggles)
     - `tokenizer_policy(...)` returning `VendorTokenizerPolicy`
     - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
     - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
@@ -345,12 +367,12 @@ src/
   - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths and image spans on Gemma multimodal path.
   - runtime validates prompt/media alignment before starting preprocessing.
   - if native multimodal tensors are unavailable, runtime fails with a qualified native-capability error that includes architecture/token/tensor probe details.
-  - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, stop-token matching, and deterministic loop-guard behavior.
+  - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, stop-token matching, deterministic loop-guard behavior, and vendor-enabled think-recovery retries.
   - token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`); native media embedding injection remains in progress.
 10. Agent mode:
   - tool transcript prompt encoded per turn
   - model emits JSON `tool_call` / `final`
-  - host executes tool call (`app::tools`) and loops until final response or limit.
+  - host executes tool call (`tools`) and loops until final response or limit.
   - `shell_exec` calls are restricted to CLI/env-provided allowed commands; model can request missing commands with `shell_request_allowed`.
 11. Profiling/timings printed from `engine::profiling` + `app::run()`.
 

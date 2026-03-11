@@ -1343,7 +1343,7 @@ fn transformer_inner(
             // Number of Q4 scale blocks per full kv_dim row; head_size/Q4_BLOCK_SIZE per KV head.
             let blocks_per_head = head_size / Q4_BLOCK_SIZE;
             let (att_all, xb_all) = (&mut s.att[..p.n_heads * p.seq_len], &mut s.xb[..q_dim]);
-            let fuse_qwen35_online_attn = p.is_qwen35;
+            let fuse_qwen35_online_attn = p.online_attn_fusion;
 
             if p.n_heads >= par_attn_min_heads() {
                 att_all

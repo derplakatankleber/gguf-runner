@@ -1,9 +1,8 @@
 use crate::app::generation::ModelRuntime;
-use crate::app::tools::ToolExecutor;
 use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
+use crate::tools::ToolExecutor;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
 
 struct AgentMessage {
     role: &'static str,
@@ -17,7 +16,11 @@ enum AgentResponse {
     ToolCall { tool: String, args: Option<Value> },
 }
 
-pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Result<(), String> {
+pub(crate) fn run_agent_loop(
+    runtime: &mut ModelRuntime,
+    cli: &CliOptions,
+    prompt: &str,
+) -> Result<(), String> {
     let tool_exec = ToolExecutor::new(
         cli.tool_root.as_deref(),
         cli.tool_enablement.clone(),
@@ -31,18 +34,28 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
     );
     let mut transcript = vec![AgentMessage {
         role: "user",
-        content: cli.prompt.clone(),
+        content: prompt.to_string(),
     }];
     let mut tool_calls = 0usize;
     let mut protocol_failures = 0usize;
     let max_protocol_failures = 3usize;
-    let max_turns = cli.max_tool_calls.saturating_mul(3).saturating_add(8);
+    let max_turns = cli
+        .max_tool_calls
+        .saturating_mul(3)
+        .saturating_add(8)
+        .min(64);
     let require_tool_before_final =
-        prompt_requires_filesystem(&cli.prompt) && tool_exec.has_any_filesystem_tool();
+        prompt_requires_filesystem(prompt) && tool_exec.has_any_filesystem_tool();
 
-    for _turn in 0..max_turns {
-        let prompt = build_turn_prompt(&transcript);
-        let raw = runtime.generate_text(&prompt, &system_prompt, false)?;
+    for turn in 0..max_turns {
+        if cli.debug {
+            eprintln!("Agent turn {}/{}", turn + 1, max_turns);
+        }
+        let turn_prompt = build_turn_prompt(&transcript);
+        let raw = runtime.generate_text_for_agent(&turn_prompt, &system_prompt, false)?;
+        if cli.debug {
+            eprintln!("Agent raw output bytes: {}", raw.len());
+        }
         match parse_agent_response(&raw) {
             Ok(AgentResponse::Final { content }) => {
                 if require_tool_before_final && tool_calls == 0 {
@@ -54,12 +67,8 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
                         );
                     }
                     transcript.push(AgentMessage {
-                        role: "assistant",
-                        content,
-                    });
-                    transcript.push(AgentMessage {
                         role: "user",
-                        content: "You must call at least one filesystem tool before finalizing this request."
+                        content: "You must call at least one filesystem tool before finalizing this request. Reply with exactly one JSON object: either a tool_call or final."
                             .to_string(),
                     });
                     continue;
@@ -76,6 +85,9 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
                 }
                 tool_calls += 1;
                 let args = args.unwrap_or_else(|| json!({}));
+                let args_json =
+                    serde_json::to_string(&args).unwrap_or_else(|_| "<invalid-json>".to_string());
+                eprintln!("Tool call [{}]: {} args={}", tool_calls, tool, args_json);
                 let tool_result = match tool_exec.execute(&tool, &args) {
                     Ok(v) => v,
                     Err(e) => {
@@ -130,22 +142,54 @@ pub(crate) fn run_agent_loop(runtime: &mut ModelRuntime, cli: &CliOptions) -> Re
                 });
             }
             Err(parse_error) => {
+                if cli.debug {
+                    let preview = raw.trim().chars().take(180).collect::<String>();
+                    eprintln!(
+                        "Agent protocol parse error: {} | preview: {}",
+                        parse_error, preview
+                    );
+                }
+                let fallback = raw.trim();
+                let fallback_looks_like_json = fallback.starts_with('{');
+                if tool_calls > 0
+                    && !fallback.is_empty()
+                    && !fallback_looks_like_json
+                    && looks_like_reasonable_fallback_text(fallback)
+                {
+                    if cli.debug {
+                        eprintln!(
+                            "Agent protocol fallback after tool call(s): {}",
+                            parse_error
+                        );
+                    }
+                    println!("{fallback}");
+                    return Ok(());
+                }
                 protocol_failures += 1;
                 if protocol_failures > max_protocol_failures {
+                    if !require_tool_before_final {
+                        let fallback = raw.trim();
+                        if !fallback.is_empty() {
+                            println!("{fallback}");
+                            return Ok(());
+                        }
+                    }
                     let raw_preview = raw.trim().chars().take(240).collect::<String>();
                     return Err(format!(
                         "model did not follow agent JSON protocol after {} attempts: {}. Last output: {}",
                         max_protocol_failures, parse_error, raw_preview
                     ));
                 }
-                transcript.push(AgentMessage {
-                    role: "assistant",
-                    content: raw.trim().to_string(),
-                });
+                let mut protocol_msg = "Protocol error: reply with exactly one JSON object only. Use either {\"type\":\"tool_call\",\"tool\":\"...\",\"args\":{...}} or {\"type\":\"final\",\"content\":\"...\"}."
+                    .to_string();
+                if require_tool_before_final && tool_calls == 0 {
+                    protocol_msg.push_str(
+                        " For this request you must call a filesystem tool before final.",
+                    );
+                }
                 transcript.push(AgentMessage {
                     role: "user",
-                    content: "Protocol error: reply with exactly one JSON object only. Use either {\"type\":\"tool_call\",\"tool\":\"...\",\"args\":{...}} or {\"type\":\"final\",\"content\":\"...\"}."
-                        .to_string(),
+                    content: protocol_msg,
                 });
             }
         }
@@ -160,6 +204,14 @@ fn build_agent_system_prompt(
     tool_prompt_specs: &[ToolPromptSpec],
     shell_command_description_specs: &[ShellCommandDescriptionSpec],
 ) -> String {
+    let _metadata_bytes: usize = tool_prompt_specs
+        .iter()
+        .map(|s| s.name.len() + s.description.len() + s.when_to_use.len())
+        .sum::<usize>()
+        + shell_command_description_specs
+            .iter()
+            .map(|s| s.command.len() + s.description.len())
+            .sum::<usize>();
     let write_state = if tool_exec.write_file_enabled() {
         "enabled"
     } else {
@@ -177,15 +229,11 @@ fn build_agent_system_prompt(
         tool_exec.shell_allowed_commands().join(", ")
     };
     let tool_rules = render_tool_rules(tool_exec);
-    let tool_catalog = render_tool_catalog(tool_prompt_specs, &enabled_tools);
-    let shell_command_catalog = render_shell_command_catalog(
-        tool_exec.shell_allowed_commands(),
-        shell_command_description_specs,
-    );
     format!(
         "{base_system_prompt}\n\n\
-You are running with host tools. \
+You are running with host tools.\n\
 Always respond with exactly one JSON object and no surrounding markdown.\n\
+Use compact JSON on a single line, with keys in the exact order shown below.\n\
 Allowed response schemas:\n\
 1) Tool call:\n\
 {{\"type\":\"tool_call\",\"tool\":\"{}\",\"args\":{{...}}}}\n\
@@ -193,23 +241,47 @@ Allowed response schemas:\n\
 {{\"type\":\"final\",\"content\":\"...\"}}\n\
 Rules:\n\
 {}\n\
-Tool constraints:\n\
+Runtime constraints:\n\
 - tool_root: {}\n\
 - write_file: {}\n\
 - shell allowed commands: {}\n\
 - max read/write payload per call: 262144 bytes\n\
-Tool catalog (description, when_to_use):\n\
-{}\n\
-Allowed shell commands (with optional description):\n\
-{}\n",
+Output rules:\n\
+- If the user asks about files/repo contents and filesystem tools are enabled, call a filesystem tool before final.\n\
+- If a tool call fails due args shape, fix the args and retry.\n\
+- Avoid prose outside the single JSON object.\n",
         allowed_tool_names,
         tool_rules,
         tool_exec.root().display(),
         write_state,
-        shell_allowed_commands,
-        tool_catalog,
-        shell_command_catalog
+        shell_allowed_commands
     )
+}
+
+fn looks_like_reasonable_fallback_text(text: &str) -> bool {
+    if text.len() < 24 || text.contains('\0') {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut humanish = 0usize;
+    let mut alpha = 0usize;
+    for c in text.chars() {
+        total += 1;
+        if c.is_ascii_alphabetic() {
+            alpha += 1;
+            humanish += 1;
+            continue;
+        }
+        if c.is_ascii_whitespace() || c.is_ascii_punctuation() || c.is_ascii_digit() {
+            humanish += 1;
+        }
+    }
+    if total == 0 {
+        return false;
+    }
+    let humanish_ratio = humanish as f32 / total as f32;
+    let alpha_ratio = alpha as f32 / total as f32;
+    humanish_ratio > 0.92 && alpha_ratio > 0.08
 }
 
 fn render_tool_rules(tool_exec: &ToolExecutor) -> String {
@@ -241,53 +313,6 @@ fn render_tool_rules(tool_exec: &ToolExecutor) -> String {
     rules.join("\n")
 }
 
-fn render_tool_catalog(tool_prompt_specs: &[ToolPromptSpec], enabled_tools: &[&str]) -> String {
-    if enabled_tools.is_empty() {
-        return "- <none>\n".to_string();
-    }
-    let enabled_set = enabled_tools.iter().copied().collect::<BTreeSet<_>>();
-    let mut out = String::new();
-    for spec in tool_prompt_specs {
-        if !enabled_set.contains(spec.name.as_str()) {
-            continue;
-        }
-        out.push_str("- ");
-        out.push_str(&spec.name);
-        out.push('\n');
-        out.push_str("  description: ");
-        out.push_str(spec.description.trim());
-        out.push('\n');
-        out.push_str("  when_to_use: ");
-        out.push_str(spec.when_to_use.trim());
-        out.push('\n');
-    }
-    out
-}
-
-fn render_shell_command_catalog(
-    allowed_commands: &[String],
-    shell_command_description_specs: &[ShellCommandDescriptionSpec],
-) -> String {
-    if allowed_commands.is_empty() {
-        return "- <none>\n".to_string();
-    }
-    let mut description_by_command = BTreeMap::new();
-    for spec in shell_command_description_specs {
-        description_by_command.insert(spec.command.as_str(), spec.description.as_str());
-    }
-    let mut out = String::new();
-    for command in allowed_commands {
-        out.push_str("- ");
-        out.push_str(command);
-        if let Some(description) = description_by_command.get(command.as_str()) {
-            out.push_str(": ");
-            out.push_str(description);
-        }
-        out.push('\n');
-    }
-    out
-}
-
 fn build_turn_prompt(transcript: &[AgentMessage]) -> String {
     let mut out = String::from("Transcript:\n");
     for msg in transcript {
@@ -306,12 +331,21 @@ fn parse_agent_response(raw: &str) -> Result<AgentResponse, String> {
         return Ok(parsed);
     }
 
-    let value = extract_first_json_value(raw)
-        .ok_or_else(|| "no JSON object found in model output".to_string())?;
-    if let Ok(parsed) = serde_json::from_value::<AgentResponse>(value.clone()) {
-        return Ok(parsed);
+    let mut saw_json_object = false;
+    for value in extract_json_objects(raw) {
+        saw_json_object = true;
+        if let Ok(parsed) = serde_json::from_value::<AgentResponse>(value.clone()) {
+            return Ok(parsed);
+        }
+        if let Ok(parsed) = parse_agent_response_from_value(value) {
+            return Ok(parsed);
+        }
     }
-    parse_agent_response_from_value(value)
+    if saw_json_object {
+        Err("unsupported agent response payload".to_string())
+    } else {
+        Err("no JSON object found in model output".to_string())
+    }
 }
 
 fn parse_agent_response_from_value(value: Value) -> Result<AgentResponse, String> {
@@ -337,18 +371,19 @@ fn parse_agent_response_from_value(value: Value) -> Result<AgentResponse, String
     Err("unsupported agent response payload".to_string())
 }
 
-fn extract_first_json_value(raw: &str) -> Option<Value> {
+fn extract_json_objects(raw: &str) -> Vec<Value> {
+    let mut values = Vec::new();
     for (idx, ch) in raw.char_indices() {
         if ch != '{' {
             continue;
         }
         if let Some(v) = parse_first_json_value(&raw[idx..]) {
             if v.is_object() {
-                return Some(v);
+                values.push(v);
             }
         }
     }
-    None
+    values
 }
 
 fn parse_first_json_value(s: &str) -> Option<Value> {
@@ -373,4 +408,15 @@ fn prompt_requires_filesystem(prompt: &str) -> bool {
         "codebase",
     ];
     hints.iter().any(|h| p.contains(h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_reasonable_fallback_text;
+
+    #[test]
+    fn fallback_text_guard_rejects_numeric_gibberish() {
+        let gibberish = "000003 010 1000 200000101 01 600006 00000 000106 40 00016560";
+        assert!(!looks_like_reasonable_fallback_text(gibberish));
+    }
 }

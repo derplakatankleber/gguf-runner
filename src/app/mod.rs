@@ -1,7 +1,7 @@
 mod agent;
 mod generation;
-mod tools;
 
+use crate::cli::CliOperationMode;
 use crate::cli::CliOptions;
 use crate::engine::profiling::{print_profile_report, profiling_reset, set_profiling_enabled};
 #[cfg(target_arch = "aarch64")]
@@ -12,7 +12,8 @@ use crate::engine::switches::{
 };
 use crate::engine::types::{ContentPart, GenerationRequest, MediaRef};
 use std::fs;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const MAX_IMAGES: usize = 10;
@@ -25,6 +26,7 @@ const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4"];
+const REPL_COMMANDS: [&str; 4] = ["help", "model", "exit", "quit"];
 
 fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCacheMode> {
     mode.map(|v| match v {
@@ -225,6 +227,29 @@ pub(crate) fn run() -> Result<(), String> {
     }
 
     if cli.debug {
+        let workspace_root = match cli.tool_root.as_deref() {
+            Some(raw) => PathBuf::from(raw),
+            None => match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("Tool workspace root: <failed to read current directory: {e}>");
+                    PathBuf::from(".")
+                }
+            },
+        };
+        match workspace_root.canonicalize() {
+            Ok(root) => eprintln!("Tool workspace root: {}", root.display()),
+            Err(e) => eprintln!(
+                "Tool workspace root: <cannot resolve '{}': {e}>",
+                workspace_root.display()
+            ),
+        }
+        let enabled_tools = cli.tool_enablement.enabled_tool_names();
+        if enabled_tools.is_empty() {
+            eprintln!("Allowed tools: none");
+        } else {
+            eprintln!("Allowed tools: {}", enabled_tools.join(", "));
+        }
         eprintln!(
             "Parallel thresholds: matmul_min_rows={}, matmul_chunk_rows={}, attn_min_heads={}, qwen3next_min_heads={}",
             par_matmul_min_rows(),
@@ -241,33 +266,13 @@ pub(crate) fn run() -> Result<(), String> {
     }
 
     let mut runtime = generation::ModelRuntime::load(&cli)?;
-    if cli.agent {
-        if !cli.images.is_empty() || !cli.videos.is_empty() || !cli.audios.is_empty() {
-            return Err(
-                "`--image/--video/--audio` are not supported together with `--agent` yet"
-                    .to_string(),
-            );
+    match cli.mode {
+        CliOperationMode::Oneshot => {
+            run_oneshot_mode(&mut runtime, &cli)?;
         }
-        agent::run_agent_loop(&mut runtime, &cli)?;
-    } else {
-        let images = validate_media_paths(
-            &cli.images,
-            "image",
-            MAX_IMAGES,
-            MAX_IMAGE_BYTES,
-            Some(IMAGE_EXTENSIONS),
-        )?;
-        let videos = validate_media_paths(
-            &cli.videos,
-            "video",
-            MAX_VIDEOS,
-            MAX_VIDEO_BYTES,
-            Some(VIDEO_EXTENSIONS),
-        )?;
-        let audios = validate_media_paths(&cli.audios, "audio", MAX_AUDIOS, MAX_AUDIO_BYTES, None)?;
-        let request =
-            build_generation_request(&cli.prompt, &cli.system_prompt, images, videos, audios);
-        let _ = runtime.generate_request(&request, true)?;
+        CliOperationMode::Repl => {
+            run_repl_mode(&mut runtime, &cli)?;
+        }
     }
 
     if cli.profiling {
@@ -280,6 +285,179 @@ pub(crate) fn run() -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+fn run_oneshot_mode(
+    runtime: &mut generation::ModelRuntime,
+    cli: &CliOptions,
+) -> Result<(), String> {
+    if cli.tools_enabled {
+        if !cli.images.is_empty() || !cli.videos.is_empty() || !cli.audios.is_empty() {
+            return Err(
+                "`--image/--video/--audio` are not supported together with tools mode yet"
+                    .to_string(),
+            );
+        }
+        return agent::run_agent_loop(runtime, cli, &cli.prompt);
+    }
+
+    let images = validate_media_paths(
+        &cli.images,
+        "image",
+        MAX_IMAGES,
+        MAX_IMAGE_BYTES,
+        Some(IMAGE_EXTENSIONS),
+    )?;
+    let videos = validate_media_paths(
+        &cli.videos,
+        "video",
+        MAX_VIDEOS,
+        MAX_VIDEO_BYTES,
+        Some(VIDEO_EXTENSIONS),
+    )?;
+    let audios = validate_media_paths(&cli.audios, "audio", MAX_AUDIOS, MAX_AUDIO_BYTES, None)?;
+    let request = build_generation_request(&cli.prompt, &cli.system_prompt, images, videos, audios);
+    let _ = runtime.generate_request(&request, true)?;
+    Ok(())
+}
+
+fn run_repl_mode(runtime: &mut generation::ModelRuntime, cli: &CliOptions) -> Result<(), String> {
+    if !cli.images.is_empty() || !cli.videos.is_empty() || !cli.audios.is_empty() {
+        return Err("`--image/--video/--audio` are not supported in repl mode yet".to_string());
+    }
+
+    eprintln!("Entering repl mode. Type /help for commands.");
+    if !cli.prompt.trim().is_empty() {
+        match handle_repl_command(cli, cli.prompt.trim()) {
+            ReplCommandAction::Exit => return Ok(()),
+            ReplCommandAction::Handled => {}
+            ReplCommandAction::ModelPrompt(prompt) => {
+                if let Err(e) = run_repl_turn(runtime, cli, prompt) {
+                    eprintln!("Turn failed: {e}");
+                }
+            }
+        }
+    }
+
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("stdout flush failed: {e}"))?;
+        let mut line = String::new();
+        let read = stdin
+            .read_line(&mut line)
+            .map_err(|e| format!("stdin read failed: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let completed = expand_repl_tab_completion(line);
+        let input = completed.trim();
+        match handle_repl_command(cli, input) {
+            ReplCommandAction::Exit => break,
+            ReplCommandAction::Handled => continue,
+            ReplCommandAction::ModelPrompt(prompt) => {
+                if let Err(e) = run_repl_turn(runtime, cli, prompt) {
+                    eprintln!("Turn failed: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum ReplCommandAction<'a> {
+    Exit,
+    Handled,
+    ModelPrompt(&'a str),
+}
+
+fn handle_repl_command<'a>(cli: &CliOptions, input: &'a str) -> ReplCommandAction<'a> {
+    let Some(raw_cmd) = input.strip_prefix('/') else {
+        return ReplCommandAction::ModelPrompt(input);
+    };
+    let cmd = raw_cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match cmd.as_str() {
+        "" => {
+            eprintln!("Empty command. Type /help for commands.");
+            ReplCommandAction::Handled
+        }
+        "help" => {
+            print_repl_help();
+            ReplCommandAction::Handled
+        }
+        "model" => {
+            println!("{}", cli.model);
+            ReplCommandAction::Handled
+        }
+        "exit" | "quit" => ReplCommandAction::Exit,
+        _ => {
+            eprintln!("Unknown command '/{}'. Type /help for commands.", cmd);
+            ReplCommandAction::Handled
+        }
+    }
+}
+
+fn expand_repl_tab_completion(input: &str) -> String {
+    let Some(raw_cmd) = input.strip_prefix('/') else {
+        return input.to_string();
+    };
+    let Some(tab_pos) = raw_cmd.find('\t') else {
+        return input.to_string();
+    };
+    let before_tab = &raw_cmd[..tab_pos];
+    if before_tab.is_empty() || before_tab.contains(char::is_whitespace) {
+        return input.replace('\t', "");
+    }
+    let mut matches = REPL_COMMANDS
+        .iter()
+        .copied()
+        .filter(|cmd| cmd.starts_with(before_tab));
+    let first = matches.next();
+    let second = matches.next();
+    if let (Some(cmd), None) = (first, second) {
+        return format!("/{cmd}");
+    }
+    input.replace('\t', "")
+}
+
+fn print_repl_help() {
+    println!("REPL commands:");
+    println!("  /help   Show this help");
+    println!("  /model  Show active model path");
+    println!("  /exit   Exit REPL");
+    println!("  /quit   Exit REPL");
+    println!("  /e<Tab> expands to /exit");
+}
+
+fn run_repl_turn(
+    runtime: &mut generation::ModelRuntime,
+    cli: &CliOptions,
+    prompt: &str,
+) -> Result<(), String> {
+    if cli.tools_enabled {
+        return agent::run_agent_loop(runtime, cli, prompt);
+    }
+
+    let request = build_generation_request(
+        prompt,
+        &cli.system_prompt,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let _ = runtime.generate_request(&request, true)?;
     Ok(())
 }
 
@@ -350,5 +528,25 @@ fn build_generation_request(
     GenerationRequest {
         system_prompt: system_prompt.to_string(),
         parts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_repl_tab_completion;
+
+    #[test]
+    fn repl_tab_completion_completes_exit() {
+        assert_eq!(expand_repl_tab_completion("/e\t"), "/exit");
+    }
+
+    #[test]
+    fn repl_tab_completion_completes_model() {
+        assert_eq!(expand_repl_tab_completion("/mo\t"), "/model");
+    }
+
+    #[test]
+    fn repl_tab_completion_ambiguous_prefix_keeps_slash_only() {
+        assert_eq!(expand_repl_tab_completion("/\t"), "/");
     }
 }

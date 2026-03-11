@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod engine;
+mod tools;
 mod vendors;
 
 fn main() {

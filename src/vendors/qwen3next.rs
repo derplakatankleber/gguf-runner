@@ -76,6 +76,7 @@ pub(super) fn decode_policy(config: &Config) -> VendorDecodePolicy {
         recover_early_endoftext_once: true,
         early_endoftext_recover_max_tokens: 192,
         hidden_think_token_cap_base: 384,
+        retry_without_think_when_no_post_think_text: false,
     }
 }
 

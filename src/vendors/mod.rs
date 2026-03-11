@@ -25,6 +25,7 @@ pub(crate) struct VendorDecodePolicy {
     pub(crate) recover_early_endoftext_once: bool,
     pub(crate) early_endoftext_recover_max_tokens: usize,
     pub(crate) hidden_think_token_cap_base: usize,
+    pub(crate) retry_without_think_when_no_post_think_text: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -402,6 +403,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let key_ssm_state_size = format!("{key_prefix}.ssm.state_size");
     let key_ssm_time_step_rank = format!("{key_prefix}.ssm.time_step_rank");
     let key_ssm_group_count = format!("{key_prefix}.ssm.group_count");
+    let key_full_attention_interval = format!("{key_prefix}.full_attention_interval");
 
     let chat_template = get_gguf_string_from_map(&gguf.kv, "tokenizer.chat_template")
         .unwrap_or_default()
@@ -437,13 +439,14 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe || is_qwen3vlmoe_arch,
         is_qwen3next: identity.family == ModelFamily::Qwen3Next
             || identity.family == ModelFamily::Qwen35,
+        online_attn_fusion: false,
         qwen_chat_template_contains_think: chat_template.contains("<think>"),
         qwen_chat_template_has_builtin_system: chat_template.contains("you are qwen"),
         capabilities,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
         rope_theta_swa: get_gguf_float_from_map(&gguf.kv, &key_rope_swa, 10_000.0),
-        swa_pattern: 6,
+        swa_pattern: get_gguf_int_from_map(&gguf.kv, &key_full_attention_interval, 6) as usize,
         ssm_conv_kernel: get_gguf_int_from_map(&gguf.kv, &key_ssm_conv_kernel, 0) as usize,
         ssm_inner_size: get_gguf_int_from_map(&gguf.kv, &key_ssm_inner_size, 0) as usize,
         ssm_state_size: get_gguf_int_from_map(&gguf.kv, &key_ssm_state_size, 0) as usize,
@@ -473,6 +476,8 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
             config.moe_routed_scaling_factor = 1.0;
         }
     }
+
+    config.online_attn_fusion = config.is_qwen35;
 
     config.n_kv_heads =
         get_gguf_int_from_map(&gguf.kv, &key_kv_heads, config.n_heads as i64) as usize;

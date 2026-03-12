@@ -1,12 +1,38 @@
+use crate::app::events::{emit_runtime_event, RuntimeEvent, RuntimeEventCallback};
 use crate::app::generation::ModelRuntime;
 use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
 use crate::tools::ToolExecutor;
+use crate::vendors::{ChatMessage, ChatRole};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 struct AgentMessage {
     role: &'static str,
     content: String,
+}
+
+pub(crate) enum AgentRunEvent {
+    Info(String),
+    Output(String),
+    Error(String),
+}
+
+pub(crate) struct AgentRunResult {
+    pub(crate) events: Vec<AgentRunEvent>,
+}
+
+fn push_agent_event(
+    events: &mut Vec<AgentRunEvent>,
+    event: AgentRunEvent,
+    callback: Option<&RuntimeEventCallback>,
+) {
+    let runtime_event = match &event {
+        AgentRunEvent::Info(text) => RuntimeEvent::Info(text.clone()),
+        AgentRunEvent::Output(text) => RuntimeEvent::Output(text.clone()),
+        AgentRunEvent::Error(text) => RuntimeEvent::Error(text.clone()),
+    };
+    emit_runtime_event(callback, runtime_event);
+    events.push(event);
 }
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +47,32 @@ pub(crate) fn run_agent_loop(
     cli: &CliOptions,
     prompt: &str,
 ) -> Result<(), String> {
+    let result = run_agent_loop_collect(runtime, cli, prompt)?;
+    for event in result.events {
+        match event {
+            AgentRunEvent::Info(text) => eprintln!("{text}"),
+            AgentRunEvent::Output(text) => println!("{text}"),
+            AgentRunEvent::Error(text) => eprintln!("{text}"),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn run_agent_loop_collect(
+    runtime: &mut ModelRuntime,
+    cli: &CliOptions,
+    prompt: &str,
+) -> Result<AgentRunResult, String> {
+    run_agent_loop_collect_with_history_callback(runtime, cli, &[], prompt, None)
+}
+
+pub(crate) fn run_agent_loop_collect_with_history_callback(
+    runtime: &mut ModelRuntime,
+    cli: &CliOptions,
+    prior_chat_history: &[ChatMessage],
+    prompt: &str,
+    callback: Option<&RuntimeEventCallback>,
+) -> Result<AgentRunResult, String> {
     let tool_exec = ToolExecutor::new(
         cli.tool_root.as_deref(),
         cli.tool_enablement.clone(),
@@ -32,12 +84,23 @@ pub(crate) fn run_agent_loop(
         &cli.tool_prompt_specs,
         &cli.shell_command_description_specs,
     );
-    let mut transcript = vec![AgentMessage {
+    let mut transcript = Vec::new();
+    for message in prior_chat_history {
+        transcript.push(AgentMessage {
+            role: match message.role {
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+            },
+            content: message.content.clone(),
+        });
+    }
+    transcript.push(AgentMessage {
         role: "user",
         content: prompt.to_string(),
-    }];
+    });
     let mut tool_calls = 0usize;
     let mut protocol_failures = 0usize;
+    let mut events = Vec::new();
     let max_protocol_failures = 3usize;
     let max_turns = cli
         .max_tool_calls
@@ -49,12 +112,32 @@ pub(crate) fn run_agent_loop(
 
     for turn in 0..max_turns {
         if cli.debug {
-            eprintln!("Agent turn {}/{}", turn + 1, max_turns);
+            push_agent_event(
+                &mut events,
+                AgentRunEvent::Info(format!("Agent turn {}/{}", turn + 1, max_turns)),
+                callback,
+            );
         }
         let turn_prompt = build_turn_prompt(&transcript);
-        let raw = runtime.generate_text_for_agent(&turn_prompt, &system_prompt, false)?;
+        let original_callback = runtime.runtime_event_callback();
+        let filtered_callback = callback.map(|outer| {
+            let outer = outer.clone();
+            std::sync::Arc::new(move |event: RuntimeEvent| {
+                if !matches!(event, RuntimeEvent::Output(_)) {
+                    outer(event);
+                }
+            }) as RuntimeEventCallback
+        });
+        runtime.set_runtime_event_callback(filtered_callback);
+        let raw = runtime.generate_text_for_agent(&turn_prompt, &system_prompt, false);
+        runtime.set_runtime_event_callback(original_callback);
+        let raw = raw?;
         if cli.debug {
-            eprintln!("Agent raw output bytes: {}", raw.len());
+            push_agent_event(
+                &mut events,
+                AgentRunEvent::Info(format!("Agent raw output bytes: {}", raw.len())),
+                callback,
+            );
         }
         match parse_agent_response(&raw) {
             Ok(AgentResponse::Final { content }) => {
@@ -73,8 +156,8 @@ pub(crate) fn run_agent_loop(
                     });
                     continue;
                 }
-                println!("{content}");
-                return Ok(());
+                push_agent_event(&mut events, AgentRunEvent::Output(content), callback);
+                return Ok(AgentRunResult { events });
             }
             Ok(AgentResponse::ToolCall { tool, args }) => {
                 if tool_calls >= cli.max_tool_calls {
@@ -87,12 +170,23 @@ pub(crate) fn run_agent_loop(
                 let args = args.unwrap_or_else(|| json!({}));
                 let args_json =
                     serde_json::to_string(&args).unwrap_or_else(|_| "<invalid-json>".to_string());
-                eprintln!("Tool call [{}]: {} args={}", tool_calls, tool, args_json);
+                push_agent_event(
+                    &mut events,
+                    AgentRunEvent::Info(format!(
+                        "Tool call [{}]: {} args={}",
+                        tool_calls, tool, args_json
+                    )),
+                    callback,
+                );
                 let tool_result = match tool_exec.execute(&tool, &args) {
                     Ok(v) => v,
                     Err(e) => {
                         if tool == "shell_exec" {
-                            eprintln!("shell_exec error: {e}");
+                            push_agent_event(
+                                &mut events,
+                                AgentRunEvent::Error(format!("shell_exec error: {e}")),
+                                callback,
+                            );
                         }
                         json!({
                             "ok": false,
@@ -116,11 +210,21 @@ pub(crate) fn run_agent_loop(
                         .unwrap_or("");
                     let stderr_preview = stderr.trim().chars().take(240).collect::<String>();
                     if stderr_preview.is_empty() {
-                        eprintln!("shell_exec failed (exit_code={exit_code})");
+                        push_agent_event(
+                            &mut events,
+                            AgentRunEvent::Error(format!(
+                                "shell_exec failed (exit_code={exit_code})"
+                            )),
+                            callback,
+                        );
                     } else {
-                        eprintln!(
-                            "shell_exec failed (exit_code={exit_code}): {}",
-                            stderr_preview
+                        push_agent_event(
+                            &mut events,
+                            AgentRunEvent::Error(format!(
+                                "shell_exec failed (exit_code={exit_code}): {}",
+                                stderr_preview
+                            )),
+                            callback,
                         );
                     }
                 }
@@ -144,9 +248,13 @@ pub(crate) fn run_agent_loop(
             Err(parse_error) => {
                 if cli.debug {
                     let preview = raw.trim().chars().take(180).collect::<String>();
-                    eprintln!(
-                        "Agent protocol parse error: {} | preview: {}",
-                        parse_error, preview
+                    push_agent_event(
+                        &mut events,
+                        AgentRunEvent::Error(format!(
+                            "Agent protocol parse error: {} | preview: {}",
+                            parse_error, preview
+                        )),
+                        callback,
                     );
                 }
                 let fallback = raw.trim();
@@ -157,21 +265,33 @@ pub(crate) fn run_agent_loop(
                     && looks_like_reasonable_fallback_text(fallback)
                 {
                     if cli.debug {
-                        eprintln!(
-                            "Agent protocol fallback after tool call(s): {}",
-                            parse_error
+                        push_agent_event(
+                            &mut events,
+                            AgentRunEvent::Info(format!(
+                                "Agent protocol fallback after tool call(s): {}",
+                                parse_error
+                            )),
+                            callback,
                         );
                     }
-                    println!("{fallback}");
-                    return Ok(());
+                    push_agent_event(
+                        &mut events,
+                        AgentRunEvent::Output(fallback.to_string()),
+                        callback,
+                    );
+                    return Ok(AgentRunResult { events });
                 }
                 protocol_failures += 1;
                 if protocol_failures > max_protocol_failures {
                     if !require_tool_before_final {
                         let fallback = raw.trim();
                         if !fallback.is_empty() {
-                            println!("{fallback}");
-                            return Ok(());
+                            push_agent_event(
+                                &mut events,
+                                AgentRunEvent::Output(fallback.to_string()),
+                                callback,
+                            );
+                            return Ok(AgentRunResult { events });
                         }
                     }
                     let raw_preview = raw.trim().chars().take(240).collect::<String>();

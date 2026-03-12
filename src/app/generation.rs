@@ -1,3 +1,6 @@
+use crate::app::events::{
+    emit_runtime_event, RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress,
+};
 use crate::cli::CliOptions;
 use crate::engine::io::{get_gguf_string_from_map, parse_gguf_file};
 use crate::engine::kernels::{argmax, sample, softmax, TopKSampler};
@@ -105,6 +108,7 @@ fn append_visible_text(
     output: &mut String,
     pending_newline: &mut bool,
     stream_stdout: bool,
+    callback: Option<&RuntimeEventCallback>,
 ) {
     if decoded.is_empty() {
         return;
@@ -124,17 +128,48 @@ fn append_visible_text(
     if *pending_newline {
         if !output.is_empty() {
             output.push('\n');
-            if stream_stdout {
+            if callback.is_some() {
+                emit_runtime_event(callback, RuntimeEvent::Output("\n".to_string()));
+            } else if stream_stdout {
                 println!();
             }
         }
         *pending_newline = false;
     }
     output.push_str(decoded);
-    if stream_stdout {
+    if callback.is_some() {
+        emit_runtime_event(callback, RuntimeEvent::Output(decoded.to_string()));
+    } else if stream_stdout {
         print!("{decoded}");
         let _ = io::stdout().flush();
     }
+}
+
+fn emit_debug_line(callback: Option<&RuntimeEventCallback>, text: impl Into<String>) {
+    let text = text.into();
+    if callback.is_some() {
+        emit_runtime_event(callback, RuntimeEvent::Debug(text));
+    } else {
+        eprintln!("{text}");
+    }
+}
+
+fn emit_output_text(
+    callback: Option<&RuntimeEventCallback>,
+    text: impl Into<String>,
+    stream_stdout: bool,
+) {
+    let text = text.into();
+    if callback.is_some() {
+        emit_runtime_event(callback, RuntimeEvent::Output(text));
+    } else if stream_stdout && !text.is_empty() {
+        print!("{text}");
+        let _ = io::stdout().flush();
+    }
+}
+
+fn emit_progress_update(callback: Option<&RuntimeEventCallback>, progress: RuntimeProgress) {
+    emit_runtime_event(callback, RuntimeEvent::Progress(progress));
 }
 
 fn decode_utf8_streaming(pending: &mut Vec<u8>, piece: &[u8]) -> String {
@@ -741,6 +776,7 @@ fn process_decoded_with_think(
     output: &mut String,
     pending_newline: &mut bool,
     stream_stdout: bool,
+    callback: Option<&RuntimeEventCallback>,
 ) {
     if decoded.is_empty() {
         return;
@@ -750,14 +786,14 @@ fn process_decoded_with_think(
         if parse_think_tags {
             let cleaned = hidden_strip_visible_chunk(decoded, hidden_visible_tail);
             let cleaned = trim_leading_line_breaks_for_first_visible(&cleaned, output);
-            append_visible_text(cleaned, output, pending_newline, stream_stdout);
+            append_visible_text(cleaned, output, pending_newline, stream_stdout, callback);
         } else {
-            append_visible_text(decoded, output, pending_newline, stream_stdout);
+            append_visible_text(decoded, output, pending_newline, stream_stdout, callback);
         }
         return;
     }
     if !parse_think_tags {
-        append_visible_text(decoded, output, pending_newline, stream_stdout);
+        append_visible_text(decoded, output, pending_newline, stream_stdout, callback);
         return;
     }
 
@@ -772,9 +808,9 @@ fn process_decoded_with_think(
         if think_mode == ThinkMode::Hidden {
             let cleaned = hidden_strip_visible_chunk(&combined, hidden_visible_tail);
             let cleaned = trim_leading_line_breaks_for_first_visible(&cleaned, output);
-            append_visible_text(cleaned, output, pending_newline, stream_stdout);
+            append_visible_text(cleaned, output, pending_newline, stream_stdout, callback);
         } else {
-            append_visible_text(&combined, output, pending_newline, stream_stdout);
+            append_visible_text(&combined, output, pending_newline, stream_stdout, callback);
         }
         return;
     }
@@ -782,7 +818,13 @@ fn process_decoded_with_think(
     if let Some(close_idx) = combined.find(THINK_CLOSE_TAG) {
         if think_mode == ThinkMode::Yes {
             let end = close_idx + THINK_CLOSE_TAG.len();
-            append_visible_text(&combined[..end], output, pending_newline, stream_stdout);
+            append_visible_text(
+                &combined[..end],
+                output,
+                pending_newline,
+                stream_stdout,
+                callback,
+            );
         } else {
             *pending_newline = false;
         }
@@ -792,9 +834,9 @@ fn process_decoded_with_think(
             if think_mode == ThinkMode::Hidden || think_mode == ThinkMode::No {
                 let cleaned = hidden_strip_visible_chunk(rest, hidden_visible_tail);
                 let cleaned = trim_leading_line_breaks_for_first_visible(&cleaned, output);
-                append_visible_text(cleaned, output, pending_newline, stream_stdout);
+                append_visible_text(cleaned, output, pending_newline, stream_stdout, callback);
             } else {
-                append_visible_text(rest, output, pending_newline, stream_stdout);
+                append_visible_text(rest, output, pending_newline, stream_stdout, callback);
             }
         }
         return;
@@ -805,7 +847,7 @@ fn process_decoded_with_think(
         if combined.len() > keep {
             let emit_len = combined.len() - keep;
             let (emit_part, tail_part) = split_at_char_boundary(&combined, emit_len);
-            append_visible_text(emit_part, output, pending_newline, stream_stdout);
+            append_visible_text(emit_part, output, pending_newline, stream_stdout, callback);
             think_tail.push_str(tail_part);
         } else {
             think_tail.push_str(&combined);
@@ -836,6 +878,7 @@ pub(crate) struct GenerationSettings {
     pub(crate) structured_output_mode: StructuredOutputMode,
     pub(crate) vendor_decode_policy: crate::vendors::VendorDecodePolicy,
     pub(crate) vendor_multimodal_policy: crate::vendors::VendorMultimodalPolicy,
+    pub(crate) runtime_event_callback: Option<RuntimeEventCallback>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1674,8 +1717,15 @@ impl ModelRuntime {
     }
 
     pub(crate) fn load(cli: &CliOptions) -> Result<Self, String> {
+        Self::load_with_debug_mode(cli, cli.debug)
+    }
+
+    pub(crate) fn load_for_repl(cli: &CliOptions) -> Result<Self, String> {
+        Self::load_with_debug_mode(cli, false)
+    }
+
+    fn load_with_debug_mode(cli: &CliOptions, debug_mode: bool) -> Result<Self, String> {
         let mut max_tokens = cli.max_tokens;
-        let debug_mode = cli.debug;
         let checkpoint = &cli.model;
         if debug_mode {
             eprintln!("Loading GGUF model: {checkpoint}");
@@ -1819,6 +1869,7 @@ impl ModelRuntime {
             structured_output_mode: StructuredOutputMode::None,
             vendor_decode_policy,
             vendor_multimodal_policy,
+            runtime_event_callback: None,
         };
 
         Ok(Self {
@@ -1884,9 +1935,6 @@ impl ModelRuntime {
         self.settings.think_mode = ThinkMode::No;
         self.settings.show_tokens = false;
         self.settings.structured_output_mode = StructuredOutputMode::AgentJson;
-        // Keep REPL agent output readable: suppress per-token debug internals during turns.
-        self.settings.debug_mode = false;
-
         let result = self.generate_text(prompt, system_prompt, stream_stdout);
 
         self.settings.temperature = original_temperature;
@@ -1901,11 +1949,98 @@ impl ModelRuntime {
         result
     }
 
+    pub(crate) fn generate_chat_messages_for_repl(
+        &mut self,
+        messages: &[crate::vendors::ChatMessage],
+        system_prompt: &str,
+    ) -> Result<String, String> {
+        let debug_mode = self.settings.debug_mode;
+        let mut active_messages = messages.to_vec();
+        let mut prompt_tokens: Vec<i32> = crate::vendors::encode_chat_messages(
+            &mut self.tokenizer,
+            &self.config,
+            &active_messages,
+            system_prompt,
+            self.settings.think_mode,
+        );
+
+        while prompt_tokens.len() > self.config.seq_len && active_messages.len() > 1 {
+            // Preserve the newest exchange when the rolling chat transcript outgrows context.
+            active_messages.remove(0);
+            prompt_tokens = crate::vendors::encode_chat_messages(
+                &mut self.tokenizer,
+                &self.config,
+                &active_messages,
+                system_prompt,
+                self.settings.think_mode,
+            );
+        }
+
+        if prompt_tokens.is_empty() {
+            prompt_tokens.push(self.tokenizer.bos_token);
+        }
+        if prompt_tokens.len() > self.config.seq_len {
+            prompt_tokens =
+                prompt_tokens.split_off(prompt_tokens.len().saturating_sub(self.config.seq_len));
+        }
+        if debug_mode {
+            emit_debug_line(
+                self.settings.runtime_event_callback.as_ref(),
+                format!("Prompt tokens: {}", prompt_tokens.len()),
+            );
+            if active_messages.len() != messages.len() {
+                emit_debug_line(
+                    self.settings.runtime_event_callback.as_ref(),
+                    format!(
+                        "Trimmed chat history to {} message(s) to fit context window",
+                        active_messages.len()
+                    ),
+                );
+            }
+            let preview = prompt_tokens
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            emit_debug_line(
+                self.settings.runtime_event_callback.as_ref(),
+                format!("Prompt token ids: [{preview}]"),
+            );
+        }
+
+        let prefill_injected_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
+        let output =
+            self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, false)?;
+        let request = GenerationRequest {
+            system_prompt: system_prompt.to_string(),
+            parts: vec![ContentPart::Text(
+                active_messages
+                    .last()
+                    .map(|msg| msg.content.clone())
+                    .unwrap_or_default(),
+            )],
+        };
+        self.retry_without_think_for_request(output, &request, false)
+    }
+
+    pub(crate) fn set_runtime_event_callback(&mut self, callback: Option<RuntimeEventCallback>) {
+        self.settings.runtime_event_callback = callback;
+    }
+
+    pub(crate) fn runtime_event_callback(&self) -> Option<RuntimeEventCallback> {
+        self.settings.runtime_event_callback.clone()
+    }
+
+    pub(crate) fn set_debug_mode(&mut self, enabled: bool) {
+        self.settings.debug_mode = enabled;
+    }
+
     pub(crate) fn generate_request(
         &mut self,
         request: &GenerationRequest,
         stream_stdout: bool,
     ) -> Result<String, String> {
+        let event_callback = self.settings.runtime_event_callback.as_ref();
         let effective_request = self.expand_request_for_vendor_detail_crop(request)?;
         let mut prompt_parts: Vec<&str> = Vec::new();
         let mut images: Vec<String> = Vec::new();
@@ -1953,12 +2088,15 @@ impl ModelRuntime {
             audios.len(),
         )?;
         if self.settings.debug_mode {
-            eprintln!(
-                "Encoded prompt: tokens={}, image_spans={}, video_spans={}, audio_spans={}",
-                encoded_prompt.token_ids.len(),
-                encoded_prompt.image_spans.len(),
-                encoded_prompt.video_spans.len(),
-                encoded_prompt.audio_spans.len()
+            emit_debug_line(
+                event_callback,
+                format!(
+                    "Encoded prompt: tokens={}, image_spans={}, video_spans={}, audio_spans={}",
+                    encoded_prompt.token_ids.len(),
+                    encoded_prompt.image_spans.len(),
+                    encoded_prompt.video_spans.len(),
+                    encoded_prompt.audio_spans.len()
+                ),
             );
         }
 
@@ -1969,14 +2107,16 @@ impl ModelRuntime {
             prepared_images = prepare_images_for_multimodal(&images, image_profile)?;
             if self.settings.debug_mode {
                 let first = &prepared_images[0];
-                eprintln!(
+                emit_debug_line(
+                    event_callback,
+                    format!(
                     "Prepared {} image tensor(s); first image: path='{}', width={}, height={}, elements={}",
                     prepared_images.len(),
                     first.path,
                     first.width,
                     first.height,
                     first.element_count()
-                );
+                ));
             }
             preprocess_summary.push(format!("images={}", prepared_images.len()));
         }
@@ -1997,7 +2137,9 @@ impl ModelRuntime {
                     } else {
                         (0, 0, 0)
                     };
-                eprintln!(
+                emit_debug_line(
+                    event_callback,
+                    format!(
                     "Prepared {} video tensor(s); first video: path='{}', fps={}, size={}x{}, frames={}, chunks={}, first_chunk_start={}, first_chunk_frames={}, first_chunk_decoded={}",
                     prepared.len(),
                     first.path,
@@ -2009,7 +2151,7 @@ impl ModelRuntime {
                     chunk_start,
                     chunk_frames,
                     decoded_chunk_frames
-                );
+                ));
             }
             preprocess_summary.push(format!("videos={}", prepared.len()));
         }
@@ -2027,7 +2169,9 @@ impl ModelRuntime {
                 } else {
                     0
                 };
-                eprintln!(
+                emit_debug_line(
+                    event_callback,
+                    format!(
                     "Prepared {} audio tensor(s); first audio: path='{}', sample_rate={}, channels={}, samples={}, chunks={}, first_chunk_samples={}",
                     prepared.len(),
                     first.path,
@@ -2036,7 +2180,7 @@ impl ModelRuntime {
                     first.total_samples,
                     first.chunks.len(),
                     first_chunk_samples
-                );
+                ));
             }
             preprocess_summary.push(format!("audios={}", prepared.len()));
         }
@@ -2076,12 +2220,15 @@ impl ModelRuntime {
                         sum_norm / first.tokens.len() as f32
                     };
                     let backend = self.config.capabilities.multimodal_backend.as_str();
-                    eprintln!(
+                    emit_debug_line(
+                        event_callback,
+                        format!(
                         "{backend} image embeddings: tokens={} norm(min/avg/max)={:.4}/{:.4}/{:.4}",
                         first.tokens.len(),
                         min_norm,
                         avg_norm,
                         max_norm
+                    ),
                     );
                 }
             }
@@ -2103,23 +2250,27 @@ impl ModelRuntime {
 
         if self.settings.debug_mode {
             if let Some(mm) = &self.multimodal_weights {
-                eprintln!(
+                emit_debug_line(
+                    event_callback,
+                    format!(
                     "Multimodal weights ready: backend={}, total_tensors={}, vision={}, projector={}, audio={}",
                     mm.backend.as_str(),
                     mm.total_tensor_count(),
                     mm.vision_tensor_names.len(),
                     mm.projector_tensor_names.len(),
                     mm.audio_tensor_names.len()
-                );
+                ));
             }
-            eprintln!(
+            emit_debug_line(
+                event_callback,
+                format!(
                 "Prepared multimodal prefill: tokens={} injected_embeddings={} images={} videos={} audios={}",
                 prompt_tokens.len(),
                 prefill_embeddings.len(),
                 encoded_prompt.image_spans.len(),
                 encoded_prompt.video_spans.len(),
                 encoded_prompt.audio_spans.len()
-            );
+            ));
         }
 
         if prompt_tokens.is_empty() {
@@ -2141,6 +2292,7 @@ impl ModelRuntime {
         prefill_injected_embeddings: HashMap<usize, Vec<f32>>,
         stream_stdout: bool,
     ) -> Result<String, String> {
+        let event_callback = self.settings.runtime_event_callback.clone();
         let hidden_retry_enabled = self.settings.think_mode == ThinkMode::Hidden;
         let retry_prompt_tokens = if hidden_retry_enabled {
             Some(prompt_tokens.clone())
@@ -2171,7 +2323,10 @@ impl ModelRuntime {
 
         let mut state = crate::engine::runtime::malloc_run_state(&self.config)?;
         if debug_mode && !self.kv_cache_format_logged {
-            eprintln!("KV cache format: {:?}", state.kv_cache_format);
+            emit_debug_line(
+                event_callback.as_ref(),
+                format!("KV cache format: {:?}", state.kv_cache_format),
+            );
             self.kv_cache_format_logged = true;
         }
         let mut rng = XorShiftRng::new(
@@ -2211,9 +2366,8 @@ impl ModelRuntime {
         let decode_policy = self.settings.vendor_decode_policy;
         let thinking_active = decode_policy.parse_think_tags && think_mode != ThinkMode::No;
         let mut is_thinking = thinking_active;
-        if thinking_active && think_mode == ThinkMode::Yes && stream_stdout {
-            println!("<think>");
-            let _ = io::stdout().flush();
+        if thinking_active && think_mode == ThinkMode::Yes {
+            emit_output_text(event_callback.as_ref(), "<think>", stream_stdout);
         }
         let stop_tokens = decode_policy
             .stop_token_literals
@@ -2242,6 +2396,17 @@ impl ModelRuntime {
             .len()
             .saturating_add(max_new_tokens)
             .min(self.config.seq_len);
+        emit_progress_update(
+            event_callback.as_ref(),
+            RuntimeProgress {
+                phase: RuntimePhase::Prefill,
+                prefill_tokens: prompt_tokens.len(),
+                decode_tokens: 0,
+                tokens_per_second: None,
+                context_used: prompt_tokens.len(),
+                context_limit: self.config.seq_len,
+            },
+        );
         let think_caps = if decode_policy.parse_think_tags {
             let new_budget = total_limit.saturating_sub(prompt_tokens.len());
             let vendor_base = decode_policy.hidden_think_token_cap_base.max(256usize);
@@ -2313,15 +2478,19 @@ impl ModelRuntime {
             None
         };
         let mut visible_yes_think_token_count = 0usize;
+        let mut last_progress_emit_ms = 0i64;
         if let Some((think_cap, total_cap)) = hidden_mode_caps {
             if debug_mode {
-                eprintln!(
-                    "Hidden-think policy: think_cap={} total_cap={} (n_layers={} seq_len={} budget={})",
-                    think_cap,
-                    total_cap,
-                    self.config.n_layers,
-                    self.config.seq_len,
-                    total_limit.saturating_sub(prompt_tokens.len())
+                emit_debug_line(
+                    event_callback.as_ref(),
+                    format!(
+                        "Hidden-think policy: think_cap={} total_cap={} (n_layers={} seq_len={} budget={})",
+                        think_cap,
+                        total_cap,
+                        self.config.n_layers,
+                        self.config.seq_len,
+                        total_limit.saturating_sub(prompt_tokens.len())
+                    ),
                 );
             }
         }
@@ -2365,7 +2534,7 @@ impl ModelRuntime {
                     .enumerate()
                     .collect();
                 top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                eprint!("[DEBUG pos={pos}] Top 5 logits: ");
+                let mut line = format!("[DEBUG pos={pos}] Top 5 logits: ");
                 for (id, v) in top.into_iter().take(5) {
                     let decoded = self
                         .tokenizer
@@ -2373,9 +2542,9 @@ impl ModelRuntime {
                         .unwrap_or_else(|| "?".to_string())
                         .replace('\n', "\\n")
                         .replace('\r', "\\r");
-                    eprint!("{id}({v:.2},\"{decoded}\") ");
+                    line.push_str(&format!("{id}({v:.2},\"{decoded}\") "));
                 }
-                eprintln!();
+                emit_debug_line(event_callback.as_ref(), line);
             }
 
             if pos < prompt_tokens.len().saturating_sub(1) {
@@ -2429,7 +2598,10 @@ impl ModelRuntime {
                         ) as i32;
                     } else {
                         if top_p < 1.0 && debug_mode && !warned_top_p_without_top_k {
-                            eprintln!("Note: -top_p is ignored unless -top_k > 0");
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                "Note: -top_p is ignored unless -top_k > 0",
+                            );
                             warned_top_p_without_top_k = true;
                         }
                         for q in 0..self.config.vocab_size {
@@ -2469,10 +2641,13 @@ impl ModelRuntime {
                         .enumerate()
                         .collect();
                     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                    eprintln!(
-                        "\nNote: early terminal token id={} at generated_tokens={}; top alternatives:",
-                        next,
-                        generated_tokens.len()
+                    emit_debug_line(
+                        event_callback.as_ref(),
+                        format!(
+                            "Note: early terminal token id={} at generated_tokens={}; top alternatives:",
+                            next,
+                            generated_tokens.len()
+                        ),
                     );
                     let mut shown = 0usize;
                     for (idx, logit) in ranked {
@@ -2490,9 +2665,12 @@ impl ModelRuntime {
                             .unwrap_or_else(|| "?".to_string())
                             .replace('\n', "\\n")
                             .replace('\r', "\\r");
-                        eprintln!(
-                            "  cand id={} logit={:.3} tok=\"{}\"",
-                            candidate, logit, decoded
+                        emit_debug_line(
+                            event_callback.as_ref(),
+                            format!(
+                                "  cand id={} logit={:.3} tok=\"{}\"",
+                                candidate, logit, decoded
+                            ),
                         );
                         shown += 1;
                         if shown >= 8 {
@@ -2534,11 +2712,14 @@ impl ModelRuntime {
                 if let Some(candidate) = alt_token.or(fallback_token) {
                     early_terminal_recovery_used = true;
                     if debug_mode {
-                        eprintln!(
-                            "\nNote: recovered once from early terminal token id={} at generated_tokens={}; using alternative token id={}",
-                            next,
-                            generated_tokens.len(),
-                            candidate
+                        emit_debug_line(
+                            event_callback.as_ref(),
+                            format!(
+                                "Note: recovered once from early terminal token id={} at generated_tokens={}; using alternative token id={}",
+                                next,
+                                generated_tokens.len(),
+                                candidate
+                            ),
                         );
                     }
                     next = candidate;
@@ -2562,6 +2743,7 @@ impl ModelRuntime {
                         &mut output,
                         &mut pending_newline,
                         stream_stdout,
+                        event_callback.as_ref(),
                     );
                     if let Some(structured_output) =
                         extract_first_complete_structured_output(&output, structured_output_schema)
@@ -2584,6 +2766,31 @@ impl ModelRuntime {
             }
 
             if pos >= prompt_tokens.len().saturating_sub(1) {
+                let now_ms = time_in_ms();
+                if now_ms.saturating_sub(last_progress_emit_ms) >= 200 {
+                    let decode_tokens = generated_tokens.len();
+                    let tok_s = if decode_tokens > 0 {
+                        let elapsed_ms = (now_ms - start).max(1) as f64;
+                        Some(decode_tokens as f64 / elapsed_ms * 1000.0)
+                    } else {
+                        None
+                    };
+                    emit_progress_update(
+                        event_callback.as_ref(),
+                        RuntimeProgress {
+                            phase: RuntimePhase::Decode,
+                            prefill_tokens: prompt_tokens.len(),
+                            decode_tokens,
+                            tokens_per_second: tok_s,
+                            context_used: prompt_tokens.len().saturating_add(decode_tokens),
+                            context_limit: self.config.seq_len,
+                        },
+                    );
+                    last_progress_emit_ms = now_ms;
+                }
+            }
+
+            if pos >= prompt_tokens.len().saturating_sub(1) {
                 generated_tokens.push(token);
                 if let Some((hidden_think_cap, hidden_total_cap)) = hidden_mode_caps {
                     if is_thinking {
@@ -2593,18 +2800,24 @@ impl ModelRuntime {
                             think_tail.clear();
                             pending_newline = false;
                             if debug_mode {
-                                eprintln!(
-                                    "\nNote: forced exit from hidden thinking block after {} tokens without </think>",
-                                    hidden_think_cap
+                                emit_debug_line(
+                                    event_callback.as_ref(),
+                                    format!(
+                                        "Note: forced exit from hidden thinking block after {} tokens without </think>",
+                                        hidden_think_cap
+                                    ),
                                 );
                             }
                         }
                     }
                     if generated_tokens.len() >= hidden_total_cap {
                         if debug_mode {
-                            eprintln!(
-                                "\nStopping hidden mode after {} generated tokens to avoid unbounded run",
-                                hidden_total_cap
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Stopping hidden mode after {} generated tokens to avoid unbounded run",
+                                    hidden_total_cap
+                                ),
                             );
                         }
                         break;
@@ -2622,11 +2835,15 @@ impl ModelRuntime {
                                 &mut output,
                                 &mut pending_newline,
                                 stream_stdout,
+                                event_callback.as_ref(),
                             );
                             if debug_mode {
-                                eprintln!(
-                                    "\nNote: forced close of visible thinking block after {} tokens without </think>",
-                                    visible_think_cap
+                                emit_debug_line(
+                                    event_callback.as_ref(),
+                                    format!(
+                                        "Note: forced close of visible thinking block after {} tokens without </think>",
+                                        visible_think_cap
+                                    ),
                                 );
                             }
                         }
@@ -2634,7 +2851,10 @@ impl ModelRuntime {
                 }
                 if structured_output_completed {
                     if debug_mode {
-                        eprintln!("\nStopping after first complete structured output object");
+                        emit_debug_line(
+                            event_callback.as_ref(),
+                            "Stopping after first complete structured output object",
+                        );
                     }
                     break;
                 }
@@ -2653,19 +2873,26 @@ impl ModelRuntime {
                                 &mut output,
                                 &mut pending_newline,
                                 stream_stdout,
+                                event_callback.as_ref(),
                             );
                         } else {
                             pending_newline = false;
                         }
                         if debug_mode {
-                            eprintln!(
-                                "\nNote: forced close of thinking block on terminal token id={token}; retrying decode once"
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Note: forced close of thinking block on terminal token id={token}; retrying decode once"
+                                ),
                             );
                         }
                         continue;
                     }
                     if debug_mode {
-                        eprintln!("\nStopping on terminal token id={token}");
+                        emit_debug_line(
+                            event_callback.as_ref(),
+                            format!("Stopping on terminal token id={token}"),
+                        );
                     }
                     break;
                 }
@@ -2680,20 +2907,27 @@ impl ModelRuntime {
                                 &mut output,
                                 &mut pending_newline,
                                 stream_stdout,
+                                event_callback.as_ref(),
                             );
                         } else {
                             pending_newline = false;
                         }
                         if debug_mode {
-                            eprintln!(
-                                "\nNote: forced close of thinking block on stop token '{}' (id={token})",
-                                literal
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Note: forced close of thinking block on stop token '{}' (id={token})",
+                                    literal
+                                ),
                             );
                         }
                         continue;
                     } else {
                         if debug_mode {
-                            eprintln!("\nStopping on vendor stop token '{}' (id={token})", literal);
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!("Stopping on vendor stop token '{}' (id={token})", literal),
+                            );
                         }
                         break;
                     }
@@ -2708,16 +2942,22 @@ impl ModelRuntime {
                 {
                     if let Some(len) = repeated_text_suffix_bytes(&output) {
                         if debug_mode {
-                            eprintln!(
-                                "\nStopping due to repeated output suffix block (len={len} bytes)"
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Stopping due to repeated output suffix block (len={len} bytes)"
+                                ),
                             );
                         }
                         break;
                     }
                     if let Some((line, repeats)) = repeated_long_line(&output) {
                         if debug_mode {
-                            eprintln!(
-                                "\nStopping due to repeated output line (repeats={repeats}): {line}"
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Stopping due to repeated output line (repeats={repeats}): {line}"
+                                ),
                             );
                         }
                         break;
@@ -2725,8 +2965,11 @@ impl ModelRuntime {
                     if temperature == 0.0 {
                         if let Some(period) = repeated_cycle_period(&generated_tokens) {
                             if debug_mode {
-                                eprintln!(
-                                    "\nStopping due to repeated token cycle (window={period}, repeated suffix)"
+                                emit_debug_line(
+                                    event_callback.as_ref(),
+                                    format!(
+                                        "Stopping due to repeated token cycle (window={period}, repeated suffix)"
+                                    ),
                                 );
                             }
                             break;
@@ -2747,6 +2990,7 @@ impl ModelRuntime {
             &mut output,
             &mut pending_newline,
             stream_stdout,
+            event_callback.as_ref(),
         );
         if let Some(structured_output) =
             extract_first_complete_structured_output(&output, structured_output_schema)
@@ -2760,6 +3004,7 @@ impl ModelRuntime {
                     &mut output,
                     &mut pending_newline,
                     stream_stdout,
+                    event_callback.as_ref(),
                 );
             }
             think_tail.clear();
@@ -2767,7 +3012,13 @@ impl ModelRuntime {
         if think_mode == ThinkMode::Hidden || think_mode == ThinkMode::No {
             let trailing = hidden_finalize_tail(&mut hidden_visible_tail);
             let trailing = trim_leading_line_breaks_for_first_visible(&trailing, &output);
-            append_visible_text(trailing, &mut output, &mut pending_newline, stream_stdout);
+            append_visible_text(
+                trailing,
+                &mut output,
+                &mut pending_newline,
+                stream_stdout,
+                event_callback.as_ref(),
+            );
         }
         if decode_policy.parse_think_tags && think_mode == ThinkMode::Yes && is_thinking {
             append_visible_text(
@@ -2775,9 +3026,13 @@ impl ModelRuntime {
                 &mut output,
                 &mut pending_newline,
                 stream_stdout,
+                event_callback.as_ref(),
             );
             if debug_mode {
-                eprintln!("\nNote: auto-closed missing </think> at end of generation");
+                emit_debug_line(
+                    event_callback.as_ref(),
+                    "Note: auto-closed missing </think> at end of generation",
+                );
             }
         }
         if decode_policy.parse_think_tags
@@ -2790,14 +3045,19 @@ impl ModelRuntime {
                 promoted = prefix.trim().to_string();
             }
             if !promoted.is_empty() {
-                if stream_stdout {
-                    println!();
-                    print!("{promoted}");
-                    let _ = io::stdout().flush();
+                if event_callback.is_some() || stream_stdout {
+                    emit_output_text(
+                        event_callback.as_ref(),
+                        format!("\n{promoted}"),
+                        stream_stdout,
+                    );
                 }
                 output = promoted;
                 if debug_mode {
-                    eprintln!("\nNote: promoted think-only content to final response text");
+                    emit_debug_line(
+                        event_callback.as_ref(),
+                        "Note: promoted think-only content to final response text",
+                    );
                 }
             }
         }
@@ -2808,11 +3068,30 @@ impl ModelRuntime {
         }
 
         let end = time_in_ms();
+        emit_progress_update(
+            event_callback.as_ref(),
+            RuntimeProgress {
+                phase: RuntimePhase::Ready,
+                prefill_tokens: prompt_tokens.len(),
+                decode_tokens: generated_tokens.len(),
+                tokens_per_second: if pos > 1 {
+                    let elapsed_ms = (end - start).max(1) as f64;
+                    Some((pos - 1) as f64 / elapsed_ms * 1000.0)
+                } else {
+                    None
+                },
+                context_used: prompt_tokens.len().saturating_add(generated_tokens.len()),
+                context_limit: self.config.seq_len,
+            },
+        );
         if (debug_mode || show_tokens) && pos > 1 {
             let elapsed_ms = (end - start).max(1) as f64;
-            eprintln!(
-                "\nachieved tok/s: {:.3}",
-                (pos - 1) as f64 / elapsed_ms * 1000.0
+            emit_debug_line(
+                event_callback.as_ref(),
+                format!(
+                    "achieved tok/s: {:.3}",
+                    (pos - 1) as f64 / elapsed_ms * 1000.0
+                ),
             );
         } else if stream_stdout && !output.is_empty() {
             println!();
@@ -2820,8 +3099,9 @@ impl ModelRuntime {
 
         if hidden_retry_enabled && output.trim().is_empty() {
             if debug_mode {
-                eprintln!(
-                    "\nNote: hidden think mode produced no visible output; retrying with think=no"
+                emit_debug_line(
+                    event_callback.as_ref(),
+                    "Note: hidden think mode produced no visible output; retrying with think=no",
                 );
             }
             if let (Some(retry_prompt_tokens), Some(retry_prefill_embeddings)) =
@@ -2857,9 +3137,15 @@ impl ModelRuntime {
         }
 
         if self.settings.debug_mode {
-            eprintln!("\nNote: no post-think answer detected; retrying once with think=no");
+            emit_debug_line(
+                self.settings.runtime_event_callback.as_ref(),
+                "Note: no post-think answer detected; retrying once with think=no",
+            );
         }
-        if stream_stdout && !output.ends_with('\n') {
+        if self.settings.runtime_event_callback.is_none()
+            && stream_stdout
+            && !output.ends_with('\n')
+        {
             println!();
         }
 
@@ -2899,7 +3185,10 @@ impl ModelRuntime {
             }
             Err(err) => {
                 if self.settings.debug_mode {
-                    eprintln!("\nNote: think=no retry failed: {err}");
+                    emit_debug_line(
+                        self.settings.runtime_event_callback.as_ref(),
+                        format!("Note: think=no retry failed: {err}"),
+                    );
                 }
                 Ok(output)
             }
@@ -2958,13 +3247,19 @@ impl ModelRuntime {
             prompt_tokens.truncate(self.config.seq_len);
         }
         if debug_mode {
-            eprintln!("Prompt tokens: {}", prompt_tokens.len());
+            emit_debug_line(
+                self.settings.runtime_event_callback.as_ref(),
+                format!("Prompt tokens: {}", prompt_tokens.len()),
+            );
             let preview = prompt_tokens
                 .iter()
                 .map(|t| t.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!("Prompt token ids: [{preview}]");
+            emit_debug_line(
+                self.settings.runtime_event_callback.as_ref(),
+                format!("Prompt token ids: [{preview}]"),
+            );
         }
 
         let prefill_injected_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();

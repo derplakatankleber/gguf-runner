@@ -806,6 +806,7 @@ struct Cli {
     layer_debug_pos: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct CliOptions {
     pub(crate) model: String,
     pub(crate) prompt: String,

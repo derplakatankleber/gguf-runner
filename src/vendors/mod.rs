@@ -16,6 +16,18 @@ use crate::engine::types::{
     MultimodalBackend, ThinkMode, Tokenizer, VendorTokenizerPolicy,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChatRole {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChatMessage {
+    pub(crate) role: ChatRole,
+    pub(crate) content: String,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct VendorDecodePolicy {
     pub(crate) parse_think_tags: bool,
@@ -588,6 +600,30 @@ pub(crate) fn encode_chat_prompt(
         qwen2::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, prompt, system_prompt)
+    }
+}
+
+pub(crate) fn encode_chat_messages(
+    tokenizer: &mut Tokenizer,
+    cfg: &Config,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    if cfg.is_gemma3 {
+        gemma::encode_chat_messages(tokenizer, messages, system_prompt)
+    } else if cfg.is_qwen35 {
+        qwen35::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
+    } else if cfg.is_qwen3vl {
+        qwen3vl::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
+    } else if cfg.is_qwen3next {
+        qwen3next::encode_chat_messages(tokenizer, cfg, messages, system_prompt, think_mode)
+    } else if cfg.is_qwen3moe {
+        qwen3::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
+    } else if cfg.is_qwen2 {
+        qwen2::encode_chat_messages(tokenizer, messages, system_prompt)
+    } else {
+        llama::encode_chat_messages(tokenizer, messages, system_prompt)
     }
 }
 

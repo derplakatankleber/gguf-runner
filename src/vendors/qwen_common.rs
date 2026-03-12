@@ -1,4 +1,4 @@
-use super::{MmprojFilenameScoreHint, VendorRuntimeDebugPolicy};
+use super::{ChatMessage, ChatRole, MmprojFilenameScoreHint, VendorRuntimeDebugPolicy};
 use crate::engine::types::{
     ContentPart, EncodedPrompt, GenerationRequest, MediaRef, MultimodalBackend, PlaceholderSpan,
     ThinkMode, Tokenizer,
@@ -88,6 +88,117 @@ pub(super) fn encode_qwen3_chat_no_forced_think(
         think_mode,
         false,
     )
+}
+
+pub(super) fn encode_qwen3_messages_with_think_style(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+    inject_forced_think_prompt: bool,
+) -> Vec<i32> {
+    let mut tokens: Vec<i32> = Vec::with_capacity(8192);
+    let mut temp: Vec<i32> = Vec::with_capacity(8192);
+    let sys = system_prompt.trim();
+
+    let im_start = tokenizer.find_special_token("<|im_start|>");
+    let im_end = tokenizer.find_special_token("<|im_end|>");
+
+    if tokenizer.bos_token >= 0 {
+        tokens.push(tokenizer.bos_token);
+    }
+
+    if let (Some(start), Some(end)) = (im_start, im_end) {
+        if !sys.is_empty() {
+            tokens.push(start);
+            tokenizer.bpe_encode("system\n", &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokenizer.bpe_encode(sys, &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokens.push(end);
+            tokenizer.bpe_encode("\n", &mut temp);
+            tokens.extend_from_slice(&temp);
+        }
+
+        for message in messages {
+            tokens.push(start);
+            let role = match message.role {
+                ChatRole::User => "user\n",
+                ChatRole::Assistant => "assistant\n",
+            };
+            tokenizer.bpe_encode(role, &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokenizer.bpe_encode(&message.content, &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokens.push(end);
+            tokenizer.bpe_encode("\n", &mut temp);
+            tokens.extend_from_slice(&temp);
+        }
+
+        tokens.push(start);
+        tokenizer.bpe_encode("assistant\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+        if inject_forced_think_prompt {
+            let think_prefix = if think_mode == ThinkMode::No {
+                "<think>\n\n</think>\n\n"
+            } else {
+                "<think>\n"
+            };
+            tokenizer.bpe_encode(think_prefix, &mut temp);
+            tokens.extend_from_slice(&temp);
+        }
+        return tokens;
+    }
+
+    if !sys.is_empty() {
+        tokenizer.bpe_encode("<|im_start|>system\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode(sys, &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode("<|im_end|>\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+
+    for message in messages {
+        let role = match message.role {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        tokenizer.bpe_encode(&format!("<|im_start|>{role}\n"), &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode(&message.content, &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode("<|im_end|>\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+    let assistant_suffix = if !inject_forced_think_prompt {
+        "<|im_start|>assistant\n"
+    } else if think_mode == ThinkMode::No {
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    } else {
+        "<|im_start|>assistant\n<think>\n"
+    };
+    tokenizer.bpe_encode(assistant_suffix, &mut temp);
+    tokens.extend_from_slice(&temp);
+    tokens
+}
+
+pub(super) fn encode_qwen3_messages(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    encode_qwen3_messages_with_think_style(tokenizer, messages, system_prompt, think_mode, true)
+}
+
+pub(super) fn encode_qwen3_messages_no_forced_think(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    encode_qwen3_messages_with_think_style(tokenizer, messages, system_prompt, think_mode, false)
 }
 
 fn append_encoded_literal(

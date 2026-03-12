@@ -14,8 +14,10 @@ src/
   main.rs
   app/
     mod.rs
+    events.rs
     generation.rs
     agent.rs
+    repl.rs
   cli.rs
   tools.rs
   engine/
@@ -80,7 +82,7 @@ src/
     - `--audio` (extension-agnostic validation in current scaffold)
   - route by operation mode:
     - `oneshot`: single prompt execution
-    - `repl`: interactive question/answer loop with slash commands (`/help`, `/model`, `/exit`, `/quit`) and tab-completion for slash-command prefixes
+    - `repl`: interactive question/answer loop with slash commands (`/help`, `/model`, `/exit`, `/quit`)
   - routes plain text-only non-agent turns through `generate_text(...)`; uses structured `GenerationRequest` execution only when media inputs are present
   - tool-agent support is orthogonal to operation mode:
     - default `allowed-tools=none` in `oneshot`
@@ -88,6 +90,31 @@ src/
     - when tools are enabled, requests are handled via `app::agent`
     - when tools are disabled, requests are handled via standard generation
   - print profiling/timing summaries
+
+### `src/app/repl.rs`
+
+- `ratatui`/`crossterm` terminal UI for REPL mode.
+- Owns:
+  - alternate-screen terminal lifecycle
+  - raw-mode key handling
+  - visible input buffer editing
+  - slash-command tab-completion at edit time
+  - scrollback transcript rendering
+  - prompt history navigation
+  - rolling non-agent chat history for continuous multi-turn conversations
+  - status line updates during turn execution
+  - a single background worker thread that owns the only `ModelRuntime` instance in `repl` mode
+  - command/event channels between UI thread and runtime worker
+  - live transcript updates for streamed assistant output and debug lines
+- Loads the runtime inside the worker thread so the REPL owns runtime lifecycle end-to-end and enforces one active runtime.
+
+### `src/app/events.rs`
+
+- Shared app-level runtime event types for streamed REPL output.
+- Defines the event callback used by:
+  - `app::generation` for visible token chunks and debug lines
+  - `app::agent` for tool-call/info/error/final events
+- Keeps event transport in `app/` so `engine/` stays independent of UI/orchestration concerns.
 
 ### `src/app/generation.rs`
 
@@ -102,6 +129,7 @@ src/
 - Token generation loop implementation.
 - Exposes reusable generation APIs:
   - `generate_text(...)` for text-only prompts
+  - `generate_chat_messages_for_repl(...)` for multi-turn REPL chat encoded through vendor-native chat templates
   - `generate_text_with_images(...)` (image path routes through structured request execution)
     - qwen35 image route appends a non-hallucination guard instruction for unreadable text regions
   - `generate_request(...)` for structured multimodal requests (`GenerationRequest`) with:
@@ -128,6 +156,10 @@ src/
       - stop after first complete top-level JSON object
     - explicit current-state errors for unimplemented native video/audio embedding execution
   - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
+- Supports optional app-level runtime event callbacks:
+  - streamed visible output chunks for TUI REPL
+  - debug-line emission without writing directly to terminal during REPL turns
+- For REPL multi-turn chat, trims oldest encoded turns when chat history outgrows the model context window, preserving the newest exchange.
 
 ### `src/app/agent.rs`
 
@@ -137,6 +169,10 @@ src/
 - Agent replies are expected as compact single-object JSON with fixed key order; runtime constrains decode to the two supported schemas.
 - Builds system prompt with tool catalog metadata (description / when-to-use) and optional allowed-shell-command descriptions supplied by `cli`.
 - Executes tool calls through `tools::ToolExecutor` and appends tool results back into transcript.
+- Exposes both:
+  - direct stdout/stderr execution for `oneshot`
+  - collected event output for TUI-driven `repl`
+  - immediate app-level runtime event emission during tool-agent turns when a callback is installed
 - Terminates on `final` response or configured tool-call limit.
 
 ### `src/tools.rs`

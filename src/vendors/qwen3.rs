@@ -1,4 +1,6 @@
-use super::{qwen_common, VendorDecodePolicy, VendorMultimodalPolicy, VendorTokenizerPolicy};
+use super::{
+    qwen_common, ChatMessage, VendorDecodePolicy, VendorMultimodalPolicy, VendorTokenizerPolicy,
+};
 use crate::engine::types::{Config, EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
 
 pub(super) fn finalize_moe_config(config: &mut Config) -> Result<(), String> {
@@ -72,6 +74,15 @@ pub(super) fn encode_chat_prompt(
     think_mode: ThinkMode,
 ) -> Vec<i32> {
     qwen_common::encode_qwen3_chat(tokenizer, prompt, system_prompt, image_count, think_mode)
+}
+
+pub(super) fn encode_chat_messages(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    qwen_common::encode_qwen3_messages(tokenizer, messages, system_prompt, think_mode)
 }
 
 pub(super) fn encode_generation_request(

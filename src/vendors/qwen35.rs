@@ -1,5 +1,5 @@
 use super::{
-    qwen_common, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
+    qwen_common, ChatMessage, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
     VendorRuntimeDebugPolicy, VendorTokenizerPolicy,
 };
 use crate::engine::types::{EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
@@ -57,6 +57,15 @@ pub(super) fn encode_chat_prompt(
     think_mode: ThinkMode,
 ) -> Vec<i32> {
     qwen_common::encode_qwen3_chat(tokenizer, prompt, system_prompt, image_count, think_mode)
+}
+
+pub(super) fn encode_chat_messages(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    qwen_common::encode_qwen3_messages(tokenizer, messages, system_prompt, think_mode)
 }
 
 pub(super) fn encode_generation_request(

@@ -1,5 +1,6 @@
 use super::{
-    MmprojFilenameScoreHint, VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy,
+    ChatMessage, ChatRole, MmprojFilenameScoreHint, VendorDecodePolicy, VendorMultimodalPolicy,
+    VendorRuntimeDebugPolicy,
 };
 use crate::engine::types::{
     Config, ContentPart, EncodedPrompt, GenerationRequest, MultimodalBackend, PlaceholderSpan,
@@ -178,6 +179,58 @@ pub(super) fn encode_chat_prompt(
         parts: vec![ContentPart::Text(prompt.to_string())],
     };
     encode_generation_request(tokenizer, &request).token_ids
+}
+
+pub(super) fn encode_chat_messages(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+) -> Vec<i32> {
+    let mut tokens: Vec<i32> = Vec::with_capacity(8192);
+    let mut temp: Vec<i32> = Vec::with_capacity(8192);
+
+    let bos_token = tokenizer
+        .find_special_token("<bos>")
+        .unwrap_or(GEMMA3_BOS_TOKEN);
+    let start_turn = tokenizer
+        .find_special_token("<start_of_turn>")
+        .unwrap_or(GEMMA3_START_TURN);
+    let end_turn = tokenizer
+        .find_special_token("<end_of_turn>")
+        .unwrap_or(GEMMA3_END_TURN);
+
+    tokens.push(bos_token);
+
+    let mut first_user_turn = true;
+    for message in messages {
+        tokens.push(start_turn);
+        let role = match message.role {
+            ChatRole::User => "user\n",
+            ChatRole::Assistant => "model\n",
+        };
+        tokenizer.bpe_encode(role, &mut temp);
+        tokens.extend_from_slice(&temp);
+        if first_user_turn
+            && matches!(message.role, ChatRole::User)
+            && !system_prompt.trim().is_empty()
+        {
+            tokenizer.bpe_encode(system_prompt.trim(), &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokenizer.bpe_encode("\n\n", &mut temp);
+            tokens.extend_from_slice(&temp);
+            first_user_turn = false;
+        }
+        tokenizer.bpe_encode(&message.content, &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokens.push(end_turn);
+        tokenizer.bpe_encode("\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+
+    tokens.push(start_turn);
+    tokenizer.bpe_encode("model\n", &mut temp);
+    tokens.extend_from_slice(&temp);
+    tokens
 }
 
 #[cfg(test)]

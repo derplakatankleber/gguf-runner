@@ -1,4 +1,7 @@
-use super::{qwen_common, VendorDecodePolicy, VendorMultimodalPolicy, VendorTokenizerPolicy};
+use super::{
+    qwen_common, ChatMessage, ChatRole, VendorDecodePolicy, VendorMultimodalPolicy,
+    VendorTokenizerPolicy,
+};
 use crate::engine::types::Tokenizer;
 
 pub(super) fn decode_policy() -> VendorDecodePolicy {
@@ -73,6 +76,73 @@ pub(super) fn encode_chat_prompt(
     let rendered = format!(
         "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
     );
+    tokenizer.bpe_encode(&rendered, &mut tokens);
+    tokens
+}
+
+pub(super) fn encode_chat_messages(
+    tokenizer: &mut Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+) -> Vec<i32> {
+    let mut tokens: Vec<i32> = Vec::with_capacity(8192);
+    let mut temp: Vec<i32> = Vec::with_capacity(8192);
+    let sys = if system_prompt.is_empty() {
+        "You are a helpful assistant."
+    } else {
+        system_prompt
+    };
+
+    let im_start = tokenizer.find_special_token("<|im_start|>");
+    let im_end = tokenizer.find_special_token("<|im_end|>");
+
+    if tokenizer.bos_token >= 0 {
+        tokens.push(tokenizer.bos_token);
+    }
+
+    if let (Some(start), Some(end)) = (im_start, im_end) {
+        tokens.push(start);
+        tokenizer.bpe_encode("system\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode(sys, &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokens.push(end);
+        tokenizer.bpe_encode("\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+
+        for message in messages {
+            tokens.push(start);
+            let role = match message.role {
+                ChatRole::User => "user\n",
+                ChatRole::Assistant => "assistant\n",
+            };
+            tokenizer.bpe_encode(role, &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokenizer.bpe_encode(&message.content, &mut temp);
+            tokens.extend_from_slice(&temp);
+            tokens.push(end);
+            tokenizer.bpe_encode("\n", &mut temp);
+            tokens.extend_from_slice(&temp);
+        }
+
+        tokens.push(start);
+        tokenizer.bpe_encode("assistant\n", &mut temp);
+        tokens.extend_from_slice(&temp);
+        return tokens;
+    }
+
+    let mut rendered = format!("<|im_start|>system\n{sys}<|im_end|>\n");
+    for message in messages {
+        let role = match message.role {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        rendered.push_str(&format!(
+            "<|im_start|>{role}\n{}<|im_end|>\n",
+            message.content
+        ));
+    }
+    rendered.push_str("<|im_start|>assistant\n");
     tokenizer.bpe_encode(&rendered, &mut tokens);
     tokens
 }

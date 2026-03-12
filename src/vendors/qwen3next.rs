@@ -1,5 +1,5 @@
 use super::{
-    qwen_common, VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy,
+    qwen_common, ChatMessage, VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy,
     VendorTokenizerPolicy,
 };
 use crate::engine::types::{Config, EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
@@ -126,6 +126,34 @@ pub(super) fn encode_chat_prompt(
             prompt,
             effective_system_prompt,
             image_count,
+            think_mode,
+        )
+    }
+}
+
+pub(super) fn encode_chat_messages(
+    tokenizer: &mut Tokenizer,
+    config: &Config,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    think_mode: ThinkMode,
+) -> Vec<i32> {
+    const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+    let effective_system_prompt = if config.qwen_chat_template_has_builtin_system
+        && system_prompt.trim() == DEFAULT_SYSTEM_PROMPT
+    {
+        ""
+    } else {
+        system_prompt
+    };
+
+    if config.qwen_chat_template_contains_think {
+        qwen_common::encode_qwen3_messages(tokenizer, messages, effective_system_prompt, think_mode)
+    } else {
+        qwen_common::encode_qwen3_messages_no_forced_think(
+            tokenizer,
+            messages,
+            effective_system_prompt,
             think_mode,
         )
     }

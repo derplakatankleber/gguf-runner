@@ -20,6 +20,8 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         recover_early_endoftext_once: false,
         early_endoftext_recover_max_tokens: 0,
         hidden_think_token_cap_base: 384,
+        visible_think_token_cap_base: 192,
+        prefer_hidden_think_for_multimodal: true,
         retry_without_think_when_no_post_think_text: true,
     }
 }

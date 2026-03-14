@@ -93,19 +93,22 @@ src/
 
 ### `src/app/repl.rs`
 
-- `ratatui`/`crossterm` terminal UI for REPL mode.
+- `crossterm` footer-style terminal UI for REPL mode.
 - Owns:
-  - alternate-screen terminal lifecycle
+  - main-screen terminal lifecycle with a fixed footer area
+  - scroll-region management so model/debug output prints into the terminal's native scrollback above the footer
   - raw-mode key handling
   - visible input buffer editing
   - slash-command tab-completion at edit time
-  - scrollback transcript rendering
+  - slash-command managed REPL state, including persistent image attachments (`/image`, `/images`, `/clear-images`, `/clear`)
   - prompt history navigation
   - rolling non-agent chat history for continuous multi-turn conversations
   - status line updates during turn execution
   - a single background worker thread that owns the only `ModelRuntime` instance in `repl` mode
   - command/event channels between UI thread and runtime worker
-  - live transcript updates for streamed assistant output and debug lines
+  - streamed assistant/debug/system output printed directly into terminal scrollback
+- Uses native multimodal generation for turns with active image attachments, rather than routing image access through tool-agent calls.
+- Active REPL media attachments can initialize external multimodal support lazily on first use, including local `mmproj` sidecar discovery/loading for sidecar-backed vision families.
 - Loads the runtime inside the worker thread so the REPL owns runtime lifecycle end-to-end and enforces one active runtime.
 
 ### `src/app/events.rs`
@@ -147,8 +150,9 @@ src/
     - native image embedding execution via in-engine multimodal backend (`qwen3vl`/`qwen35` mmproj sidecar path)
       - Gemma3 sidecar path uses `<start_of_image>`/`<end_of_image>` prompt markers and SigLIP-style projector pooling
     - think-tag decode safeguards:
-      - hidden-think mode enforces bounded think/total token caps
-      - visible-think mode reserves answer budget after `</think>`, enforces a bounded think phase, and auto-closes missing `</think>` when exceeded
+      - hidden-think mode enforces vendor-bounded think/total token caps
+      - visible-think mode reserves answer budget after `</think>` and enforces a vendor-bounded visible think phase
+      - multimodal turns can be forced to hidden-think by vendor decode policy without changing the global CLI think setting
     - structured-output decode safeguards:
       - generic structured-output mode selector in generation settings
       - current `agent-json` mode seeds a compact JSON prefix for tool-agent turns
@@ -373,7 +377,7 @@ src/
   - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `gemma3`, `qwen3vl`, and `qwen35`.
   - Performs vendor-specific mmproj sidecar compatibility checks (`validate_mmproj_for_backend(...)`) including projector type, projection dim matching, and Qwen family/deepstack guards.
   - Dispatches vendor policies used by app/tokenizer decode paths:
-    - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`, think-recovery toggles)
+    - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`, hidden/visible think budgets, multimodal think preference, think-retry toggles)
     - `tokenizer_policy(...)` returning `VendorTokenizerPolicy`
     - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
     - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
@@ -403,7 +407,7 @@ src/
   - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths and image spans on Gemma multimodal path.
   - runtime validates prompt/media alignment before starting preprocessing.
   - if native multimodal tensors are unavailable, runtime fails with a qualified native-capability error that includes architecture/token/tensor probe details.
-  - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, stop-token matching, deterministic loop-guard behavior, and vendor-enabled think-recovery retries.
+  - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, phase-bounded visible/hidden think decoding, stop-token matching, deterministic loop-guard behavior, and vendor-enabled think-recovery retries.
   - token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`); native media embedding injection remains in progress.
 10. Agent mode:
   - tool transcript prompt encoded per turn

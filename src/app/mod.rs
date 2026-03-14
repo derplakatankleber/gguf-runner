@@ -27,7 +27,16 @@ const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4"];
-const REPL_COMMANDS: [&str; 4] = ["help", "model", "exit", "quit"];
+const REPL_COMMANDS: [&str; 8] = [
+    "help",
+    "model",
+    "image",
+    "images",
+    "clear-images",
+    "clear",
+    "exit",
+    "quit",
+];
 
 fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCacheMode> {
     mode.map(|v| match v {
@@ -300,6 +309,10 @@ fn run_repl_mode(cli: &CliOptions) -> Result<(), String> {
 pub(crate) enum ReplCommandAction {
     Exit,
     Messages(Vec<String>),
+    AttachImage(String),
+    ListImages,
+    ClearImages,
+    ClearState,
     ModelPrompt(String),
 }
 
@@ -307,17 +320,32 @@ pub(crate) fn handle_repl_command(cli: &CliOptions, input: &str) -> ReplCommandA
     let Some(raw_cmd) = input.strip_prefix('/') else {
         return ReplCommandAction::ModelPrompt(input.to_string());
     };
-    let cmd = raw_cmd
+    let trimmed = raw_cmd.trim();
+    let cmd = trimmed
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    let rest = trimmed
+        .strip_prefix(cmd.as_str())
+        .map(str::trim)
+        .unwrap_or("");
     match cmd.as_str() {
         "" => {
             ReplCommandAction::Messages(vec!["Empty command. Type /help for commands.".to_string()])
         }
         "help" => ReplCommandAction::Messages(repl_help_lines()),
         "model" => ReplCommandAction::Messages(vec![cli.model.clone()]),
+        "image" => {
+            if rest.is_empty() {
+                ReplCommandAction::Messages(vec!["Usage: /image <path-to-image>".to_string()])
+            } else {
+                ReplCommandAction::AttachImage(rest.to_string())
+            }
+        }
+        "images" => ReplCommandAction::ListImages,
+        "clear-images" => ReplCommandAction::ClearImages,
+        "clear" => ReplCommandAction::ClearState,
         "exit" | "quit" => ReplCommandAction::Exit,
         _ => ReplCommandAction::Messages(vec![format!(
             "Unknown command '/{}'. Type /help for commands.",
@@ -330,31 +358,136 @@ fn expand_repl_tab_completion(input: &str) -> String {
     let Some(raw_cmd) = input.strip_prefix('/') else {
         return input.to_string();
     };
-    let before_tab = raw_cmd.split_whitespace().next().unwrap_or("");
-    if before_tab.is_empty() || before_tab.contains(char::is_whitespace) {
-        return input.replace('\t', "");
+    let sanitized = raw_cmd.replace('\t', "");
+    let cmd = sanitized.split_whitespace().next().unwrap_or("");
+    if cmd.is_empty() {
+        return "/".to_string();
     }
-    let mut matches = REPL_COMMANDS
+    if let Some((typed_cmd, rest)) = split_repl_command_and_rest(&sanitized) {
+        if typed_cmd == "image" && rest.starts_with(char::is_whitespace) {
+            if let Some(completed) = complete_filesystem_path(rest.trim_start()) {
+                return format!("/{typed_cmd} {completed}");
+            }
+            return format!("/{typed_cmd} {}", rest.trim_start());
+        }
+    }
+
+    let matches = REPL_COMMANDS
         .iter()
         .copied()
-        .filter(|cmd| cmd.starts_with(before_tab));
-    let first = matches.next();
-    let second = matches.next();
-    if let (Some(cmd), None) = (first, second) {
-        return format!("/{cmd}");
+        .filter(|candidate| candidate.starts_with(cmd))
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return format!("/{sanitized}");
     }
-    input.replace('\t', "")
+    let shared = longest_common_prefix(&matches);
+    if shared.len() > cmd.len() {
+        format!("/{shared}")
+    } else if matches.len() == 1 {
+        format!("/{}", matches[0])
+    } else {
+        format!("/{sanitized}")
+    }
+}
+
+fn split_repl_command_and_rest(input: &str) -> Option<(&str, &str)> {
+    let trimmed_start = input.trim_start();
+    let cmd_end = trimmed_start.find(char::is_whitespace)?;
+    let cmd = &trimmed_start[..cmd_end];
+    let rest = &trimmed_start[cmd_end..];
+    Some((cmd, rest))
+}
+
+fn longest_common_prefix(items: &[&str]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut prefix = (*first).to_string();
+    for item in &items[1..] {
+        while !item.starts_with(&prefix) {
+            if prefix.is_empty() {
+                return prefix;
+            }
+            prefix.pop();
+        }
+    }
+    prefix
+}
+
+fn complete_filesystem_path(fragment: &str) -> Option<String> {
+    let (dir_part, name_prefix) = match fragment.rsplit_once('/') {
+        Some((dir, prefix)) => (format!("{dir}/"), prefix),
+        None => (String::new(), fragment),
+    };
+    let dir_path = if dir_part.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(&dir_part)
+    };
+    let mut matches = fs::read_dir(&dir_path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(name_prefix) {
+                return None;
+            }
+            let is_dir = entry
+                .file_type()
+                .ok()
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
+            Some((name, is_dir))
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    if matches.len() == 1 {
+        let (name, is_dir) = &matches[0];
+        let suffix = if *is_dir { "/" } else { "" };
+        return Some(format!("{dir_part}{name}{suffix}"));
+    }
+    let names = matches
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    let shared = longest_common_prefix(&names);
+    if shared.len() > name_prefix.len() {
+        Some(format!("{dir_part}{shared}"))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn repl_help_lines() -> Vec<String> {
     vec![
         "REPL commands:".to_string(),
-        "  /help   Show this help".to_string(),
-        "  /model  Show active model path".to_string(),
-        "  /exit   Exit REPL".to_string(),
-        "  /quit   Exit REPL".to_string(),
+        "  /help          Show this help".to_string(),
+        "  /model         Show active model path".to_string(),
+        "  /image <path>  Attach an image to the conversation".to_string(),
+        "  /images        List active image attachments".to_string(),
+        "  /clear-images  Remove all active image attachments".to_string(),
+        "  /clear         Reset chat history and active attachments".to_string(),
+        "  /exit          Exit REPL".to_string(),
+        "  /quit          Exit REPL".to_string(),
         "  /e<Tab> expands to /exit".to_string(),
     ]
+}
+
+pub(crate) fn validate_repl_image_path(path: &str) -> Result<String, String> {
+    let validated = validate_media_paths(
+        &[path.to_string()],
+        "image",
+        1,
+        MAX_IMAGE_BYTES,
+        Some(IMAGE_EXTENSIONS),
+    )?;
+    let canonical = PathBuf::from(&validated[0])
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve image path '{}': {e}", validated[0]))?;
+    Ok(canonical.to_string_lossy().to_string())
 }
 
 pub(crate) fn collect_debug_banner_lines(cli: &CliOptions) -> Vec<String> {
@@ -473,6 +606,7 @@ fn build_generation_request(
 #[cfg(test)]
 mod tests {
     use super::expand_repl_tab_completion;
+    use std::fs;
 
     #[test]
     fn repl_tab_completion_completes_exit() {
@@ -485,7 +619,27 @@ mod tests {
     }
 
     #[test]
+    fn repl_tab_completion_extends_shared_prefix_for_ambiguous_commands() {
+        assert_eq!(expand_repl_tab_completion("/ima"), "/image");
+        assert_eq!(expand_repl_tab_completion("/cl"), "/clear");
+    }
+
+    #[test]
     fn repl_tab_completion_ambiguous_prefix_keeps_slash_only() {
         assert_eq!(expand_repl_tab_completion("/\t"), "/");
+    }
+
+    #[test]
+    fn repl_tab_completion_completes_image_path() {
+        let test_dir = std::env::temp_dir().join("gguf-runner-repl-tab");
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).expect("create temp dir");
+        fs::write(test_dir.join("sample-image.jpg"), "x").expect("write image");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&test_dir).expect("set cwd");
+        let completed = expand_repl_tab_completion("/image samp");
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&test_dir);
+        assert_eq!(completed, "/image sample-image.jpg");
     }
 }

@@ -37,6 +37,8 @@ pub(crate) struct VendorDecodePolicy {
     pub(crate) recover_early_endoftext_once: bool,
     pub(crate) early_endoftext_recover_max_tokens: usize,
     pub(crate) hidden_think_token_cap_base: usize,
+    pub(crate) visible_think_token_cap_base: usize,
+    pub(crate) prefer_hidden_think_for_multimodal: bool,
     pub(crate) retry_without_think_when_no_post_think_text: bool,
 }
 

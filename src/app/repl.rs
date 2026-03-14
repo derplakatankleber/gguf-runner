@@ -6,7 +6,7 @@ use crate::app::generation::ModelRuntime;
 use crate::app::{collect_debug_banner_lines, expand_repl_tab_completion, handle_repl_command};
 use crate::cli::CliOptions;
 use crate::vendors::{ChatMessage, ChatRole};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -508,6 +508,9 @@ fn handle_key_event(
     cli: &CliOptions,
     key: KeyEvent,
 ) -> Result<bool, String> {
+    if key.kind != KeyEventKind::Press {
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
         KeyCode::Esc => return Ok(true),

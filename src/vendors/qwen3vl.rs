@@ -2,9 +2,9 @@ use super::{
     qwen_common, ChatMessage, VendorDecodePolicy, VendorMultimodalPolicy, VendorRuntimeDebugPolicy,
     VendorTokenizerPolicy,
 };
-use crate::engine::types::{EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
+use crate::engine::types::{Config, EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
 
-pub(super) fn decode_policy() -> VendorDecodePolicy {
+pub(super) fn decode_policy(_config: &Config) -> VendorDecodePolicy {
     VendorDecodePolicy {
         parse_think_tags: true,
         stop_token_literals: qwen_common::QWEN_STOP_TOKEN_LITERALS,
@@ -16,6 +16,9 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         visible_think_token_cap_base: 224,
         prefer_hidden_think_for_multimodal: true,
         retry_without_think_when_no_post_think_text: false,
+        agent_force_deterministic: false,
+        agent_protocol_max_failures: 3,
+        agent_plain_chat_fallback_after_protocol_failures: false,
     }
 }
 

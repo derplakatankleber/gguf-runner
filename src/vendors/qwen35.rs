@@ -2,7 +2,7 @@ use super::{
     qwen_common, ChatMessage, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
     VendorRuntimeDebugPolicy, VendorTokenizerPolicy,
 };
-use crate::engine::types::{EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
+use crate::engine::types::{Config, EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
 
 fn qwen35_detail_crop_enabled() -> bool {
     matches!(
@@ -11,7 +11,12 @@ fn qwen35_detail_crop_enabled() -> bool {
     )
 }
 
-pub(super) fn decode_policy() -> VendorDecodePolicy {
+fn weak_agent_model(config: &Config) -> bool {
+    config.n_experts == 0 && (config.dim <= 1024 || config.n_layers <= 24)
+}
+
+pub(super) fn decode_policy(config: &Config) -> VendorDecodePolicy {
+    let weak_agent_model = weak_agent_model(config);
     VendorDecodePolicy {
         parse_think_tags: true,
         stop_token_literals: qwen_common::QWEN_STOP_TOKEN_LITERALS,
@@ -23,6 +28,9 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         visible_think_token_cap_base: 192,
         prefer_hidden_think_for_multimodal: true,
         retry_without_think_when_no_post_think_text: true,
+        agent_force_deterministic: config.n_experts > 0 || weak_agent_model,
+        agent_protocol_max_failures: if weak_agent_model { 1 } else { 3 },
+        agent_plain_chat_fallback_after_protocol_failures: weak_agent_model,
     }
 }
 
@@ -76,4 +84,74 @@ pub(super) fn encode_generation_request(
     think_mode: ThinkMode,
 ) -> EncodedPrompt {
     qwen_common::encode_qwen3_request(tokenizer, request, think_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_policy;
+    use crate::engine::types::{Config, ModelCapabilities};
+
+    fn base_qwen35_config() -> Config {
+        Config {
+            dim: 2048,
+            input_embedding_dim: 2048,
+            n_deepstack_layers: 0,
+            hidden_dim: 0,
+            expert_hidden_dim: 0,
+            shared_expert_hidden_dim: 0,
+            n_layers: 40,
+            n_heads: 0,
+            n_kv_heads: 0,
+            n_experts: 0,
+            n_experts_used: 0,
+            moe_n_group: 0,
+            moe_topk_group: 0,
+            moe_norm_topk_prob: false,
+            moe_routed_scaling_factor: 0.0,
+            vocab_size: 0,
+            seq_len: 0,
+            rope_theta: 0.0,
+            head_dim: 0,
+            rope_dim: 0,
+            rope_sections: [0; 4],
+            is_gemma3: false,
+            is_qwen2: false,
+            is_qwen35: true,
+            is_qwen3vl: false,
+            is_qwen3moe: false,
+            is_qwen3next: false,
+            online_attn_fusion: false,
+            qwen_chat_template_contains_think: true,
+            qwen_chat_template_has_builtin_system: false,
+            capabilities: ModelCapabilities::default(),
+            final_logit_softcapping: 0.0,
+            rms_norm_eps: 0.0,
+            rope_theta_swa: 0.0,
+            swa_pattern: 0,
+            ssm_conv_kernel: 0,
+            ssm_inner_size: 0,
+            ssm_state_size: 0,
+            ssm_time_step_rank: 0,
+            ssm_group_count: 0,
+        }
+    }
+
+    #[test]
+    fn weak_qwen35_agent_policy_uses_low_retry_budget() {
+        let mut config = base_qwen35_config();
+        config.dim = 1024;
+        config.n_layers = 24;
+        let policy = decode_policy(&config);
+        assert!(policy.agent_force_deterministic);
+        assert_eq!(policy.agent_protocol_max_failures, 1);
+        assert!(policy.agent_plain_chat_fallback_after_protocol_failures);
+    }
+
+    #[test]
+    fn larger_qwen35_agent_policy_keeps_standard_retry_budget() {
+        let config = base_qwen35_config();
+        let policy = decode_policy(&config);
+        assert!(!policy.agent_plain_chat_fallback_after_protocol_failures);
+        assert_eq!(policy.agent_protocol_max_failures, 3);
+    }
 }

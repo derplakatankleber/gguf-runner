@@ -45,6 +45,9 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         visible_think_token_cap_base: 256,
         prefer_hidden_think_for_multimodal: false,
         retry_without_think_when_no_post_think_text: false,
+        agent_force_deterministic: false,
+        agent_protocol_max_failures: 3,
+        agent_plain_chat_fallback_after_protocol_failures: false,
     }
 }
 

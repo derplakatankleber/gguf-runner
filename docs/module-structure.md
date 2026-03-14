@@ -87,7 +87,8 @@ src/
   - tool-agent support is orthogonal to operation mode:
     - default `allowed-tools=none` in `oneshot`
     - default `allowed-tools=all` in `repl`
-    - when tools are enabled, requests are handled via `app::agent`
+    - when tools are enabled, the runner chooses between standard generation and `app::agent`
+      based on prompt/tool eligibility rather than forcing every REPL turn through the agent planner
     - when tools are disabled, requests are handled via standard generation
   - print profiling/timing summaries
 
@@ -103,11 +104,15 @@ src/
   - slash-command managed REPL state, including persistent image attachments (`/image`, `/images`, `/clear-images`, `/clear`)
   - prompt history navigation
   - rolling non-agent chat history for continuous multi-turn conversations
-  - status line updates during turn execution
+  - status line updates during turn execution:
+    - standard generation progress uses prefill/decode counters, throughput, and a context gauge
+    - agent/tool turns consume typed `RunnerStatus` values and render them as explicit phase labels such as planning, tool execution, finalizing, and recovery
   - a single background worker thread that owns the only `ModelRuntime` instance in `repl` mode
   - command/event channels between UI thread and runtime worker
-  - streamed assistant/debug/system output printed directly into terminal scrollback
+  - streamed assistant output plus typed runner logs printed directly into terminal scrollback
 - Uses native multimodal generation for turns with active image attachments, rather than routing image access through tool-agent calls.
+- When tools are enabled, only tool-likely prompts are routed into the agent runner; ordinary chat remains on the standard text-generation path.
+- Plain text REPL chat runs with `think=no` to avoid exposing raw chain-of-thought or losing the visible answer on reasoning-model chat templates; oneshot behavior remains unchanged.
 - Active REPL media attachments can initialize external multimodal support lazily on first use, including local `mmproj` sidecar discovery/loading for sidecar-backed vision families.
 - Loads the runtime inside the worker thread so the REPL owns runtime lifecycle end-to-end and enforces one active runtime.
 
@@ -116,8 +121,13 @@ src/
 - Shared app-level runtime event types for streamed REPL output.
 - Defines the event callback used by:
   - `app::generation` for visible token chunks and debug lines
-  - `app::agent` for tool-call/info/error/final events
+  - `app::agent` for typed runner logs, final output, and explicit footer status updates during agent turns
 - Keeps event transport in `app/` so `engine/` stays independent of UI/orchestration concerns.
+- The runner/UI boundary is typed:
+  - `RuntimeEvent::Output(String)` for visible assistant text
+  - `RuntimeEvent::Log(RuntimeLog)` for debug/system/error messages
+  - `RuntimeEvent::Status(RunnerStatus)` for orchestration state such as planning, tool execution, finalizing, and recovery
+  - `RuntimeEvent::Progress(RuntimeProgress)` for numeric decode/prefill progress
 
 ### `src/app/generation.rs`
 
@@ -135,6 +145,7 @@ src/
   - `generate_chat_messages_for_repl(...)` for multi-turn REPL chat encoded through vendor-native chat templates
   - `generate_text_with_images(...)` (image path routes through structured request execution)
     - qwen35 image route appends a non-hallucination guard instruction for unreadable text regions
+  - `generate_text_for_agent(...)` for strict agent JSON turns; uses vendor decode policy generically for deterministic agent-mode settings instead of family branches in app logic
   - `generate_request(...)` for structured multimodal requests (`GenerationRequest`) with:
     - structured prompt encoding via `vendors::encode_generation_request(...)`
     - placeholder-span/media alignment checks for image/video/audio inputs
@@ -166,6 +177,17 @@ src/
 - For REPL multi-turn chat, trims oldest encoded turns when chat history outgrows the model context window, preserving the newest exchange.
 
 ### `src/app/agent.rs`
+
+- Engine-owned agent runner/tool loop:
+  - one agent turn = one structured model decision (`tool_call` or `final`)
+  - agent JSON is used only for control flow; final user-facing prose is generated in a separate plain-text step so long answers are not forced into JSON strings
+  - retries malformed agent JSON up to a vendor-policy-defined budget
+  - can fall back to plain chat for weak models after repeated malformed non-tool turns, using clean chat history instead of the internal protocol-repair transcript
+- Internal runner roles are split explicitly:
+  - `AgentPlanner` handles structured control decisions
+  - `ToolRunner` executes host tools and produces transcript entries
+  - `FinalAnswerGenerator` produces the final plain-text answer after planning completes
+- Emits typed runner logs/status into `app::events` so UI code does not infer runner state from raw model text or free-form status strings.
 
 - Tool-agent orchestration loop for multi-step runs.
 - Entrypoint accepts per-turn prompt text, so the same agent loop can be used from both `oneshot` and `repl` modes.

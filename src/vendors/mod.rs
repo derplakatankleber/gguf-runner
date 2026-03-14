@@ -40,6 +40,9 @@ pub(crate) struct VendorDecodePolicy {
     pub(crate) visible_think_token_cap_base: usize,
     pub(crate) prefer_hidden_think_for_multimodal: bool,
     pub(crate) retry_without_think_when_no_post_think_text: bool,
+    pub(crate) agent_force_deterministic: bool,
+    pub(crate) agent_protocol_max_failures: usize,
+    pub(crate) agent_plain_chat_fallback_after_protocol_failures: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -672,9 +675,9 @@ pub(crate) fn encode_generation_request(
 
 pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
     if config.is_qwen35 {
-        qwen35::decode_policy()
+        qwen35::decode_policy(config)
     } else if config.is_qwen3vl {
-        qwen3vl::decode_policy()
+        qwen3vl::decode_policy(config)
     } else if config.is_qwen3next {
         qwen3next::decode_policy(config)
     } else if config.is_qwen3moe {

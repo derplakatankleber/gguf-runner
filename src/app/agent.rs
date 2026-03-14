@@ -1,4 +1,6 @@
-use crate::app::events::{emit_runtime_event, RuntimeEvent, RuntimeEventCallback};
+use crate::app::events::{
+    emit_runtime_event, RunnerStatus, RuntimeEvent, RuntimeEventCallback, RuntimeLog,
+};
 use crate::app::generation::ModelRuntime;
 use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
 use crate::tools::ToolExecutor;
@@ -11,10 +13,51 @@ struct AgentMessage {
     content: String,
 }
 
+struct AgentPlanner<'a> {
+    runtime: &'a mut ModelRuntime,
+    system_prompt: &'a str,
+    callback: Option<&'a RuntimeEventCallback>,
+    debug: bool,
+}
+
+struct ToolRunner<'a> {
+    tool_exec: &'a ToolExecutor,
+    callback: Option<&'a RuntimeEventCallback>,
+}
+
+struct FinalAnswerGenerator<'a> {
+    runtime: &'a mut ModelRuntime,
+    system_prompt: &'a str,
+    callback: Option<&'a RuntimeEventCallback>,
+}
+
+enum PlannerOutcome {
+    Response {
+        response: AgentResponse,
+        raw: String,
+    },
+    ParseError {
+        parse_error: String,
+        raw: String,
+    },
+}
+
+struct ToolExecution {
+    assistant_transcript: String,
+    tool_transcript: String,
+}
+
+struct ToolRunRequest {
+    turn: usize,
+    max_turns: usize,
+    max_tool_calls: usize,
+    tool: String,
+    args: Option<Value>,
+}
+
 pub(crate) enum AgentRunEvent {
-    Info(String),
+    Log(RuntimeLog),
     Output(String),
-    Error(String),
 }
 
 pub(crate) struct AgentRunResult {
@@ -27,19 +70,200 @@ fn push_agent_event(
     callback: Option<&RuntimeEventCallback>,
 ) {
     let runtime_event = match &event {
-        AgentRunEvent::Info(text) => RuntimeEvent::Info(text.clone()),
+        AgentRunEvent::Log(log) => RuntimeEvent::Log(log.clone()),
         AgentRunEvent::Output(text) => RuntimeEvent::Output(text.clone()),
-        AgentRunEvent::Error(text) => RuntimeEvent::Error(text.clone()),
     };
     emit_runtime_event(callback, runtime_event);
     events.push(event);
 }
 
+fn emit_agent_status(callback: Option<&RuntimeEventCallback>, status: RunnerStatus) {
+    emit_runtime_event(callback, RuntimeEvent::Status(status));
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AgentResponse {
-    Final { content: String },
+    Final { content: Option<String> },
     ToolCall { tool: String, args: Option<Value> },
+}
+
+impl<'a> AgentPlanner<'a> {
+    fn plan_turn(
+        &mut self,
+        transcript: &[AgentMessage],
+        turn: usize,
+        max_turns: usize,
+        events: &mut Vec<AgentRunEvent>,
+    ) -> Result<PlannerOutcome, String> {
+        emit_agent_status(self.callback, RunnerStatus::Planning { turn, max_turns });
+        if self.debug {
+            push_agent_event(
+                events,
+                AgentRunEvent::Log(RuntimeLog::debug(format!("Agent turn {turn}/{max_turns}"))),
+                self.callback,
+            );
+        }
+        let turn_prompt = build_turn_prompt(transcript);
+        let original_callback = self.runtime.runtime_event_callback();
+        let filtered_callback = self.callback.map(|outer| {
+            let outer = outer.clone();
+            std::sync::Arc::new(move |event: RuntimeEvent| {
+                if !matches!(event, RuntimeEvent::Output(_)) {
+                    outer(event);
+                }
+            }) as RuntimeEventCallback
+        });
+        self.runtime.set_runtime_event_callback(filtered_callback);
+        let raw = self
+            .runtime
+            .generate_text_for_agent(&turn_prompt, self.system_prompt, false);
+        self.runtime.set_runtime_event_callback(original_callback);
+        let raw = raw?;
+        if self.debug {
+            push_agent_event(
+                events,
+                AgentRunEvent::Log(RuntimeLog::debug(format!(
+                    "Agent raw output bytes: {}",
+                    raw.len()
+                ))),
+                self.callback,
+            );
+        }
+        Ok(match parse_agent_response(&raw) {
+            Ok(response) => PlannerOutcome::Response { response, raw },
+            Err(parse_error) => PlannerOutcome::ParseError { parse_error, raw },
+        })
+    }
+}
+
+impl<'a> ToolRunner<'a> {
+    fn execute(
+        &self,
+        tool_calls: &mut usize,
+        request: ToolRunRequest,
+        events: &mut Vec<AgentRunEvent>,
+    ) -> Result<ToolExecution, String> {
+        emit_agent_status(
+            self.callback,
+            RunnerStatus::Tool {
+                turn: request.turn,
+                max_turns: request.max_turns,
+                tool: request.tool.clone(),
+            },
+        );
+        if *tool_calls >= request.max_tool_calls {
+            return Err(format!(
+                "max-tool-calls ({}) reached before final response",
+                request.max_tool_calls
+            ));
+        }
+        *tool_calls += 1;
+        let tool = request.tool;
+        let args = request.args.unwrap_or_else(|| json!({}));
+        let args_json =
+            serde_json::to_string(&args).unwrap_or_else(|_| "<invalid-json>".to_string());
+        push_agent_event(
+            events,
+            AgentRunEvent::Log(RuntimeLog::system(format!(
+                "Tool call [{}]: {} args={}",
+                *tool_calls, tool, args_json
+            ))),
+            self.callback,
+        );
+        let tool_result = match self.tool_exec.execute(&tool, &args) {
+            Ok(v) => v,
+            Err(e) => {
+                if tool == "shell_exec" {
+                    push_agent_event(
+                        events,
+                        AgentRunEvent::Log(RuntimeLog::error(format!("shell_exec error: {e}"))),
+                        self.callback,
+                    );
+                }
+                json!({
+                    "ok": false,
+                    "tool": tool,
+                    "error": e
+                })
+            }
+        };
+        if tool == "shell_exec"
+            && tool_result.get("ok").and_then(Value::as_bool) == Some(false)
+            && tool_result.get("exit_code").is_some()
+        {
+            let exit_code = tool_result
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let stderr = tool_result
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let stderr_preview = stderr.trim().chars().take(240).collect::<String>();
+            if stderr_preview.is_empty() {
+                push_agent_event(
+                    events,
+                    AgentRunEvent::Log(RuntimeLog::error(format!(
+                        "shell_exec failed (exit_code={exit_code})"
+                    ))),
+                    self.callback,
+                );
+            } else {
+                push_agent_event(
+                    events,
+                    AgentRunEvent::Log(RuntimeLog::error(format!(
+                        "shell_exec failed (exit_code={exit_code}): {}",
+                        stderr_preview
+                    ))),
+                    self.callback,
+                );
+            }
+        }
+        let tool_result_text =
+            serde_json::to_string_pretty(&tool_result).map_err(|e| e.to_string())?;
+        Ok(ToolExecution {
+            assistant_transcript: format!(
+                "tool_call\n{}",
+                json!({
+                    "tool": tool,
+                    "args": args
+                })
+            ),
+            tool_transcript: tool_result_text,
+        })
+    }
+}
+
+impl<'a> FinalAnswerGenerator<'a> {
+    fn generate(
+        &mut self,
+        prior_chat_history: &[ChatMessage],
+        transcript: &[AgentMessage],
+        prompt: &str,
+        inline_content: Option<&str>,
+    ) -> Result<String, String> {
+        if transcript.iter().all(|message| message.role != "tool") {
+            return fallback_to_plain_chat(
+                self.runtime,
+                prior_chat_history,
+                prompt,
+                self.system_prompt,
+                self.callback,
+            );
+        }
+
+        let synthesis_prompt = build_tool_answer_prompt(prompt, transcript, inline_content);
+        let original_callback = self.runtime.runtime_event_callback();
+        self.runtime
+            .set_runtime_event_callback(self.callback.cloned());
+        let output =
+            self.runtime
+                .generate_text_without_think(&synthesis_prompt, self.system_prompt, false);
+        self.runtime.set_runtime_event_callback(original_callback);
+        output
+    }
 }
 
 pub(crate) fn run_agent_loop(
@@ -50,9 +274,8 @@ pub(crate) fn run_agent_loop(
     let result = run_agent_loop_collect(runtime, cli, prompt)?;
     for event in result.events {
         match event {
-            AgentRunEvent::Info(text) => eprintln!("{text}"),
+            AgentRunEvent::Log(log) => eprintln!("{}", log.message),
             AgentRunEvent::Output(text) => println!("{text}"),
-            AgentRunEvent::Error(text) => eprintln!("{text}"),
         }
     }
     Ok(())
@@ -78,6 +301,7 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
         cli.tool_enablement.clone(),
         &cli.allow_shell_commands,
     )?;
+    let decode_policy = runtime.vendor_decode_policy();
     let system_prompt = build_agent_system_prompt(
         &cli.system_prompt,
         &tool_exec,
@@ -101,7 +325,7 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
     let mut tool_calls = 0usize;
     let mut protocol_failures = 0usize;
     let mut events = Vec::new();
-    let max_protocol_failures = 3usize;
+    let max_protocol_failures = decode_policy.agent_protocol_max_failures.max(1);
     let max_turns = cli
         .max_tool_calls
         .saturating_mul(3)
@@ -109,38 +333,30 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
         .min(64);
     let require_tool_before_final =
         prompt_requires_filesystem(prompt) && tool_exec.has_any_filesystem_tool();
+    let mut planner = AgentPlanner {
+        runtime,
+        system_prompt: &system_prompt,
+        callback,
+        debug: cli.debug,
+    };
+    let tool_runner = ToolRunner {
+        tool_exec: &tool_exec,
+        callback,
+    };
 
     for turn in 0..max_turns {
-        if cli.debug {
-            push_agent_event(
-                &mut events,
-                AgentRunEvent::Info(format!("Agent turn {}/{}", turn + 1, max_turns)),
-                callback,
-            );
-        }
-        let turn_prompt = build_turn_prompt(&transcript);
-        let original_callback = runtime.runtime_event_callback();
-        let filtered_callback = callback.map(|outer| {
-            let outer = outer.clone();
-            std::sync::Arc::new(move |event: RuntimeEvent| {
-                if !matches!(event, RuntimeEvent::Output(_)) {
-                    outer(event);
-                }
-            }) as RuntimeEventCallback
-        });
-        runtime.set_runtime_event_callback(filtered_callback);
-        let raw = runtime.generate_text_for_agent(&turn_prompt, &system_prompt, false);
-        runtime.set_runtime_event_callback(original_callback);
-        let raw = raw?;
-        if cli.debug {
-            push_agent_event(
-                &mut events,
-                AgentRunEvent::Info(format!("Agent raw output bytes: {}", raw.len())),
-                callback,
-            );
-        }
-        match parse_agent_response(&raw) {
-            Ok(AgentResponse::Final { content }) => {
+        match planner.plan_turn(&transcript, turn + 1, max_turns, &mut events)? {
+            PlannerOutcome::Response {
+                response: AgentResponse::Final { content },
+                raw: _raw,
+            } => {
+                emit_agent_status(
+                    callback,
+                    RunnerStatus::Finalizing {
+                        turn: turn + 1,
+                        max_turns,
+                    },
+                );
                 if require_tool_before_final && tool_calls == 0 {
                     protocol_failures += 1;
                     if protocol_failures > max_protocol_failures {
@@ -156,104 +372,53 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
                     });
                     continue;
                 }
+                let mut final_answer_generator = FinalAnswerGenerator {
+                    runtime: planner.runtime,
+                    system_prompt: &cli.system_prompt,
+                    callback,
+                };
+                let content = final_answer_generator.generate(
+                    prior_chat_history,
+                    &transcript,
+                    prompt,
+                    content.as_deref(),
+                )?;
                 push_agent_event(&mut events, AgentRunEvent::Output(content), callback);
                 return Ok(AgentRunResult { events });
             }
-            Ok(AgentResponse::ToolCall { tool, args }) => {
-                if tool_calls >= cli.max_tool_calls {
-                    return Err(format!(
-                        "max-tool-calls ({}) reached before final response",
-                        cli.max_tool_calls
-                    ));
-                }
-                tool_calls += 1;
-                let args = args.unwrap_or_else(|| json!({}));
-                let args_json =
-                    serde_json::to_string(&args).unwrap_or_else(|_| "<invalid-json>".to_string());
-                push_agent_event(
+            PlannerOutcome::Response {
+                response: AgentResponse::ToolCall { tool, args },
+                raw: _raw,
+            } => {
+                let tool_execution = tool_runner.execute(
+                    &mut tool_calls,
+                    ToolRunRequest {
+                        turn: turn + 1,
+                        max_turns,
+                        max_tool_calls: cli.max_tool_calls,
+                        tool,
+                        args,
+                    },
                     &mut events,
-                    AgentRunEvent::Info(format!(
-                        "Tool call [{}]: {} args={}",
-                        tool_calls, tool, args_json
-                    )),
-                    callback,
-                );
-                let tool_result = match tool_exec.execute(&tool, &args) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if tool == "shell_exec" {
-                            push_agent_event(
-                                &mut events,
-                                AgentRunEvent::Error(format!("shell_exec error: {e}")),
-                                callback,
-                            );
-                        }
-                        json!({
-                            "ok": false,
-                            "tool": tool,
-                            "error": e
-                        })
-                    }
-                };
-                if tool == "shell_exec"
-                    && tool_result.get("ok").and_then(Value::as_bool) == Some(false)
-                    && tool_result.get("exit_code").is_some()
-                {
-                    let exit_code = tool_result
-                        .get("exit_code")
-                        .and_then(Value::as_i64)
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let stderr = tool_result
-                        .get("stderr")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let stderr_preview = stderr.trim().chars().take(240).collect::<String>();
-                    if stderr_preview.is_empty() {
-                        push_agent_event(
-                            &mut events,
-                            AgentRunEvent::Error(format!(
-                                "shell_exec failed (exit_code={exit_code})"
-                            )),
-                            callback,
-                        );
-                    } else {
-                        push_agent_event(
-                            &mut events,
-                            AgentRunEvent::Error(format!(
-                                "shell_exec failed (exit_code={exit_code}): {}",
-                                stderr_preview
-                            )),
-                            callback,
-                        );
-                    }
-                }
-                let tool_result_text =
-                    serde_json::to_string_pretty(&tool_result).map_err(|e| e.to_string())?;
+                )?;
                 transcript.push(AgentMessage {
                     role: "assistant",
-                    content: format!(
-                        "tool_call\n{}",
-                        json!({
-                            "tool": tool,
-                            "args": args
-                        })
-                    ),
+                    content: tool_execution.assistant_transcript,
                 });
                 transcript.push(AgentMessage {
                     role: "tool",
-                    content: tool_result_text,
+                    content: tool_execution.tool_transcript,
                 });
             }
-            Err(parse_error) => {
+            PlannerOutcome::ParseError { parse_error, raw } => {
                 if cli.debug {
                     let preview = raw.trim().chars().take(180).collect::<String>();
                     push_agent_event(
                         &mut events,
-                        AgentRunEvent::Error(format!(
+                        AgentRunEvent::Log(RuntimeLog::error(format!(
                             "Agent protocol parse error: {} | preview: {}",
                             parse_error, preview
-                        )),
+                        ))),
                         callback,
                     );
                 }
@@ -267,10 +432,10 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
                     if cli.debug {
                         push_agent_event(
                             &mut events,
-                            AgentRunEvent::Info(format!(
+                            AgentRunEvent::Log(RuntimeLog::debug(format!(
                                 "Agent protocol fallback after tool call(s): {}",
                                 parse_error
-                            )),
+                            ))),
                             callback,
                         );
                     }
@@ -284,6 +449,39 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
                 protocol_failures += 1;
                 if protocol_failures > max_protocol_failures {
                     if !require_tool_before_final {
+                        if let Some(content) = extract_agent_final_content(&raw) {
+                            push_agent_event(&mut events, AgentRunEvent::Output(content), callback);
+                            return Ok(AgentRunResult { events });
+                        }
+                        if tool_calls == 0
+                            && decode_policy.agent_plain_chat_fallback_after_protocol_failures
+                        {
+                            if cli.debug {
+                                push_agent_event(
+                                    &mut events,
+                                    AgentRunEvent::Log(RuntimeLog::debug(
+                                        "Agent protocol exhausted; falling back to plain chat",
+                                    )),
+                                    callback,
+                                );
+                            }
+                            emit_agent_status(
+                                callback,
+                                RunnerStatus::Recovering {
+                                    turn: turn + 1,
+                                    max_turns,
+                                },
+                            );
+                            let content = fallback_to_plain_chat(
+                                runtime,
+                                prior_chat_history,
+                                prompt,
+                                &cli.system_prompt,
+                                callback,
+                            )?;
+                            push_agent_event(&mut events, AgentRunEvent::Output(content), callback);
+                            return Ok(AgentRunResult { events });
+                        }
                         let fallback = raw.trim();
                         if !fallback.is_empty() {
                             push_agent_event(
@@ -300,7 +498,7 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
                         max_protocol_failures, parse_error, raw_preview
                     ));
                 }
-                let mut protocol_msg = "Protocol error: reply with exactly one JSON object only. Use either {\"type\":\"tool_call\",\"tool\":\"...\",\"args\":{...}} or {\"type\":\"final\",\"content\":\"...\"}."
+                let mut protocol_msg = "Protocol error: reply with exactly one JSON object only. Use either {\"type\":\"tool_call\",\"tool\":\"...\",\"args\":{...}} or {\"type\":\"final\"}."
                     .to_string();
                 if require_tool_before_final && tool_calls == 0 {
                     protocol_msg.push_str(
@@ -316,6 +514,25 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
     }
 
     Err("agent loop reached maximum turns without final response".to_string())
+}
+
+fn fallback_to_plain_chat(
+    runtime: &mut ModelRuntime,
+    prior_chat_history: &[ChatMessage],
+    prompt: &str,
+    system_prompt: &str,
+    callback: Option<&RuntimeEventCallback>,
+) -> Result<String, String> {
+    let mut messages = prior_chat_history.to_vec();
+    messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: prompt.to_string(),
+    });
+    let original_callback = runtime.runtime_event_callback();
+    runtime.set_runtime_event_callback(callback.cloned());
+    let output = runtime.generate_chat_messages_without_think_for_repl(&messages, system_prompt);
+    runtime.set_runtime_event_callback(original_callback);
+    output
 }
 
 fn build_agent_system_prompt(
@@ -357,8 +574,8 @@ Use compact JSON on a single line, with keys in the exact order shown below.\n\
 Allowed response schemas:\n\
 1) Tool call:\n\
 {{\"type\":\"tool_call\",\"tool\":\"{}\",\"args\":{{...}}}}\n\
-2) Final answer:\n\
-{{\"type\":\"final\",\"content\":\"...\"}}\n\
+2) Final decision:\n\
+{{\"type\":\"final\"}}\n\
 Rules:\n\
 {}\n\
 Runtime constraints:\n\
@@ -368,6 +585,7 @@ Runtime constraints:\n\
 - max read/write payload per call: 262144 bytes\n\
 Output rules:\n\
 - If the user asks about files/repo contents and filesystem tools are enabled, call a filesystem tool before final.\n\
+- Use `type=final` when you are done deciding. Do not put long natural-language answers inside the JSON object.\n\
 - If a tool call fails due args shape, fix the args and retry.\n\
 - Avoid prose outside the single JSON object.\n",
         allowed_tool_names,
@@ -446,6 +664,38 @@ fn build_turn_prompt(transcript: &[AgentMessage]) -> String {
     out
 }
 
+fn build_tool_answer_prompt(
+    prompt: &str,
+    transcript: &[AgentMessage],
+    inline_content: Option<&str>,
+) -> String {
+    let mut out = String::from(
+        "Use the tool transcript below to answer the user's request. Respond with plain text only.\n\n",
+    );
+    out.push_str("User request:\n");
+    out.push_str(prompt);
+    out.push_str("\n\nTool transcript:\n");
+    for msg in transcript {
+        if msg.role == "tool" || msg.role == "assistant" {
+            out.push_str("<<<");
+            out.push_str(msg.role);
+            out.push_str(">>>\n");
+            out.push_str(&msg.content);
+            out.push('\n');
+        }
+    }
+    if let Some(content) = inline_content {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            out.push_str("\nDraft final answer:\n");
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out.push_str("\nAnswer the user now.");
+    out
+}
+
 fn parse_agent_response(raw: &str) -> Result<AgentResponse, String> {
     if let Ok(parsed) = serde_json::from_str::<AgentResponse>(raw.trim()) {
         return Ok(parsed);
@@ -468,14 +718,41 @@ fn parse_agent_response(raw: &str) -> Result<AgentResponse, String> {
     }
 }
 
-fn parse_agent_response_from_value(value: Value) -> Result<AgentResponse, String> {
-    if let Some(content) = value.get("content").and_then(Value::as_str) {
-        if value.get("type").and_then(Value::as_str) == Some("final") || value.get("type").is_none()
-        {
-            return Ok(AgentResponse::Final {
-                content: content.to_string(),
-            });
+fn extract_agent_final_content(raw: &str) -> Option<String> {
+    if let Ok(AgentResponse::Final {
+        content: Some(content),
+    }) = serde_json::from_str::<AgentResponse>(raw.trim())
+    {
+        return Some(content);
+    }
+    for value in extract_json_objects(raw) {
+        if let Some(content) = value.get("content").and_then(Value::as_str) {
+            if value.get("type").and_then(Value::as_str) == Some("final")
+                || value.get("type").is_none()
+            {
+                return Some(content.to_string());
+            }
         }
+    }
+    None
+}
+
+fn parse_agent_response_from_value(value: Value) -> Result<AgentResponse, String> {
+    if value.get("type").and_then(Value::as_str) == Some("final") {
+        return Ok(AgentResponse::Final {
+            content: value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|content| content.to_string()),
+        });
+    }
+    if value.get("type").is_none() && value.get("content").and_then(Value::as_str).is_some() {
+        return Ok(AgentResponse::Final {
+            content: value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|content| content.to_string()),
+        });
     }
     if let Some(tool) = value.get("tool").and_then(Value::as_str) {
         let args = value.get("args").cloned();
@@ -530,13 +807,73 @@ fn prompt_requires_filesystem(prompt: &str) -> bool {
     hints.iter().any(|h| p.contains(h))
 }
 
+pub(crate) fn prompt_likely_requires_tools(
+    prompt: &str,
+    filesystem_tools_enabled: bool,
+    shell_tools_enabled: bool,
+) -> bool {
+    if filesystem_tools_enabled && prompt_requires_filesystem(prompt) {
+        return true;
+    }
+    if shell_tools_enabled {
+        let p = prompt.to_ascii_lowercase();
+        let shell_hints = [
+            "shell", "command", "terminal", "bash", "zsh", "sh ", "run ", "execute ", "exec ",
+            "ls", "pwd", "find ", "grep ", "rg ", "cat ", "cargo ", "git ", "curl ",
+        ];
+        if shell_hints.iter().any(|h| p.contains(h)) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::looks_like_reasonable_fallback_text;
+    use super::{
+        extract_agent_final_content, looks_like_reasonable_fallback_text, parse_agent_response,
+        prompt_likely_requires_tools, AgentResponse,
+    };
 
     #[test]
     fn fallback_text_guard_rejects_numeric_gibberish() {
         let gibberish = "000003 010 1000 200000101 01 600006 00000 000106 40 00016560";
         assert!(!looks_like_reasonable_fallback_text(gibberish));
+    }
+
+    #[test]
+    fn extract_agent_final_content_from_json_prefix_with_trailing_text() {
+        let raw = "{\"type\":\"final\",\"content\":\"Paris is a good weekend destination.\"}Paris is a good weekend destination.";
+        assert_eq!(
+            extract_agent_final_content(raw).as_deref(),
+            Some("Paris is a good weekend destination.")
+        );
+    }
+
+    #[test]
+    fn parse_agent_response_accepts_final_without_content() {
+        let parsed = parse_agent_response("{\"type\":\"final\"}").expect("final response");
+        match parsed {
+            AgentResponse::Final { content } => assert!(content.is_none()),
+            AgentResponse::ToolCall { .. } => panic!("expected final response"),
+        }
+    }
+
+    #[test]
+    fn prompt_tool_routing_stays_off_for_plain_chat() {
+        assert!(!prompt_likely_requires_tools(
+            "what is the capital of france?",
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn prompt_tool_routing_detects_repo_requests() {
+        assert!(prompt_likely_requires_tools(
+            "can you inspect my Cargo.toml and list the dependencies?",
+            true,
+            false
+        ));
     }
 }

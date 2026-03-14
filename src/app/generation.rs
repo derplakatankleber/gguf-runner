@@ -148,7 +148,10 @@ fn append_visible_text(
 fn emit_debug_line(callback: Option<&RuntimeEventCallback>, text: impl Into<String>) {
     let text = text.into();
     if callback.is_some() {
-        emit_runtime_event(callback, RuntimeEvent::Debug(text));
+        emit_runtime_event(
+            callback,
+            RuntimeEvent::Log(crate::app::events::RuntimeLog::debug(text)),
+        );
     } else {
         eprintln!("{text}");
     }
@@ -354,6 +357,16 @@ fn match_final_response_prefix(text: &str) -> PrefixMatch {
         None if "final".starts_with(rest) => return PrefixMatch::Incomplete,
         None => return PrefixMatch::Invalid,
     };
+    if let Some(rest) = strip_literal_prefix(rest, "\"}") {
+        return if rest.is_empty() {
+            PrefixMatch::Complete
+        } else {
+            PrefixMatch::Invalid
+        };
+    }
+    if "\"}".starts_with(rest) {
+        return PrefixMatch::Incomplete;
+    }
     rest = match strip_literal_prefix(rest, "\",\"content\":\"") {
         Some(rest) => rest,
         None if "\",\"content\":\"".starts_with(rest) => return PrefixMatch::Incomplete,
@@ -1961,6 +1974,19 @@ impl ModelRuntime {
         self.generate_text_with_images(prompt, system_prompt, &[], stream_stdout)
     }
 
+    pub(crate) fn generate_text_without_think(
+        &mut self,
+        prompt: &str,
+        system_prompt: &str,
+        stream_stdout: bool,
+    ) -> Result<String, String> {
+        let original_think_mode = self.settings.think_mode;
+        self.settings.think_mode = ThinkMode::No;
+        let result = self.generate_text(prompt, system_prompt, stream_stdout);
+        self.settings.think_mode = original_think_mode;
+        result
+    }
+
     pub(crate) fn generate_text_for_agent(
         &mut self,
         prompt: &str,
@@ -1975,15 +2001,12 @@ impl ModelRuntime {
         let original_show_tokens = self.settings.show_tokens;
         let original_debug_mode = self.settings.debug_mode;
         let original_structured_output_mode = self.settings.structured_output_mode;
-        let unstable_agent_model =
-            self.config.is_qwen3moe || (self.config.is_qwen35 && self.config.n_experts > 0);
+        let decode_policy = self.settings.vendor_decode_policy;
 
         // Agent protocol adherence is more stable with no think tags and a bounded
         // decode budget. Pure argmax can degenerate on some models, so prefer a
         // conservative low-temperature/top-k profile instead.
-        if unstable_agent_model {
-            // Qwen MoE variants are significantly more likely to emit protocol noise
-            // with sampled decoding in tool mode; keep agent turns deterministic.
+        if decode_policy.agent_force_deterministic {
             self.settings.temperature = 0.0;
             self.settings.top_k = 1;
             self.settings.top_p = 1.0;
@@ -2089,12 +2112,28 @@ impl ModelRuntime {
         self.retry_without_think_for_request(output, &request, false)
     }
 
+    pub(crate) fn generate_chat_messages_without_think_for_repl(
+        &mut self,
+        messages: &[crate::vendors::ChatMessage],
+        system_prompt: &str,
+    ) -> Result<String, String> {
+        let original_think_mode = self.settings.think_mode;
+        self.settings.think_mode = ThinkMode::No;
+        let result = self.generate_chat_messages_for_repl(messages, system_prompt);
+        self.settings.think_mode = original_think_mode;
+        result
+    }
+
     pub(crate) fn set_runtime_event_callback(&mut self, callback: Option<RuntimeEventCallback>) {
         self.settings.runtime_event_callback = callback;
     }
 
     pub(crate) fn runtime_event_callback(&self) -> Option<RuntimeEventCallback> {
         self.settings.runtime_event_callback.clone()
+    }
+
+    pub(crate) fn vendor_decode_policy(&self) -> crate::vendors::VendorDecodePolicy {
+        self.settings.vendor_decode_policy
     }
 
     pub(crate) fn set_debug_mode(&mut self, enabled: bool) {
@@ -2500,6 +2539,8 @@ impl ModelRuntime {
                 phase: RuntimePhase::Prefill,
                 prefill_tokens: prompt_tokens.len(),
                 decode_tokens: 0,
+                hidden_thinking: false,
+                hidden_think_tokens: 0,
                 tokens_per_second: None,
                 context_used: prompt_tokens.len(),
                 context_limit: self.config.seq_len,
@@ -2896,6 +2937,8 @@ impl ModelRuntime {
                             phase: RuntimePhase::Decode,
                             prefill_tokens: prompt_tokens.len(),
                             decode_tokens,
+                            hidden_thinking: think_mode == ThinkMode::Hidden && is_thinking,
+                            hidden_think_tokens: hidden_think_token_count,
                             tokens_per_second: tok_s,
                             context_used: prompt_tokens.len().saturating_add(decode_tokens),
                             context_limit: self.config.seq_len,
@@ -3189,6 +3232,8 @@ impl ModelRuntime {
                 phase: RuntimePhase::Ready,
                 prefill_tokens: prompt_tokens.len(),
                 decode_tokens: generated_tokens.len(),
+                hidden_thinking: false,
+                hidden_think_tokens: hidden_think_token_count,
                 tokens_per_second: if pos > 1 {
                     let elapsed_ms = (end - start).max(1) as f64;
                     Some((pos - 1) as f64 / elapsed_ms * 1000.0)
@@ -3436,6 +3481,14 @@ mod tests {
         assert_eq!(
             match_agent_response_prefix("{\"type\":\"final\",\"content\":\"Bei"),
             PrefixMatch::Incomplete
+        );
+    }
+
+    #[test]
+    fn agent_json_prefix_accepts_compact_final_decision() {
+        assert_eq!(
+            match_agent_response_prefix("{\"type\":\"final\"}"),
+            PrefixMatch::Complete
         );
     }
 

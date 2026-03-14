@@ -1,6 +1,7 @@
 use crate::app::agent;
 use crate::app::events::{
-    emit_runtime_event, RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress,
+    emit_runtime_event, RunnerStatus, RuntimeEvent, RuntimeEventCallback, RuntimeLog,
+    RuntimeLogKind, RuntimePhase, RuntimeProgress,
 };
 use crate::app::generation::ModelRuntime;
 use crate::app::{collect_debug_banner_lines, expand_repl_tab_completion, handle_repl_command};
@@ -30,6 +31,9 @@ struct ReplApp {
     pending_assistant_output: String,
     assistant_line_open: bool,
     status: ReplStatus,
+    status_override_left: Option<String>,
+    session_output_tokens: usize,
+    last_progress_decode_tokens: usize,
     busy: bool,
     runtime_ready: bool,
 }
@@ -55,33 +59,69 @@ impl ReplApp {
                 left: "Loading model...".to_string(),
                 right: String::new(),
             },
+            status_override_left: None,
+            session_output_tokens: 0,
+            last_progress_decode_tokens: 0,
             busy: false,
             runtime_ready: false,
         }
     }
 
     fn set_status(&mut self, text: impl Into<String>) {
+        self.status_override_left = None;
         self.status.left = text.into();
         self.status.right.clear();
     }
 
+    fn set_ready_status(&mut self) {
+        self.status_override_left = None;
+        self.status.left = "Ready".to_string();
+    }
+
+    fn set_status_override(&mut self, status: RunnerStatus) {
+        self.status_override_left = Some(format_runner_status(&status));
+        if let Some(left) = &self.status_override_left {
+            self.status.left = left.clone();
+        }
+    }
+
+    fn clear_status_override(&mut self) {
+        self.status_override_left = None;
+    }
+
     fn set_progress(&mut self, progress: RuntimeProgress) {
-        let phase_label = match progress.phase {
-            RuntimePhase::Prefill => "prefill",
-            RuntimePhase::Decode => "decode",
-            RuntimePhase::Ready => "ready",
+        if progress.decode_tokens < self.last_progress_decode_tokens {
+            self.last_progress_decode_tokens = 0;
+        }
+        let delta = progress
+            .decode_tokens
+            .saturating_sub(self.last_progress_decode_tokens);
+        self.session_output_tokens = self.session_output_tokens.saturating_add(delta);
+        self.last_progress_decode_tokens = progress.decode_tokens;
+
+        let computed_left = if progress.hidden_thinking {
+            format!(
+                "thinking {} tok | decode {} tok",
+                progress.hidden_think_tokens, progress.decode_tokens
+            )
+        } else {
+            match progress.phase {
+                RuntimePhase::Ready => "Ready".to_string(),
+                RuntimePhase::Prefill | RuntimePhase::Decode => format!(
+                    "prefill {} tok | decode {} tok",
+                    progress.prefill_tokens, progress.decode_tokens
+                ),
+            }
         };
-        let left = match progress.phase {
-            RuntimePhase::Ready => "Ready".to_string(),
-            RuntimePhase::Prefill | RuntimePhase::Decode => format!(
-                "{phase_label} {} tok | decode {} tok",
-                progress.prefill_tokens, progress.decode_tokens
-            ),
-        };
+        let left = self.status_override_left.clone().unwrap_or(computed_left);
         let right = if progress.context_limit == 0 {
             String::new()
         } else {
             let mut parts = Vec::new();
+            parts.push(format!(
+                "out {} tok",
+                format_compact_token_count(self.session_output_tokens)
+            ));
             if let Some(tok_s) = progress.tokens_per_second {
                 parts.push(format!("{tok_s:.1} tok/s"));
             }
@@ -98,6 +138,25 @@ impl ReplApp {
         self.input.clear();
         self.cursor = 0;
         self.history_index = None;
+    }
+
+    fn finish_turn_progress(&mut self) {
+        self.last_progress_decode_tokens = 0;
+    }
+
+    fn absorb_assistant_output(&mut self, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        if !self.pending_assistant_output.is_empty()
+            && text.starts_with(&self.pending_assistant_output)
+        {
+            let suffix = text[self.pending_assistant_output.len()..].to_string();
+            self.pending_assistant_output = text.to_string();
+            return suffix;
+        }
+        self.pending_assistant_output.push_str(text);
+        text.to_string()
     }
 
     fn insert_char(&mut self, ch: char) {
@@ -235,9 +294,13 @@ impl TerminalGuard {
 
     fn refresh_size(&mut self) -> Result<(), String> {
         let (width, height) = size().map_err(|e| format!("failed to get terminal size: {e}"))?;
+        let changed = width != self.width || height != self.height;
         self.width = width;
         self.height = height;
-        self.configure_scroll_region()
+        if changed {
+            self.configure_scroll_region()?;
+        }
+        Ok(())
     }
 
     fn configure_scroll_region(&mut self) -> Result<(), String> {
@@ -311,6 +374,21 @@ impl TerminalGuard {
         if chunk.is_empty() {
             return Ok(());
         }
+        if should_animate_assistant_chunk(app, chunk) {
+            for segment in chunk_segments_for_animation(chunk) {
+                self.print_assistant_chunk_immediate(app, segment)?;
+                thread::sleep(Duration::from_millis(6));
+            }
+            return Ok(());
+        }
+        self.print_assistant_chunk_immediate(app, chunk)
+    }
+
+    fn print_assistant_chunk_immediate(
+        &mut self,
+        app: &mut ReplApp,
+        chunk: &str,
+    ) -> Result<(), String> {
         let output_row = self.output_bottom_row_1based().saturating_sub(1);
         for segment in chunk.split_inclusive('\n') {
             if !app.assistant_line_open {
@@ -525,10 +603,9 @@ fn run_worker_turn(
         if cli.tools_enabled {
             emit_runtime_event(
                 Some(callback),
-                RuntimeEvent::Info(
-                    "Active image context detected; using native multimodal path for this turn."
-                        .to_string(),
-                ),
+                RuntimeEvent::Log(RuntimeLog::system(
+                    "Active image context detected; using native multimodal path for this turn.",
+                )),
             );
         }
         let request =
@@ -537,13 +614,28 @@ fn run_worker_turn(
         if output.trim().is_empty() {
             emit_runtime_event(
                 Some(callback),
-                RuntimeEvent::Info("<empty response>".to_string()),
+                RuntimeEvent::Log(RuntimeLog::system("<empty response>")),
             );
         }
         return Ok(());
     }
 
-    if cli.tools_enabled {
+    let shell_tools_enabled = cli.tool_enablement.shell_exec
+        || cli.tool_enablement.shell_list_allowed
+        || cli.tool_enablement.shell_request_allowed;
+    let filesystem_tools_enabled = cli.tool_enablement.read_file
+        || cli.tool_enablement.list_dir
+        || cli.tool_enablement.write_file
+        || cli.tool_enablement.mkdir
+        || cli.tool_enablement.rmdir;
+
+    if cli.tools_enabled
+        && agent::prompt_likely_requires_tools(
+            prompt,
+            filesystem_tools_enabled,
+            shell_tools_enabled,
+        )
+    {
         agent::run_agent_loop_collect_with_history_callback(
             runtime,
             cli,
@@ -559,11 +651,12 @@ fn run_worker_turn(
         role: ChatRole::User,
         content: prompt.to_string(),
     });
-    let output = runtime.generate_chat_messages_for_repl(&messages, &cli.system_prompt)?;
+    let output =
+        runtime.generate_chat_messages_without_think_for_repl(&messages, &cli.system_prompt)?;
     if output.trim().is_empty() {
         emit_runtime_event(
             Some(callback),
-            RuntimeEvent::Info("<empty response>".to_string()),
+            RuntimeEvent::Log(RuntimeLog::system("<empty response>")),
         );
     }
     Ok(())
@@ -578,7 +671,7 @@ fn drain_worker_events(
         match event_rx.try_recv() {
             Ok(WorkerEvent::RuntimeReady(Ok(()))) => {
                 app.runtime_ready = true;
-                app.set_status("Ready");
+                app.set_ready_status();
                 terminal.print_prefixed_lines(app, "[sys] ", "Runtime ready.")?;
             }
             Ok(WorkerEvent::RuntimeReady(Err(err))) => {
@@ -593,16 +686,29 @@ fn drain_worker_events(
             }
             Ok(WorkerEvent::Runtime(event)) => match event {
                 RuntimeEvent::Output(text) => {
-                    app.pending_assistant_output.push_str(&text);
-                    terminal.print_assistant_chunk(app, &text)?;
+                    let render = app.absorb_assistant_output(&text);
+                    if !render.is_empty() {
+                        terminal.print_assistant_chunk(app, &render)?;
+                    }
                 }
-                RuntimeEvent::Debug(text) => terminal.print_prefixed_lines(app, "[dbg] ", &text)?,
-                RuntimeEvent::Info(text) => terminal.print_prefixed_lines(app, "[sys] ", &text)?,
-                RuntimeEvent::Error(text) => terminal.print_prefixed_lines(app, "[err] ", &text)?,
+                RuntimeEvent::Log(log) => match log.kind {
+                    RuntimeLogKind::Debug => {
+                        terminal.print_prefixed_lines(app, "[dbg] ", &log.message)?
+                    }
+                    RuntimeLogKind::System => {
+                        terminal.print_prefixed_lines(app, "[sys] ", &log.message)?
+                    }
+                    RuntimeLogKind::Error => {
+                        terminal.print_prefixed_lines(app, "[err] ", &log.message)?
+                    }
+                },
+                RuntimeEvent::Status(status) => app.set_status_override(status),
                 RuntimeEvent::Progress(progress) => app.set_progress(progress),
             },
             Ok(WorkerEvent::TurnFinished(Ok(()))) => {
                 app.busy = false;
+                app.finish_turn_progress();
+                app.clear_status_override();
                 terminal.ensure_output_line_closed(app)?;
                 if let Some(prompt) = app.pending_user_prompt.take() {
                     app.chat_history.push(ChatMessage {
@@ -618,12 +724,14 @@ fn drain_worker_events(
                     }
                 }
                 app.pending_assistant_output.clear();
-                if app.runtime_ready && app.status.left == "Running model..." {
-                    app.set_status("Ready");
+                if app.runtime_ready {
+                    app.set_ready_status();
                 }
             }
             Ok(WorkerEvent::TurnFinished(Err(err))) => {
                 app.busy = false;
+                app.finish_turn_progress();
+                app.clear_status_override();
                 app.pending_user_prompt = None;
                 app.pending_assistant_output.clear();
                 terminal.ensure_output_line_closed(app)?;
@@ -697,7 +805,7 @@ fn dispatch_prompt(
                 terminal.print_prefixed_lines(app, "[sys] ", &line)?;
             }
             if !app.busy && app.runtime_ready {
-                app.set_status("Ready");
+                app.set_ready_status();
             }
             return Ok(false);
         }
@@ -718,7 +826,7 @@ fn dispatch_prompt(
                 )?;
             }
             if !app.busy && app.runtime_ready {
-                app.set_status("Ready");
+                app.set_ready_status();
             }
             return Ok(false);
         }
@@ -736,7 +844,7 @@ fn dispatch_prompt(
                 }
             }
             if !app.busy && app.runtime_ready {
-                app.set_status("Ready");
+                app.set_ready_status();
             }
             return Ok(false);
         }
@@ -749,7 +857,7 @@ fn dispatch_prompt(
                 &format!("Cleared {cleared} active image attachment(s)."),
             )?;
             if !app.busy && app.runtime_ready {
-                app.set_status("Ready");
+                app.set_ready_status();
             }
             return Ok(false);
         }
@@ -778,7 +886,7 @@ fn dispatch_prompt(
                 ),
             )?;
             if app.runtime_ready {
-                app.set_status("Ready");
+                app.set_ready_status();
             }
             return Ok(false);
         }
@@ -879,6 +987,25 @@ fn compose_status_line(status: &ReplStatus, width: usize) -> String {
     )
 }
 
+fn format_runner_status(status: &RunnerStatus) -> String {
+    match status {
+        RunnerStatus::Planning { turn, max_turns } => {
+            format!("agent turn {turn}/{max_turns} | planning")
+        }
+        RunnerStatus::Tool {
+            turn,
+            max_turns,
+            tool,
+        } => format!("agent turn {turn}/{max_turns} | tool {tool}"),
+        RunnerStatus::Finalizing { turn, max_turns } => {
+            format!("agent turn {turn}/{max_turns} | finalizing")
+        }
+        RunnerStatus::Recovering { turn, max_turns } => {
+            format!("agent turn {turn}/{max_turns} | recovering")
+        }
+    }
+}
+
 fn compose_input_line(input: &str, cursor: usize, width: usize) -> (String, u16) {
     let prefix = "> ";
     if width <= prefix.len() {
@@ -905,6 +1032,43 @@ fn truncate_for_width(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
 
+fn should_animate_assistant_chunk(app: &ReplApp, chunk: &str) -> bool {
+    !app.assistant_line_open && chunk.chars().count() >= 96
+}
+
+fn chunk_segments_for_animation(text: &str) -> Vec<&str> {
+    const TARGET_SEGMENT_CHARS: usize = 20;
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut current_len = 0usize;
+    let mut saw_split = false;
+
+    for (idx, ch) in text.char_indices() {
+        current_len += 1;
+        let boundary = ch == '\n' || (ch.is_whitespace() && current_len >= TARGET_SEGMENT_CHARS);
+        if boundary {
+            let end = idx + ch.len_utf8();
+            if end > start {
+                segments.push(&text[start..end]);
+                start = end;
+                current_len = 0;
+                saw_split = true;
+            }
+        }
+    }
+
+    if start < text.len() {
+        segments.push(&text[start..]);
+        saw_split = true;
+    }
+
+    if saw_split {
+        segments
+    } else {
+        vec![text]
+    }
+}
+
 fn context_gauge(used: usize, limit: usize, width: usize) -> String {
     if limit == 0 || width == 0 {
         return String::new();
@@ -921,9 +1085,34 @@ fn context_gauge(used: usize, limit: usize, width: usize) -> String {
     )
 }
 
+fn format_compact_token_count(count: usize) -> String {
+    if count < 1_000 {
+        return count.to_string();
+    }
+    if count < 1_000_000 {
+        let value = count as f64 / 1_000.0;
+        if value < 10.0 {
+            format!("{value:.1}k")
+        } else {
+            format!("{:.0}k", value)
+        }
+    } else {
+        let value = count as f64 / 1_000_000.0;
+        if value < 10.0 {
+            format!("{value:.1}M")
+        } else {
+            format!("{:.0}M", value)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_handle_key_event;
+    use super::{
+        chunk_segments_for_animation, format_compact_token_count, should_animate_assistant_chunk,
+        should_handle_key_event, ReplApp,
+    };
+    use crate::app::events::{RunnerStatus, RuntimePhase, RuntimeProgress};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     #[test]
@@ -945,5 +1134,147 @@ mod tests {
         assert!(should_handle_key_event(press));
         assert!(should_handle_key_event(repeat));
         assert!(!should_handle_key_event(release));
+    }
+
+    #[test]
+    fn hidden_think_progress_updates_status_label() {
+        let mut app = ReplApp::new();
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Decode,
+            prefill_tokens: 128,
+            decode_tokens: 48,
+            hidden_thinking: true,
+            hidden_think_tokens: 32,
+            tokens_per_second: Some(12.5),
+            context_used: 176,
+            context_limit: 1024,
+        });
+
+        assert_eq!(app.status.left, "thinking 32 tok | decode 48 tok");
+        assert!(app.status.right.contains("out 48 tok"));
+        assert!(app.status.right.contains("12.5 tok/s"));
+        assert!(app.status.right.contains("ctx ["));
+    }
+
+    #[test]
+    fn status_override_survives_progress_updates() {
+        let mut app = ReplApp::new();
+        app.set_status_override(RunnerStatus::Tool {
+            turn: 2,
+            max_turns: 8,
+            tool: "read_file".to_string(),
+        });
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Decode,
+            prefill_tokens: 256,
+            decode_tokens: 64,
+            hidden_thinking: false,
+            hidden_think_tokens: 0,
+            tokens_per_second: Some(9.4),
+            context_used: 320,
+            context_limit: 2048,
+        });
+
+        assert_eq!(app.status.left, "agent turn 2/8 | tool read_file");
+        assert!(app.status.right.contains("out 64 tok"));
+        assert!(app.status.right.contains("9.4 tok/s"));
+        assert!(app.status.right.contains("ctx ["));
+    }
+
+    #[test]
+    fn session_output_counter_accumulates_across_turns() {
+        let mut app = ReplApp::new();
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Decode,
+            prefill_tokens: 100,
+            decode_tokens: 20,
+            hidden_thinking: false,
+            hidden_think_tokens: 0,
+            tokens_per_second: Some(8.0),
+            context_used: 120,
+            context_limit: 1024,
+        });
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Ready,
+            prefill_tokens: 100,
+            decode_tokens: 30,
+            hidden_thinking: false,
+            hidden_think_tokens: 0,
+            tokens_per_second: Some(8.0),
+            context_used: 130,
+            context_limit: 1024,
+        });
+        app.finish_turn_progress();
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Decode,
+            prefill_tokens: 80,
+            decode_tokens: 5,
+            hidden_thinking: false,
+            hidden_think_tokens: 0,
+            tokens_per_second: Some(7.5),
+            context_used: 85,
+            context_limit: 1024,
+        });
+
+        assert!(app.status.right.contains("out 35 tok"));
+    }
+
+    #[test]
+    fn compact_token_count_formats_large_values() {
+        assert_eq!(format_compact_token_count(500), "500");
+        assert_eq!(format_compact_token_count(1_500), "1.5k");
+        assert_eq!(format_compact_token_count(12_300), "12k");
+        assert_eq!(format_compact_token_count(1_700_000), "1.7M");
+    }
+
+    #[test]
+    fn ready_status_preserves_session_stats() {
+        let mut app = ReplApp::new();
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Decode,
+            prefill_tokens: 128,
+            decode_tokens: 48,
+            hidden_thinking: false,
+            hidden_think_tokens: 0,
+            tokens_per_second: Some(12.5),
+            context_used: 176,
+            context_limit: 1024,
+        });
+
+        let previous_right = app.status.right.clone();
+        app.set_ready_status();
+
+        assert_eq!(app.status.left, "Ready");
+        assert_eq!(app.status.right, previous_right);
+    }
+
+    #[test]
+    fn non_ready_status_clears_previous_stats() {
+        let mut app = ReplApp::new();
+        app.set_progress(RuntimeProgress {
+            phase: RuntimePhase::Decode,
+            prefill_tokens: 128,
+            decode_tokens: 48,
+            hidden_thinking: false,
+            hidden_think_tokens: 0,
+            tokens_per_second: Some(12.5),
+            context_used: 176,
+            context_limit: 1024,
+        });
+
+        app.set_status("Running model...");
+
+        assert_eq!(app.status.left, "Running model...");
+        assert!(app.status.right.is_empty());
+    }
+
+    #[test]
+    fn large_single_output_chunk_is_animated() {
+        let app = ReplApp::new();
+        let chunk = "This is a long assistant output chunk that should be replayed visibly in smaller pieces instead of appearing all at once in the terminal footer UI.";
+        assert!(should_animate_assistant_chunk(&app, chunk));
+        let segments = chunk_segments_for_animation(chunk);
+        assert!(segments.len() > 1);
+        assert_eq!(segments.concat(), chunk);
     }
 }

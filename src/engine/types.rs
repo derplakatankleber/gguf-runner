@@ -232,6 +232,7 @@ pub(crate) struct MappedFile {
     pub(crate) ptr: *mut u8,
     pub(crate) len: usize,
     #[cfg(not(unix))]
+    #[allow(dead_code)]
     backing: Box<[u8]>,
 }
 

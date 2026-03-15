@@ -110,6 +110,167 @@ Known-good status from `docs/performance.md` (text benchmarks) and local model/m
 - Enough RAM for the model you choose.
 - Rust toolchain (only if you build from source).
 
+## Operation Modes
+
+`gguf-runner` has two distinct operation modes selected with `--mode`:
+
+### Oneshot mode (default)
+
+Oneshot mode runs a single prompt and exits. The model loads, generates a response, prints it to stdout, then terminates. This is the default when `--mode` is not specified.
+
+```bash
+gguf-runner \
+  --model ./Qwen3.5-0.8B-Q4_K_M.gguf \
+  --prompt "What is the capital of France?"
+```
+
+**When to use oneshot:**
+- Scripting and automation — pipe the output to other tools
+- One-off questions where you do not need a follow-up
+- CI pipelines, cron jobs, or any non-interactive context
+
+**Key characteristics:**
+- `--prompt` is required
+- Tools are **disabled** by default (pass `--allowed-tools all` to enable)
+- No persistent chat history — each invocation starts fresh
+- Output goes to stdout, making it easy to capture or pipe
+
+**Scripting examples:**
+
+```bash
+# Capture output to a variable
+SUMMARY=$(gguf-runner --model model.gguf --prompt "Summarize: $(cat notes.txt)")
+
+# Pipe into another command
+gguf-runner --model model.gguf --prompt "List five ideas for a project name" | fzf
+
+# Use in a shell script
+for file in *.md; do
+  gguf-runner --model model.gguf --prompt "Summarize this: $(cat $file)" > "${file%.md}.summary"
+done
+```
+
+### REPL mode
+
+REPL mode starts an interactive terminal session. The model loads once and stays in memory. You type prompts and get responses in a continuous loop, with full chat history carried across turns.
+
+```bash
+gguf-runner \
+  --model ./Qwen3.5-0.8B-Q4_K_M.gguf \
+  --mode repl
+```
+
+**When to use REPL:**
+- Multi-turn conversations where context matters
+- Exploratory sessions — ask follow-up questions
+- Agentic work with file and shell tools
+- Any time you want the model to remember what you said earlier in the session
+
+**Key characteristics:**
+- Tools are **enabled** by default (pass `--allowed-tools none` to disable)
+- Chat history accumulates within the session
+- The model loads once — subsequent prompts pay no load cost
+- A status bar shows token count, speed, and context usage
+
+**Slash commands** (type `/help` inside the REPL for the current list):
+
+| Command | Effect |
+|---|---|
+| `/help` | Show available commands |
+| `/model` | Print the active model path |
+| `/image <path>` | Attach an image to the next prompt (vision models) |
+| `/images` | List currently attached images |
+| `/clear-images` | Remove all image attachments |
+| `/clear` | Reset chat history and image attachments |
+| `/exit` or `/quit` | Exit the REPL |
+
+Tab completion works for slash commands: type `/e` and press Tab to expand to `/exit`.
+
+Use `Ctrl+C` or `Esc` to exit at any time.
+
+**Starting with an initial prompt:**
+
+You can pass `--prompt` alongside `--mode repl` to send a first message automatically once the model is ready:
+
+```bash
+gguf-runner \
+  --model ./Qwen3.5-0.8B-Q4_K_M.gguf \
+  --mode repl \
+  --prompt "Hello, let's start by you telling me your name."
+```
+
+## Tools and Agent Capabilities
+
+Both modes support an agent layer that lets the model read files, list directories, write files, and run approved shell commands. Tools are off by default in oneshot and on by default in REPL.
+
+### Enabling and restricting tools
+
+```bash
+# Enable all tools (oneshot — disabled by default)
+gguf-runner --model model.gguf --prompt "..." --allowed-tools all
+
+# Enable only specific tools
+gguf-runner --model model.gguf --mode repl --allowed-tools read_file,list_dir
+
+# Disable all tools (REPL — enabled by default)
+gguf-runner --model model.gguf --mode repl --allowed-tools none
+```
+
+Available tool names: `read_file`, `list_dir`, `write_file`, `mkdir`, `rmdir`, `shell_list_allowed`, `shell_exec`, `shell_request_allowed`
+
+### Restricting file access
+
+Use `--tool-root` to confine file operations to a specific directory. Without it, the current working directory is used as the root.
+
+```bash
+gguf-runner \
+  --model model.gguf \
+  --mode repl \
+  --tool-root ./my-project
+```
+
+### Allowing shell commands
+
+Shell execution is sandboxed: the model can only run commands you explicitly allowlist.
+
+```bash
+# Allow specific commands on the command line
+gguf-runner --model model.gguf --mode repl \
+  --allow-shell-command cargo \
+  --allow-shell-command git
+
+# Or via environment variable (comma-separated)
+GGUF_ALLOW_SHELL_COMMANDS=cargo,git gguf-runner --model model.gguf --mode repl
+```
+
+### Config file
+
+Persistent tool and shell settings can be stored in a TOML config file. `gguf-runner` checks two locations in order, with the project-local file taking precedence:
+
+1. `~/.gguf-runner/config.toml` (user-wide defaults)
+2. `./.gguf-runner/config.toml` (per-project overrides)
+
+```toml
+# .gguf-runner/config.toml
+
+[tools]
+# Disable individual tools if needed
+write_file = false
+rmdir = false
+
+[shell]
+# Allowlist shell commands with optional descriptions
+# Descriptions help the model understand when to use each command
+[shell.md]
+cargo = "Rust build and test tool"
+git = "Version control"
+rg = "Fast grep (ripgrep)"
+```
+
+### How tool routing works in REPL
+
+In REPL mode with tools enabled, `gguf-runner` inspects each prompt before sending it to the model. Plain conversational questions go directly to a fast chat path. Prompts that clearly need file or shell access (mentioning files, directories, `cargo`, `git`, etc.) go through the full agent loop. This means you can mix plain chat and tool-assisted requests in the same session without configuration changes.
+
 ## Basic Command Pattern
 
 ```bash
@@ -120,13 +281,16 @@ gguf-runner \
 
 Most common options (and what they do):
 - `--mode oneshot|repl`: `oneshot` runs one request and exits. `repl` keeps an interactive prompt loop until you type `/exit` or `/quit`.
-  - repl commands: `/help`, `/model`, `/exit`, `/quit` (tab-completion for slash commands, e.g. `/e<Tab>` => `/exit`)
 - `--allowed-tools <list>`: Comma-separated tool allowlist, or `all` / `none` (`none` disables all tools).
   - defaults: `oneshot => none`, `repl => all`
 - `--max-tokens 256`: Maximum number of generated output tokens. Use lower values for short answers and faster test runs.
 - `--context-size 4096`: Sets how much conversation/history the model can keep in context.
 - `--temperature 0.7`: Controls randomness. Lower is more deterministic, higher is more creative/variable.
 - `--threads 8`: Number of CPU threads to use. Usually set this near your available CPU cores.
+- `--think yes|no|hidden`: Controls thinking output for reasoning models (Qwen3, Qwen3.5, etc.).
+  - `yes` — show the model's thinking steps (default for oneshot)
+  - `hidden` — suppress thinking, show only the final answer (default for REPL)
+  - `no` — skip the thinking phase entirely for faster, shorter responses
 - `--show-features`: Prints detected CPU features (compiled vs runtime) and exits.
 - `--show-tokens`: Streams token-level output/diagnostics while generating.
 - `--show-timings`: Prints timing breakdowns so you can inspect performance bottlenecks.
@@ -144,20 +308,14 @@ gguf-runner \
   --prompt "Describe this image."
 ```
 
-If required multimodal tensors/components are missing, the runner fails fast with a clear error.
+In REPL mode, attach images with the `/image` command before your prompt:
 
-## Agent Mode (Optional)
-
-```bash
-gguf-runner \
-  --model ./Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf \
-  --prompt "Review this Rust function for bugs." \
-  --agent
+```
+[you] > /image ./screenshot.png
+[you] > What does this error message say?
 ```
 
-Useful agent options:
-- `--tool-root <path>`
-- `--max-tool-calls <int>`
+If required multimodal tensors/components are missing, the runner fails fast with a clear error.
 
 ## Project Scope
 

@@ -209,7 +209,7 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "linux")]
-extern "C" {
+unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 

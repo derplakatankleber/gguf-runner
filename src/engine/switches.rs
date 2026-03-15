@@ -268,7 +268,7 @@ pub(crate) fn is_x86_amd() -> bool {
         use std::arch::x86_64::__cpuid;
 
         // CPUID vendor string is EBX, EDX, ECX for leaf 0.
-        let leaf0 = unsafe { __cpuid(0) };
+        let leaf0 = __cpuid(0);
         let mut vendor = [0u8; 12];
         vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
         vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());

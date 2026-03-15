@@ -1,21 +1,21 @@
 use crate::app::events::{
-    emit_runtime_event, RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress,
+    RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress, emit_runtime_event,
 };
 use crate::cli::CliOptions;
 use crate::engine::io::{get_gguf_string_from_map, parse_gguf_file};
-use crate::engine::kernels::{argmax, sample, softmax, TopKSampler};
+use crate::engine::kernels::{TopKSampler, argmax, sample, softmax};
 use crate::engine::multimodal::{
-    build_vision_encoder_from_mmproj, expand_prompt_with_image_embeddings, VisionEncoder,
+    VisionEncoder, build_vision_encoder_from_mmproj, expand_prompt_with_image_embeddings,
 };
-use crate::engine::profiling::{prof_end, prof_start, record_forward_pass, PROF_TRANSFORMER_NS};
+use crate::engine::profiling::{PROF_TRANSFORMER_NS, prof_end, prof_start, record_forward_pass};
 use crate::engine::types::{
     Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, MediaRef, MultimodalBackend,
     MultimodalWeights, PlaceholderSpan, ThinkMode, Tokenizer, TransformerWeights, XorShiftRng,
 };
 use crate::engine::vision::{
-    load_audio_chunk_samples, load_video_chunk_tensors, prepare_audios_for_multimodal,
-    prepare_images_for_multimodal, prepare_videos_for_multimodal, ImageNormalization,
-    ImagePreprocessProfile, ImageResizeMode,
+    ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_audio_chunk_samples,
+    load_video_chunk_tensors, prepare_audios_for_multimodal, prepare_images_for_multimodal,
+    prepare_videos_for_multimodal,
 };
 use image::{ImageFormat, ImageReader};
 use serde_json::Value;
@@ -240,8 +240,7 @@ fn should_retry_without_think_for_output(
 }
 
 fn build_direct_answer_retry_system_prompt(system_prompt: &str) -> String {
-    let directive =
-        "Provide the final answer directly and briefly. Do not describe your reasoning or restate the user's question.";
+    let directive = "Provide the final answer directly and briefly. Do not describe your reasoning or restate the user's question.";
     if system_prompt.trim().is_empty() {
         directive.to_string()
     } else {
@@ -1884,13 +1883,14 @@ impl ModelRuntime {
             cli.context_size,
             debug_mode,
         );
-        if cli.context_size == 0 && debug_mode {
-            if let Some(label) = vendor_runtime_debug_policy.native_context_label {
-                eprintln!(
-                    "Using {label} native context length {} (model may require a large workspace)",
-                    config.seq_len
-                );
-            }
+        if cli.context_size == 0
+            && debug_mode
+            && let Some(label) = vendor_runtime_debug_policy.native_context_label
+        {
+            eprintln!(
+                "Using {label} native context length {} (model may require a large workspace)",
+                config.seq_len
+            );
         }
         if max_tokens == 0 || max_tokens > config.seq_len {
             max_tokens = config.seq_len;
@@ -2204,9 +2204,9 @@ impl ModelRuntime {
                 && self.vision_encoder.is_none()
             {
                 return Err(format!(
-                "native media path selected but multimodal weights for backend '{}' were not initialized",
-                self.config.capabilities.multimodal_backend.as_str()
-            ));
+                    "native media path selected but multimodal weights for backend '{}' were not initialized",
+                    self.config.capabilities.multimodal_backend.as_str()
+                ));
             }
 
             let encoded_prompt = crate::vendors::encode_generation_request(
@@ -2242,15 +2242,16 @@ impl ModelRuntime {
                 if self.settings.debug_mode {
                     let first = &prepared_images[0];
                     emit_debug_line(
-                    event_callback,
-                    format!(
-                    "Prepared {} image tensor(s); first image: path='{}', width={}, height={}, elements={}",
-                    prepared_images.len(),
-                    first.path,
-                    first.width,
-                    first.height,
-                    first.element_count()
-                ));
+                        event_callback,
+                        format!(
+                            "Prepared {} image tensor(s); first image: path='{}', width={}, height={}, elements={}",
+                            prepared_images.len(),
+                            first.path,
+                            first.width,
+                            first.height,
+                            first.element_count()
+                        ),
+                    );
                 }
                 preprocess_summary.push(format!("images={}", prepared_images.len()));
             }
@@ -2272,20 +2273,21 @@ impl ModelRuntime {
                             (0, 0, 0)
                         };
                     emit_debug_line(
-                    event_callback,
-                    format!(
-                    "Prepared {} video tensor(s); first video: path='{}', fps={}, size={}x{}, frames={}, chunks={}, first_chunk_start={}, first_chunk_frames={}, first_chunk_decoded={}",
-                    prepared.len(),
-                    first.path,
-                    first.sampled_fps,
-                    first.frame_width,
-                    first.frame_height,
-                    first.frame_count,
-                    first.chunks.len(),
-                    chunk_start,
-                    chunk_frames,
-                    decoded_chunk_frames
-                ));
+                        event_callback,
+                        format!(
+                            "Prepared {} video tensor(s); first video: path='{}', fps={}, size={}x{}, frames={}, chunks={}, first_chunk_start={}, first_chunk_frames={}, first_chunk_decoded={}",
+                            prepared.len(),
+                            first.path,
+                            first.sampled_fps,
+                            first.frame_width,
+                            first.frame_height,
+                            first.frame_count,
+                            first.chunks.len(),
+                            chunk_start,
+                            chunk_frames,
+                            decoded_chunk_frames
+                        ),
+                    );
                 }
                 preprocess_summary.push(format!("videos={}", prepared.len()));
             }
@@ -2304,17 +2306,18 @@ impl ModelRuntime {
                         0
                     };
                     emit_debug_line(
-                    event_callback,
-                    format!(
-                    "Prepared {} audio tensor(s); first audio: path='{}', sample_rate={}, channels={}, samples={}, chunks={}, first_chunk_samples={}",
-                    prepared.len(),
-                    first.path,
-                    first.sample_rate,
-                    first.channels,
-                    first.total_samples,
-                    first.chunks.len(),
-                    first_chunk_samples
-                ));
+                        event_callback,
+                        format!(
+                            "Prepared {} audio tensor(s); first audio: path='{}', sample_rate={}, channels={}, samples={}, chunks={}, first_chunk_samples={}",
+                            prepared.len(),
+                            first.path,
+                            first.sample_rate,
+                            first.channels,
+                            first.total_samples,
+                            first.chunks.len(),
+                            first_chunk_samples
+                        ),
+                    );
                 }
                 preprocess_summary.push(format!("audios={}", prepared.len()));
             }
@@ -2337,34 +2340,34 @@ impl ModelRuntime {
                 )
             })?;
                 let image_embeddings = encoder.encode_images(&prepared_images)?;
-                if self.settings.debug_mode {
-                    if let Some(first) = image_embeddings.first() {
-                        let mut min_norm = f32::INFINITY;
-                        let mut max_norm = 0.0f32;
-                        let mut sum_norm = 0.0f32;
-                        for token in &first.tokens {
-                            let norm = token.iter().map(|v| v * v).sum::<f32>().sqrt();
-                            min_norm = min_norm.min(norm);
-                            max_norm = max_norm.max(norm);
-                            sum_norm += norm;
-                        }
-                        let avg_norm = if first.tokens.is_empty() {
-                            0.0
-                        } else {
-                            sum_norm / first.tokens.len() as f32
-                        };
-                        let backend = self.config.capabilities.multimodal_backend.as_str();
-                        emit_debug_line(
-                            event_callback,
-                            format!(
-                        "{backend} image embeddings: tokens={} norm(min/avg/max)={:.4}/{:.4}/{:.4}",
-                        first.tokens.len(),
-                        min_norm,
-                        avg_norm,
-                        max_norm
-                    ),
-                        );
+                if self.settings.debug_mode
+                    && let Some(first) = image_embeddings.first()
+                {
+                    let mut min_norm = f32::INFINITY;
+                    let mut max_norm = 0.0f32;
+                    let mut sum_norm = 0.0f32;
+                    for token in &first.tokens {
+                        let norm = token.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        min_norm = min_norm.min(norm);
+                        max_norm = max_norm.max(norm);
+                        sum_norm += norm;
                     }
+                    let avg_norm = if first.tokens.is_empty() {
+                        0.0
+                    } else {
+                        sum_norm / first.tokens.len() as f32
+                    };
+                    let backend = self.config.capabilities.multimodal_backend.as_str();
+                    emit_debug_line(
+                        event_callback,
+                        format!(
+                            "{backend} image embeddings: tokens={} norm(min/avg/max)={:.4}/{:.4}/{:.4}",
+                            first.tokens.len(),
+                            min_norm,
+                            avg_norm,
+                            max_norm
+                        ),
+                    );
                 }
                 let (expanded_tokens, injected) = expand_prompt_with_image_embeddings(
                     &encoded_prompt,
@@ -2377,34 +2380,36 @@ impl ModelRuntime {
 
             if !videos.is_empty() || !audios.is_empty() {
                 return Err(format!(
-                "native media preprocessing completed ({}), but video/audio embedding execution is not implemented yet",
-                preprocess_summary.join(", ")
-            ));
+                    "native media preprocessing completed ({}), but video/audio embedding execution is not implemented yet",
+                    preprocess_summary.join(", ")
+                ));
             }
 
             if self.settings.debug_mode {
                 if let Some(mm) = &self.multimodal_weights {
                     emit_debug_line(
-                    event_callback,
-                    format!(
-                    "Multimodal weights ready: backend={}, total_tensors={}, vision={}, projector={}, audio={}",
-                    mm.backend.as_str(),
-                    mm.total_tensor_count(),
-                    mm.vision_tensor_names.len(),
-                    mm.projector_tensor_names.len(),
-                    mm.audio_tensor_names.len()
-                ));
+                        event_callback,
+                        format!(
+                            "Multimodal weights ready: backend={}, total_tensors={}, vision={}, projector={}, audio={}",
+                            mm.backend.as_str(),
+                            mm.total_tensor_count(),
+                            mm.vision_tensor_names.len(),
+                            mm.projector_tensor_names.len(),
+                            mm.audio_tensor_names.len()
+                        ),
+                    );
                 }
                 emit_debug_line(
-                event_callback,
-                format!(
-                "Prepared multimodal prefill: tokens={} injected_embeddings={} images={} videos={} audios={}",
-                prompt_tokens.len(),
-                prefill_embeddings.len(),
-                encoded_prompt.image_spans.len(),
-                encoded_prompt.video_spans.len(),
-                encoded_prompt.audio_spans.len()
-            ));
+                    event_callback,
+                    format!(
+                        "Prepared multimodal prefill: tokens={} injected_embeddings={} images={} videos={} audios={}",
+                        prompt_tokens.len(),
+                        prefill_embeddings.len(),
+                        encoded_prompt.image_spans.len(),
+                        encoded_prompt.video_spans.len(),
+                        encoded_prompt.audio_spans.len()
+                    ),
+                );
             }
 
             if prompt_tokens.is_empty() {
@@ -2635,20 +2640,20 @@ impl ModelRuntime {
         };
         let mut visible_yes_think_token_count = 0usize;
         let mut last_progress_emit_ms = 0i64;
-        if let Some((think_cap, total_cap)) = hidden_mode_caps {
-            if debug_mode {
-                emit_debug_line(
-                    event_callback.as_ref(),
-                    format!(
-                        "Hidden-think policy: think_cap={} total_cap={} (n_layers={} seq_len={} budget={})",
-                        think_cap,
-                        total_cap,
-                        self.config.n_layers,
-                        self.config.seq_len,
-                        total_limit.saturating_sub(prompt_tokens.len())
-                    ),
-                );
-            }
+        if let Some((think_cap, total_cap)) = hidden_mode_caps
+            && debug_mode
+        {
+            emit_debug_line(
+                event_callback.as_ref(),
+                format!(
+                    "Hidden-think policy: think_cap={} total_cap={} (n_layers={} seq_len={} budget={})",
+                    think_cap,
+                    total_cap,
+                    self.config.n_layers,
+                    self.config.seq_len,
+                    total_limit.saturating_sub(prompt_tokens.len())
+                ),
+            );
         }
         while pos < total_limit {
             if token < 0 || token as usize >= self.config.vocab_size {
@@ -2886,31 +2891,30 @@ impl ModelRuntime {
                 && next != self.tokenizer.eot_token
                 && next != self.tokenizer.eos_token
                 && !is_vendor_stop_token
+                && let Some(bytes) = self.tokenizer.decode_token_bytes(next)
             {
-                if let Some(bytes) = self.tokenizer.decode_token_bytes(next) {
-                    let decoded = decode_utf8_streaming(&mut utf8_pending, &bytes);
-                    process_decoded_with_think(
-                        &decoded,
-                        decode_policy.parse_think_tags,
-                        think_mode,
-                        &mut is_thinking,
-                        &mut think_tail,
-                        &mut hidden_visible_tail,
-                        &mut output,
-                        &mut pending_newline,
-                        stream_stdout,
-                        event_callback.as_ref(),
-                    );
-                    if let Some(structured_output) =
-                        extract_first_complete_structured_output(&output, structured_output_schema)
-                    {
-                        output = structured_output;
-                        pending_newline = false;
-                        think_tail.clear();
-                        hidden_visible_tail.clear();
-                        utf8_pending.clear();
-                        structured_output_completed = true;
-                    }
+                let decoded = decode_utf8_streaming(&mut utf8_pending, &bytes);
+                process_decoded_with_think(
+                    &decoded,
+                    decode_policy.parse_think_tags,
+                    think_mode,
+                    &mut is_thinking,
+                    &mut think_tail,
+                    &mut hidden_visible_tail,
+                    &mut output,
+                    &mut pending_newline,
+                    stream_stdout,
+                    event_callback.as_ref(),
+                );
+                if let Some(structured_output) =
+                    extract_first_complete_structured_output(&output, structured_output_schema)
+                {
+                    output = structured_output;
+                    pending_newline = false;
+                    think_tail.clear();
+                    hidden_visible_tail.clear();
+                    utf8_pending.clear();
+                    structured_output_completed = true;
                 }
             }
 
@@ -2981,29 +2985,28 @@ impl ModelRuntime {
                         break;
                     }
                 }
-                if let Some(visible_think_cap) = visible_yes_think_cap {
-                    if is_thinking {
-                        visible_yes_think_token_count =
-                            visible_yes_think_token_count.saturating_add(1);
-                        if visible_yes_think_token_count >= visible_think_cap {
-                            is_thinking = false;
-                            think_tail.clear();
-                            append_visible_text(
-                                THINK_CLOSE_TAG,
-                                &mut output,
-                                &mut pending_newline,
-                                stream_stdout,
+                if let Some(visible_think_cap) = visible_yes_think_cap
+                    && is_thinking
+                {
+                    visible_yes_think_token_count = visible_yes_think_token_count.saturating_add(1);
+                    if visible_yes_think_token_count >= visible_think_cap {
+                        is_thinking = false;
+                        think_tail.clear();
+                        append_visible_text(
+                            THINK_CLOSE_TAG,
+                            &mut output,
+                            &mut pending_newline,
+                            stream_stdout,
+                            event_callback.as_ref(),
+                        );
+                        if debug_mode {
+                            emit_debug_line(
                                 event_callback.as_ref(),
+                                format!(
+                                    "Note: forced close of visible thinking block after {} tokens without </think>",
+                                    visible_think_cap
+                                ),
                             );
-                            if debug_mode {
-                                emit_debug_line(
-                                    event_callback.as_ref(),
-                                    format!(
-                                        "Note: forced close of visible thinking block after {} tokens without </think>",
-                                        visible_think_cap
-                                    ),
-                                );
-                            }
                         }
                     }
                 }
@@ -3120,18 +3123,18 @@ impl ModelRuntime {
                         }
                         break;
                     }
-                    if temperature == 0.0 {
-                        if let Some(period) = repeated_cycle_period(&generated_tokens) {
-                            if debug_mode {
-                                emit_debug_line(
-                                    event_callback.as_ref(),
-                                    format!(
-                                        "Stopping due to repeated token cycle (window={period}, repeated suffix)"
-                                    ),
-                                );
-                            }
-                            break;
+                    if temperature == 0.0
+                        && let Some(period) = repeated_cycle_period(&generated_tokens)
+                    {
+                        if debug_mode {
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Stopping due to repeated token cycle (window={period}, repeated suffix)"
+                                ),
+                            );
                         }
+                        break;
                     }
                 }
             }
@@ -3436,8 +3439,8 @@ impl ModelRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_first_complete_json_object, find_first_complete_json_object_span,
-        is_agent_json_safe_text, match_agent_response_prefix, ModelRuntime, PrefixMatch,
+        ModelRuntime, PrefixMatch, extract_first_complete_json_object,
+        find_first_complete_json_object_span, is_agent_json_safe_text, match_agent_response_prefix,
     };
     use std::fs;
     use tempfile::tempdir;

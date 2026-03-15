@@ -1,24 +1,25 @@
 #![allow(clippy::needless_range_loop)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, read_u32_le};
-use crate::engine::profiling::{prof_end, prof_start, PROF_MATMUL_NS};
+use crate::engine::profiling::{PROF_MATMUL_NS, prof_end, prof_start};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::{
-    aarch64_matmul_prefetch_rows, use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
     AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS,
-    AARCH64_Q8_0_MR2_STATUS,
+    AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows, use_aarch64_dotprod_q8,
+    use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
-    is_x86_amd, use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_avx_vnni, use_x86_f16c,
-    use_x86_qk_mr4, X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS,
+    X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd, use_x86_avx_vnni,
+    use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
 };
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
-    ensure_model_range, GgmlType, QuantizedTensor, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-    KVALUES_IQ4NL, QK4_0, QK4_1, QK4_NL, QK5_0, QK5_1, QK8_0, QK_K,
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GgmlType, KVALUES_IQ4NL, QK_K, QK4_0, QK4_1, QK4_NL, QK5_0,
+    QK5_1, QK8_0, QuantizedTensor, ensure_model_range,
 };
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 #[cfg(target_arch = "aarch64")]
@@ -4376,7 +4377,7 @@ pub(crate) fn matmul_quantized(
             return Err(format!(
                 "unsupported quantization type in matmul: {}",
                 qw.ttype.0
-            ))
+            ));
         }
     }
 
@@ -4608,7 +4609,7 @@ pub(crate) fn matmul_quantized_rows(
             return Err(format!(
                 "unsupported quantization type in matmul: {}",
                 qw.ttype.0
-            ))
+            ));
         }
     }
 

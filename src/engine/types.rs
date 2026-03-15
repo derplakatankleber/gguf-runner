@@ -196,7 +196,7 @@ const MADV_WILLNEED: i32 = 3;
 const MADV_HUGEPAGE: i32 = 14;
 
 #[cfg(unix)]
-extern "C" {
+unsafe extern "C" {
     fn mmap(
         addr: *mut c_void,
         len: usize,

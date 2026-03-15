@@ -9,8 +9,8 @@ use crate::engine::profiling::{print_profile_report, profiling_reset, set_profil
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::aarch64_matmul_prefetch_rows;
 use crate::engine::switches::{
-    init_runtime_config, kv_cache_mode, par_attn_min_heads, par_matmul_chunk_rows,
-    par_matmul_min_rows, par_qwen3next_min_heads, KvCacheMode, RuntimeSwitchConfig,
+    KvCacheMode, RuntimeSwitchConfig, init_runtime_config, kv_cache_mode, par_attn_min_heads,
+    par_matmul_chunk_rows, par_matmul_min_rows, par_qwen3next_min_heads,
 };
 use crate::engine::types::{ContentPart, GenerationRequest, MediaRef};
 use std::fs;
@@ -48,11 +48,7 @@ fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCache
 
 fn print_cpu_features() {
     fn yn(v: bool) -> &'static str {
-        if v {
-            "yes"
-        } else {
-            "no "
-        }
+        if v { "yes" } else { "no " }
     }
 
     println!("Architecture: {}", std::env::consts::ARCH);
@@ -363,13 +359,14 @@ fn expand_repl_tab_completion(input: &str) -> String {
     if cmd.is_empty() {
         return "/".to_string();
     }
-    if let Some((typed_cmd, rest)) = split_repl_command_and_rest(&sanitized) {
-        if typed_cmd == "image" && rest.starts_with(char::is_whitespace) {
-            if let Some(completed) = complete_filesystem_path(rest.trim_start()) {
-                return format!("/{typed_cmd} {completed}");
-            }
-            return format!("/{typed_cmd} {}", rest.trim_start());
+    if let Some((typed_cmd, rest)) = split_repl_command_and_rest(&sanitized)
+        && typed_cmd == "image"
+        && rest.starts_with(char::is_whitespace)
+    {
+        if let Some(completed) = complete_filesystem_path(rest.trim_start()) {
+            return format!("/{typed_cmd} {completed}");
         }
+        return format!("/{typed_cmd} {}", rest.trim_start());
     }
 
     let matches = REPL_COMMANDS

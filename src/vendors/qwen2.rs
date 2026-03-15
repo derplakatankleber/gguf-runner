@@ -1,6 +1,6 @@
 use super::{
-    qwen_common, ChatMessage, ChatRole, VendorDecodePolicy, VendorMultimodalPolicy,
-    VendorTokenizerPolicy,
+    ChatMessage, ChatRole, VendorDecodePolicy, VendorMultimodalPolicy, VendorTokenizerPolicy,
+    qwen_common,
 };
 use crate::engine::types::Tokenizer;
 

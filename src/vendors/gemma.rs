@@ -3,8 +3,8 @@ use super::{
     VendorRuntimeDebugPolicy,
 };
 use crate::engine::types::{
-    Config, ContentPart, EncodedPrompt, GenerationRequest, MultimodalBackend, PlaceholderSpan,
-    Tokenizer, VendorTokenizerPolicy, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
+    Config, ContentPart, EncodedPrompt, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
+    GenerationRequest, MultimodalBackend, PlaceholderSpan, Tokenizer, VendorTokenizerPolicy,
 };
 
 const GEMMA_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[

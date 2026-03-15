@@ -1,7 +1,7 @@
 use crate::cli::AgentToolEnablement;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -792,7 +792,7 @@ struct RequestShellAllowedArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_shell_exec_invocation, RunShellArgs, ToolExecutor};
+    use super::{RunShellArgs, ToolExecutor, normalize_shell_exec_invocation};
     use crate::cli::AgentToolEnablement;
     use serde_json::json;
     use std::fs;
@@ -891,11 +891,13 @@ mod tests {
             )
             .expect("read_file should coerce single-item path array");
         assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
-        assert!(result
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .contains("name = \"demo\""));
+        assert!(
+            result
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("name = \"demo\"")
+        );
 
         fs::remove_dir_all(&root).expect("cleanup test root");
     }

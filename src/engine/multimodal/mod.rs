@@ -4,7 +4,7 @@ mod qwen3vl;
 
 use crate::engine::types::{Config, GGUFFile, MultimodalBackend};
 use crate::engine::vision::PreparedImageTensor;
-pub(crate) use injection::{expand_prompt_with_image_embeddings, ImageEmbeddingSequence};
+pub(crate) use injection::{ImageEmbeddingSequence, expand_prompt_with_image_embeddings};
 
 pub(crate) enum VisionEncoder {
     Gemma3(gemma3::Gemma3VisionEncoder),

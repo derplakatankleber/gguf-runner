@@ -1,5 +1,5 @@
 use super::{
-    qwen_common, ChatMessage, VendorDecodePolicy, VendorMultimodalPolicy, VendorTokenizerPolicy,
+    ChatMessage, VendorDecodePolicy, VendorMultimodalPolicy, VendorTokenizerPolicy, qwen_common,
 };
 use crate::engine::types::{Config, EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
 

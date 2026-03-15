@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicU8;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU8;
 
 #[inline]
 fn available_threads() -> usize {
@@ -12,11 +12,7 @@ fn available_threads() -> usize {
 #[inline]
 fn par_matmul_min_rows_default() -> usize {
     let n_threads = available_threads();
-    if n_threads <= 4 {
-        192
-    } else {
-        384
-    }
+    if n_threads <= 4 { 192 } else { 384 }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -40,11 +36,7 @@ fn par_matmul_min_rows_default() -> usize {
 #[inline]
 fn par_matmul_chunk_rows_default() -> usize {
     let n_threads = available_threads();
-    if n_threads <= 4 {
-        32
-    } else {
-        64
-    }
+    if n_threads <= 4 { 32 } else { 64 }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -82,21 +74,13 @@ fn aarch64_matmul_prefetch_rows_default() -> usize {
 #[inline]
 fn par_attn_min_heads_default() -> usize {
     let n_threads = available_threads();
-    if n_threads <= 4 {
-        4
-    } else {
-        8
-    }
+    if n_threads <= 4 { 4 } else { 8 }
 }
 
 #[inline]
 fn par_qwen3next_min_heads_default() -> usize {
     let n_threads = available_threads();
-    if n_threads <= 4 {
-        4
-    } else {
-        8
-    }
+    if n_threads <= 4 { 4 } else { 8 }
 }
 
 static PAR_MATMUL_MIN_ROWS_CFG: OnceLock<usize> = OnceLock::new();

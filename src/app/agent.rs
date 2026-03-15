@@ -1,12 +1,12 @@
 use crate::app::events::{
-    emit_runtime_event, RunnerStatus, RuntimeEvent, RuntimeEventCallback, RuntimeLog,
+    RunnerStatus, RuntimeEvent, RuntimeEventCallback, RuntimeLog, emit_runtime_event,
 };
 use crate::app::generation::ModelRuntime;
 use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
 use crate::tools::ToolExecutor;
 use crate::vendors::{ChatMessage, ChatRole};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct AgentMessage {
     role: &'static str,
@@ -726,12 +726,11 @@ fn extract_agent_final_content(raw: &str) -> Option<String> {
         return Some(content);
     }
     for value in extract_json_objects(raw) {
-        if let Some(content) = value.get("content").and_then(Value::as_str) {
-            if value.get("type").and_then(Value::as_str) == Some("final")
-                || value.get("type").is_none()
-            {
-                return Some(content.to_string());
-            }
+        if let Some(content) = value.get("content").and_then(Value::as_str)
+            && (value.get("type").and_then(Value::as_str) == Some("final")
+                || value.get("type").is_none())
+        {
+            return Some(content.to_string());
         }
     }
     None
@@ -774,10 +773,10 @@ fn extract_json_objects(raw: &str) -> Vec<Value> {
         if ch != '{' {
             continue;
         }
-        if let Some(v) = parse_first_json_value(&raw[idx..]) {
-            if v.is_object() {
-                values.push(v);
-            }
+        if let Some(v) = parse_first_json_value(&raw[idx..])
+            && v.is_object()
+        {
+            values.push(v);
         }
     }
     values
@@ -831,8 +830,8 @@ pub(crate) fn prompt_likely_requires_tools(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_agent_final_content, looks_like_reasonable_fallback_text, parse_agent_response,
-        prompt_likely_requires_tools, AgentResponse,
+        AgentResponse, extract_agent_final_content, looks_like_reasonable_fallback_text,
+        parse_agent_response, prompt_likely_requires_tools,
     };
 
     #[test]

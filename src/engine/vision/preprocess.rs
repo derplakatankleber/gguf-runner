@@ -430,10 +430,10 @@ pub(crate) fn load_audio_chunk_samples(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_audio_chunk_samples, plan_chunks, prepare_audios_for_multimodal,
-        prepare_images_for_multimodal, prepare_videos_for_multimodal, resize_and_center_crop,
-        resize_for_profile, rgb_u8_to_chw_f32, ImageNormalization, ImagePreprocessProfile,
-        ImageResizeMode,
+        ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_audio_chunk_samples,
+        plan_chunks, prepare_audios_for_multimodal, prepare_images_for_multimodal,
+        prepare_videos_for_multimodal, resize_and_center_crop, resize_for_profile,
+        rgb_u8_to_chw_f32,
     };
     use image::{ImageFormat, RgbImage};
     use tempfile::TempDir;

@@ -1,16 +1,18 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::engine::kernels::{
     accum, dot_f32_simd, get_row_size, l2_norm, matmul_f32_embeddings, matmul_quantized,
     matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
     rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace, scale_slice_inplace,
     select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
 };
-use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
+use crate::engine::profiling::{PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS, prof_end, prof_start};
 use crate::engine::switches::{
-    kv_cache_mode, layer_debug_enabled, layer_debug_pos, par_attn_min_heads,
-    KvCacheMode as SwitchKvCacheMode,
+    KvCacheMode as SwitchKvCacheMode, kv_cache_mode, layer_debug_enabled, layer_debug_pos,
+    par_attn_min_heads,
 };
 use crate::engine::types::{
-    Config, KvCacheFormat, QuantizedTensor, RunState, TransformerWeights, GGML_TYPE_BF16,
+    Config, GGML_TYPE_BF16, KvCacheFormat, QuantizedTensor, RunState, TransformerWeights,
 };
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
@@ -371,11 +373,7 @@ fn dequant_q4_at(src: &[u8], elem_idx: usize) -> i8 {
     } else {
         (byte >> 4) & 0x0F
     };
-    if nib >= 8 {
-        nib as i8 - 16
-    } else {
-        nib as i8
-    }
+    if nib >= 8 { nib as i8 - 16 } else { nib as i8 }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2021,19 +2019,19 @@ fn transformer_inner(
             );
         }
 
-        if let Some(ds) = deepstack_embedding {
-            if l < p.n_deepstack_layers {
-                let ds_off = l * dim;
-                let ds_end = ds_off + dim;
-                if ds_end > ds.len() {
-                    return Err(format!(
-                        "deepstack embedding length mismatch at layer {l}: need {} values, have {}",
-                        ds_end,
-                        ds.len()
-                    ));
-                }
-                accum(&mut s.x[..dim], &ds[ds_off..ds_end], dim);
+        if let Some(ds) = deepstack_embedding
+            && l < p.n_deepstack_layers
+        {
+            let ds_off = l * dim;
+            let ds_end = ds_off + dim;
+            if ds_end > ds.len() {
+                return Err(format!(
+                    "deepstack embedding length mismatch at layer {l}: need {} values, have {}",
+                    ds_end,
+                    ds.len()
+                ));
             }
+            accum(&mut s.x[..dim], &ds[ds_off..ds_end], dim);
         }
     }
 

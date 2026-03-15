@@ -1,7 +1,7 @@
 use crate::engine::io::{get_gguf_int_from_map, get_gguf_string_from_map};
 use crate::engine::types::{
-    Config, GGUFFile, GgufValue, Tokenizer, TokenizerPreType, VendorTokenizerPolicy,
-    LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT, LLAMA3_START_HEADER,
+    Config, GGUFFile, GgufValue, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT,
+    LLAMA3_START_HEADER, Tokenizer, TokenizerPreType, VendorTokenizerPolicy,
 };
 use fancy_regex::Regex;
 use std::collections::HashMap;
@@ -172,24 +172,24 @@ fn split_gpt2_pieces(text: &str) -> Vec<String> {
                 out.push(" ".to_string());
                 break;
             }
-            if let Some((c1, _)) = next_char(text, j) {
-                if c1.is_whitespace() {
-                    let start = i;
-                    while j < len {
-                        if let Some((c, clen)) = next_char(text, j) {
-                            if c.is_whitespace() {
-                                j += clen;
-                            } else {
-                                break;
-                            }
+            if let Some((c1, _)) = next_char(text, j)
+                && c1.is_whitespace()
+            {
+                let start = i;
+                while j < len {
+                    if let Some((c, clen)) = next_char(text, j) {
+                        if c.is_whitespace() {
+                            j += clen;
                         } else {
                             break;
                         }
+                    } else {
+                        break;
                     }
-                    out.push(text[start..j].to_string());
-                    i = j;
-                    continue;
                 }
+                out.push(text[start..j].to_string());
+                i = j;
+                continue;
             }
 
             let start = i;
@@ -419,14 +419,13 @@ impl Tokenizer {
                     let right = &self.vocab[work[i + 1] as usize];
                     let pair = format!("{left} {right}");
                     let merged = format!("{left}{right}");
-                    if let Some(&rank) = self.merge_ranks.get(&pair) {
-                        if let Some(&id) = self.token_to_id.get(&merged) {
-                            if rank < best_rank {
-                                best_rank = rank;
-                                best_id = id;
-                                best_pos = i;
-                            }
-                        }
+                    if let Some(&rank) = self.merge_ranks.get(&pair)
+                        && let Some(&id) = self.token_to_id.get(&merged)
+                        && rank < best_rank
+                    {
+                        best_rank = rank;
+                        best_id = id;
+                        best_pos = i;
                     }
                 }
 

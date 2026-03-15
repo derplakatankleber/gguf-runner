@@ -1,7 +1,7 @@
 use crate::app::agent;
 use crate::app::events::{
-    emit_runtime_event, RunnerStatus, RuntimeEvent, RuntimeEventCallback, RuntimeLog,
-    RuntimeLogKind, RuntimePhase, RuntimeProgress,
+    RunnerStatus, RuntimeEvent, RuntimeEventCallback, RuntimeLog, RuntimeLogKind, RuntimePhase,
+    RuntimeProgress, emit_runtime_event,
 };
 use crate::app::generation::ModelRuntime;
 use crate::app::{collect_debug_banner_lines, expand_repl_tab_completion, handle_repl_command};
@@ -11,7 +11,7 @@ use crossterm::cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::style::Print;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size};
 use std::cmp::min;
 use std::io::{self, Stdout, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -511,12 +511,12 @@ pub(crate) fn run(cli: &CliOptions) -> Result<(), String> {
 
     loop {
         drain_worker_events(&mut app, &mut terminal, &event_rx)?;
-        if app.runtime_ready && !app.busy {
-            if let Some(prompt) = startup_prompt.take() {
-                if dispatch_prompt(&mut app, &mut terminal, &command_tx, cli, &prompt)? {
-                    break;
-                }
-            }
+        if app.runtime_ready
+            && !app.busy
+            && let Some(prompt) = startup_prompt.take()
+            && dispatch_prompt(&mut app, &mut terminal, &command_tx, cli, &prompt)?
+        {
+            break;
         }
 
         terminal.render_footer(&app)?;
@@ -1062,11 +1062,7 @@ fn chunk_segments_for_animation(text: &str) -> Vec<&str> {
         saw_split = true;
     }
 
-    if saw_split {
-        segments
-    } else {
-        vec![text]
-    }
+    if saw_split { segments } else { vec![text] }
 }
 
 fn context_gauge(used: usize, limit: usize, width: usize) -> String {
@@ -1109,8 +1105,8 @@ fn format_compact_token_count(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        chunk_segments_for_animation, format_compact_token_count, should_animate_assistant_chunk,
-        should_handle_key_event, ReplApp,
+        ReplApp, chunk_segments_for_animation, format_compact_token_count,
+        should_animate_assistant_chunk, should_handle_key_event,
     };
     use crate::app::events::{RunnerStatus, RuntimePhase, RuntimeProgress};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};

@@ -1,8 +1,8 @@
 use crate::engine::io::{find_gguf_tensor, find_gguf_tensor_names_with_any_prefix};
 use crate::engine::kernels::{dequantize_tensor, get_block_size, get_type_size};
 use crate::engine::types::{
-    Config, GGUFFile, GgmlType, Gguftensor, MultimodalBackend, MultimodalWeights, QuantizedTensor,
-    TransformerWeights, GGML_TYPE_F32,
+    Config, GGML_TYPE_F32, GGUFFile, GgmlType, Gguftensor, MultimodalBackend, MultimodalWeights,
+    QuantizedTensor, TransformerWeights,
 };
 use std::collections::BTreeMap;
 
@@ -22,12 +22,12 @@ fn load_tensor_float(
     let tensor = find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
     let n_elements = tensor_n_elements(tensor);
 
-    if let Some(expected) = expected_elements {
-        if expected != n_elements {
-            return Err(format!(
-                "tensor {name} has {n_elements} elements, expected {expected}"
-            ));
-        }
+    if let Some(expected) = expected_elements
+        && expected != n_elements
+    {
+        return Err(format!(
+            "tensor {name} has {n_elements} elements, expected {expected}"
+        ));
     }
 
     let block_size = get_block_size(tensor.ttype);

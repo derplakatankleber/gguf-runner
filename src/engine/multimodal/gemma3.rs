@@ -26,12 +26,12 @@ fn load_tensor_float(
 ) -> Result<Vec<f32>, String> {
     let tensor = find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
     let n_elements = tensor_n_elements(tensor);
-    if let Some(expected) = expected_elements {
-        if n_elements != expected {
-            return Err(format!(
-                "tensor {name} has {n_elements} elements, expected {expected}"
-            ));
-        }
+    if let Some(expected) = expected_elements
+        && n_elements != expected
+    {
+        return Err(format!(
+            "tensor {name} has {n_elements} elements, expected {expected}"
+        ));
     }
 
     let block_size = get_block_size(tensor.ttype);

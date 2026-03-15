@@ -3,7 +3,7 @@
 use crate::engine::kernels::{
     axpy_inplace, dot_f32_simd, matmul_quantized, matmul_quantized_rows, scale_slice_inplace,
 };
-use crate::engine::profiling::{prof_end, prof_start, PROF_SSM_NS};
+use crate::engine::profiling::{PROF_SSM_NS, prof_end, prof_start};
 use crate::engine::switches::{
     par_matmul_chunk_rows, par_matmul_min_rows, par_qwen3next_min_heads,
 };
@@ -404,11 +404,7 @@ pub(crate) fn softplusf(x: f32) -> f32 {
 
 #[inline(always)]
 pub(crate) fn finite_or_zero(x: f32) -> f32 {
-    if x.is_finite() {
-        x
-    } else {
-        0.0
-    }
+    if x.is_finite() { x } else { 0.0 }
 }
 
 /// Zero any NaN/Inf elements in `x` in-place.

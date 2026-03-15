@@ -99,11 +99,11 @@ impl TopKSampler {
                 self.heap.push(HeapCandidate { idx, score });
                 continue;
             }
-            if let Some(min_keep) = self.heap.peek() {
-                if score > min_keep.score {
-                    let _ = self.heap.pop();
-                    self.heap.push(HeapCandidate { idx, score });
-                }
+            if let Some(min_keep) = self.heap.peek()
+                && score > min_keep.score
+            {
+                let _ = self.heap.pop();
+                self.heap.push(HeapCandidate { idx, score });
             }
         }
 
